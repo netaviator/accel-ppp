@@ -6231,10 +6231,23 @@ static void load_config(void)
 	}
 }
 
-static void switch_show_walk(const void *nodep, VISIT which, void *closure)
+/* twalk_r() (which would let the CLI client be passed through as a
+ * closure argument instead of this) is a GNU extension not reliably
+ * available across the libc versions this project targets -- confirmed
+ * the hard way when it built fine against one glibc but failed with
+ * "implicit declaration of function 'twalk_r'" on another. Plain twalk()
+ * has no closure parameter at all, so the client is stashed in a
+ * thread-local instead of a plain global: l2tp_switch_show_exec() runs
+ * to completion on a single thread before any concurrent invocation on
+ * that same thread could reuse it, but a plain global would still race
+ * against a *different* thread running the same CLI command at the same
+ * time. */
+static __thread void *switch_show_client;
+
+static void switch_show_walk(const void *nodep, VISIT which, int depth)
 {
 	struct l2tp_sess_t *sess = *(struct l2tp_sess_t **)nodep;
-	void *client = closure;
+	void *client = switch_show_client;
 
 	if (which != postorder && which != leaf)
 		return;
@@ -6276,8 +6289,10 @@ static int l2tp_switch_show_exec(const char *cmd, char * const *fields,
 			 __atomic_load_n(&t->active, __ATOMIC_RELAXED),
 			 (unsigned long long)__atomic_load_n(&t->rx_bytes, __ATOMIC_RELAXED),
 			 (unsigned long long)__atomic_load_n(&t->tx_bytes, __ATOMIC_RELAXED));
-		if (t->tunnel)
-			twalk_r(t->tunnel->sessions, switch_show_walk, client);
+		if (t->tunnel) {
+			switch_show_client = client;
+			twalk(t->tunnel->sessions, switch_show_walk);
+		}
 	}
 
 	cli_send(client, "calls:\r\n");

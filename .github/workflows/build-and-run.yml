@@ -83,7 +83,6 @@ jobs:
       matrix:
         distro:
           [
-            "debian:11",
             "debian:12",
             "debian:13",
             "debian:forky",
@@ -103,7 +102,6 @@ jobs:
           debian:forky) DISTRO=debian13; CPACK_TYPE=Debian13 ;;
           debian:13) DISTRO=debian13; CPACK_TYPE=Debian13 ;;
           debian:12) DISTRO=debian12; CPACK_TYPE=Debian12 ;;
-          debian:11) CPACK_TYPE=Debian11 ;;
           ubuntu:devel) CPACK_TYPE=Ubuntu24 ; HEADERS_SUFFIX=generic ;;
           ubuntu:24.04) CPACK_TYPE=Ubuntu24 ; HEADERS_SUFFIX=generic ;;
           ubuntu:22.04) CPACK_TYPE=Ubuntu22 ; HEADERS_SUFFIX=generic ;;
@@ -114,14 +112,8 @@ jobs:
           echo UNAME_M=`uname -m` >> $GITHUB_ENV;
           cat $GITHUB_ENV
       - name: Install build tools
-        # -o Acquire::Check-Valid-Until=false: debian:11 (bullseye) reached
-        # full LTS end-of-life on 2026-08-31 -- security.debian.org's
-        # bullseye-security Release file will never be refreshed again, so
-        # apt's default staleness check fails hard forever, not just
-        # transiently. Harmless for every other (still-supported) distro
-        # in this matrix, since their Release files are already fresh.
         run: >
-          apt update -o Acquire::Check-Valid-Until=false && apt -y upgrade && apt -y dist-upgrade &&
+          apt update && apt -y upgrade && apt -y dist-upgrade &&
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt -y install git build-essential cmake gcc
           linux-headers-${{ env.HEADERS_SUFFIX }}
           libpcre2-dev libssl-dev liblua5.1-0-dev kmod

@@ -30,7 +30,8 @@ jobs:
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
           libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
-          iproute2 ppp pppoe isc-dhcp-client
+          iproute2 ppp pppoe isc-dhcp-client &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools (using pip)
         run: >

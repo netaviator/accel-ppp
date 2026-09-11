@@ -111,12 +111,13 @@ jobs:
       - name: Install build tools (on target OS)
         run: >
           ssh -i ssh-key -p2222 user@localhost "sudo apt -y install
-          git build-essential cmake gcc linux-headers-\`uname -r\` 
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          libxml2-dev libxslt1-dev zlib1g-dev 
-          iproute2 ppp pppoe isc-dhcp-client timelimit && 
-          (sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order || 
-          sudo pip3 install pytest pytest-dependency pytest-order || 
+          git build-essential cmake gcc linux-headers-\`uname -r\`
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          libxml2-dev libxslt1-dev zlib1g-dev
+          iproute2 ppp pppoe isc-dhcp-client timelimit &&
+          (sudo apt -y install linux-modules-extra-\`uname -r\` || true) &&
+          (sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order ||
+          sudo pip3 install pytest pytest-dependency pytest-order ||
           sudo pip3 install --break-system-packages pytest pytest-dependency pytest-order)"
       - name: Copy source code to target OS
         run: |
@@ -357,15 +358,16 @@ jobs:
     steps:
       - name: Install build tools (using apt)
         run: >
-          sudo apt update && 
+          sudo apt update &&
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          iproute2 ppp pppoe isc-dhcp-client
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          iproute2 ppp pppoe isc-dhcp-client &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools (using pip)
         run: >
-          sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order || 
+          sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order ||
           sudo pip3 install pytest pytest-dependency pytest-order || 
           sudo pip3 install --break-system-packages pytest pytest-dependency pytest-order
 
@@ -427,8 +429,9 @@ jobs:
           sudo apt update && 
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          iproute2 ppp pppoe isc-dhcp-client
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          iproute2 ppp pppoe isc-dhcp-client &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools
         run: >

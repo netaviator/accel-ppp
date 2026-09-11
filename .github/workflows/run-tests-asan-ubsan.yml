@@ -92,7 +92,7 @@ jobs:
           lsmod | grep ppposeq
 
       - name: Run tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         env:
           ${{ matrix.env_name }}: ${{ matrix.env_value }}

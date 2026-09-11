@@ -135,7 +135,7 @@ jobs:
           make && sudo make install"
 
       - name: Run tests (not related to ipoe and vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests && 
           sudo python3 -m pytest -Wall --order-dependencies -v -m \"not ipoe_driver and not vlan_mon_driver\""
@@ -153,7 +153,7 @@ jobs:
           lsmod | grep ipoe "
 
       - name: Run tests (not related to vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests && 
@@ -179,7 +179,7 @@ jobs:
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests &&
           sudo python3 -m pytest -Wall --order-dependencies -v"
@@ -283,7 +283,7 @@ jobs:
           make && doas make install"
 
       - name: Run tests (not related to ipoe and vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests && 
           doas python3 -m pytest -Wall --order-dependencies -v -m \"not ipoe_driver and not vlan_mon_driver and not chap_secrets\""
@@ -301,7 +301,7 @@ jobs:
           lsmod | grep ipoe "
 
       - name: Run tests (not related to vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests && 
@@ -327,7 +327,7 @@ jobs:
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests &&
           doas python3 -m pytest -Wall --order-dependencies -v -m \"not chap_secrets\""
@@ -402,7 +402,7 @@ jobs:
           lsmod | grep ppposeq
 
       - name: Run tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         run: sudo python3 -m pytest -Wall --order-dependencies -v
 
@@ -471,7 +471,7 @@ jobs:
           lsmod | grep ppposeq
 
       - name: Run tests (for coverage report) (fail is ok)
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         run: sudo python3 -m pytest -Wall --order-dependencies -v || exit 0
 

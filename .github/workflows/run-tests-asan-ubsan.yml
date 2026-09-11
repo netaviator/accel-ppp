@@ -85,7 +85,7 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq

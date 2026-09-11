@@ -156,7 +156,7 @@ jobs:
       - name: Insert ppposeq kernel module
         run: >
           ssh -i ssh-key -p2222 root@localhost "cd accel-ppp &&
-          modprobe pppox && insmod build/drivers/ppposeq/driver/ppposeq.ko &&
+          (modprobe l2tp_ppp || true) && modprobe pppox && insmod build/drivers/ppposeq/driver/ppposeq.ko &&
           lsmod | grep ppposeq"
       - name: Run tests (all)
         timeout-minutes: 5

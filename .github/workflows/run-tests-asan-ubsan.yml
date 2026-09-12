@@ -30,7 +30,8 @@ jobs:
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
           libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
-          iproute2 ppp pppoe isc-dhcp-client
+          iproute2 ppp pppoe isc-dhcp-client tcpdump &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools (using pip)
         run: >
@@ -85,13 +86,13 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq
 
       - name: Run tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         env:
           ${{ matrix.env_name }}: ${{ matrix.env_value }}

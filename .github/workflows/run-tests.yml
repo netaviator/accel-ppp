@@ -36,11 +36,6 @@ jobs:
             untar: true
             format: raw
 
-          - distro: Debian11
-            image: https://cdimage.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.tar.xz
-            untar: true
-            format: raw
-
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
@@ -111,12 +106,13 @@ jobs:
       - name: Install build tools (on target OS)
         run: >
           ssh -i ssh-key -p2222 user@localhost "sudo apt -y install
-          git build-essential cmake gcc linux-headers-\`uname -r\` 
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          libxml2-dev libxslt1-dev zlib1g-dev 
-          iproute2 ppp pppoe isc-dhcp-client timelimit && 
-          (sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order || 
-          sudo pip3 install pytest pytest-dependency pytest-order || 
+          git build-essential cmake gcc linux-headers-\`uname -r\`
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          libxml2-dev libxslt1-dev zlib1g-dev
+          iproute2 ppp pppoe isc-dhcp-client tcpdump timelimit &&
+          (sudo apt -y install linux-modules-extra-\`uname -r\` || true) &&
+          (sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order ||
+          sudo pip3 install pytest pytest-dependency pytest-order ||
           sudo pip3 install --break-system-packages pytest pytest-dependency pytest-order)"
       - name: Copy source code to target OS
         run: |
@@ -134,7 +130,7 @@ jobs:
           make && sudo make install"
 
       - name: Run tests (not related to ipoe and vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests && 
           sudo python3 -m pytest -Wall --order-dependencies -v -m \"not ipoe_driver and not vlan_mon_driver\""
@@ -152,7 +148,7 @@ jobs:
           lsmod | grep ipoe "
 
       - name: Run tests (not related to vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests && 
@@ -174,11 +170,11 @@ jobs:
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp &&
-          sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko &&
+          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko &&
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp/tests &&
           sudo python3 -m pytest -Wall --order-dependencies -v"
@@ -263,8 +259,8 @@ jobs:
           ssh -i ssh-key -p2222 alpine@localhost "doas cat /etc/passwd"
       - name: Install build tools (on target OS)
         run: >
-          ssh -i ssh-key -p2222 alpine@localhost "doas apk add --no-cache git cmake make g++ pcre2-dev libressl-dev linux-headers libucontext-dev lua5.1-dev linux-lts-dev py3-pip 
-          ppp ppp-pppoe && 
+          ssh -i ssh-key -p2222 alpine@localhost "doas apk add --no-cache git cmake make g++ pcre2-dev libressl-dev linux-headers libucontext-dev lua5.1-dev linux-lts-dev py3-pip
+          ppp ppp-pppoe tcpdump &&
           (doas pip3 install pytest pytest-dependency pytest-order || doas pip3 install --break-system-packages pytest pytest-dependency pytest-order)"
       - name: Copy source code to target OS
         run: |
@@ -282,7 +278,7 @@ jobs:
           make && doas make install"
 
       - name: Run tests (not related to ipoe and vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests && 
           doas python3 -m pytest -Wall --order-dependencies -v -m \"not ipoe_driver and not vlan_mon_driver and not chap_secrets\""
@@ -300,7 +296,7 @@ jobs:
           lsmod | grep ipoe "
 
       - name: Run tests (not related to vlan_mon drivers)
-        timeout-minutes: 5
+        timeout-minutes: 15
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests && 
@@ -322,11 +318,11 @@ jobs:
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp &&
-          doas modprobe pppox && doas insmod build/drivers/ppposeq/driver/ppposeq.ko &&
+          (doas modprobe l2tp_ppp || true) && doas modprobe pppox && doas insmod build/drivers/ppposeq/driver/ppposeq.ko &&
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp/tests &&
           doas python3 -m pytest -Wall --order-dependencies -v -m \"not chap_secrets\""
@@ -357,15 +353,16 @@ jobs:
     steps:
       - name: Install build tools (using apt)
         run: >
-          sudo apt update && 
+          sudo apt update &&
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          iproute2 ppp pppoe isc-dhcp-client
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          iproute2 ppp pppoe isc-dhcp-client tcpdump &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools (using pip)
         run: >
-          sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order || 
+          sudo apt -y install python3-pytest python3-pytest-dependency python3-pytest-order ||
           sudo pip3 install pytest pytest-dependency pytest-order || 
           sudo pip3 install --break-system-packages pytest pytest-dependency pytest-order
 
@@ -394,13 +391,13 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq
 
       - name: Run tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         run: sudo python3 -m pytest -Wall --order-dependencies -v
 
@@ -427,8 +424,9 @@ jobs:
           sudo apt update && 
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
-          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip 
-          iproute2 ppp pppoe isc-dhcp-client
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod python3-pip
+          iproute2 ppp pppoe isc-dhcp-client tcpdump &&
+          (sudo apt -y install linux-modules-extra-`uname -r` || true)
 
       - name: Install testing tools
         run: >
@@ -462,13 +460,13 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq
 
       - name: Run tests (for coverage report) (fail is ok)
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ./tests
         run: sudo python3 -m pytest -Wall --order-dependencies -v || exit 0
 

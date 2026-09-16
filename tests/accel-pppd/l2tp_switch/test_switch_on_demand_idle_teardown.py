@@ -34,7 +34,7 @@ import time
 
 import pytest
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance
+from helpers import start_instance, tunnels_active, wait_for_tunnels_active
 
 PEER_BIN = "/tmp/l2tp_switch_peer_test"
 
@@ -125,9 +125,17 @@ def _place_and_end_one_call(accel_cmd, peer_port, expect_connected):
         "the call was never actually paired downstream, so nothing was ever"
         f" active to go idle:\n{show}"
     )
-    assert "[up]" in show, (
-        "target's tunnel was already gone the moment its last call ended --"
-        f" no idle linger at all:\n{show}"
+    # "[idle]" here (Task 4) means "no active calls" -- it does not by
+    # itself prove the tunnel is still open (that word is deliberately the
+    # same one used once the tunnel is actually gone, see
+    # docs/l2tp_switching.md's Observability section). The genuine "no
+    # idle linger at all" regression this used to catch directly is instead
+    # caught a few seconds later, by this test's own mid-window
+    # tunnels_active() == 1 assertion below -- a zero-linger implementation
+    # would already have torn the tunnel down well before that point.
+    assert "[idle]" in show, (
+        f"target's tunnel is not idle immediately after its last call"
+        f" ended:\n{show}"
     )
     return ended
 
@@ -160,31 +168,43 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
 
         try:
             out = _switch_show(accel_cmd)
-            assert "[down]" in out, f"on-demand target connected with no call:\n{out}"
+            assert "[idle]" in out, f"on-demand target connected with no call:\n{out}"
 
             ended = _place_and_end_one_call(accel_cmd, 17111, 1)
 
             # Mid-window: comfortably past any "close it as soon as the last
             # call ends" behaviour, and comfortably short of the linger.
+            # `l2tp switch show`'s own status word is "[idle]" either way
+            # here (Task 4 deliberately does not distinguish "idle but
+            # still open" from "idle and closed" in that human-facing
+            # summary -- see docs/l2tp_switching.md), so the actual
+            # "still open" claim is checked via `show stat`'s tunnel count
+            # instead, which is unaffected by that ambiguity.
             time.sleep(IDLE_LINGER * 0.6)
             out = _switch_show(accel_cmd)
-            assert "[up]" in out, (
+            assert "[idle]" in out, out
+            n = tunnels_active(accel_cmd)
+            assert n == 1, (
                 f"tunnel closed {time.monotonic() - ended:.1f}s after the call"
                 f" ended, well inside the {IDLE_LINGER:.0f}s linger -- a"
-                f" back-to-back call would have to reconnect:\n{out}"
+                f" back-to-back call would have to reconnect (tunnels"
+                f" active={n}):\n{out}"
             )
 
-            closed, _, out = _wait_for(accel_cmd, "[down]", IDLE_LINGER)
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER)
             closed_after = time.monotonic() - ended
             assert closed, (
                 f"target's tunnel was still up {closed_after:.1f}s after its"
                 " last call ended -- it is waiting for the downstream peer's"
-                f" own idle policy instead of closing itself:\n{out}"
+                f" own idle policy instead of closing itself (tunnels"
+                f" active={n})"
             )
             assert closed_after > IDLE_LINGER * 0.8, (
                 f"tunnel closed after only {closed_after:.1f}s -- shorter than"
                 f" the {IDLE_LINGER:.0f}s window back-to-back calls rely on"
             )
+            out = _switch_show(accel_cmd)
+            assert "[idle]" in out, out
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
             config.delete_tmp(s_cfg)
@@ -237,9 +257,12 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
 
             time.sleep(gap)
             out = _switch_show(accel_cmd)
-            assert "[up]" in out, (
+            assert "[idle]" in out, out
+            n = tunnels_active(accel_cmd)
+            assert n == 1, (
                 f"tunnel closed {time.monotonic() - first_ended:.1f}s after the"
-                f" first call, before the second one could reuse it:\n{out}"
+                f" first call, before the second one could reuse it (tunnels"
+                f" active={n}):\n{out}"
             )
 
             second_ended = _place_and_end_one_call(accel_cmd, 17113, 2)
@@ -251,22 +274,27 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
             stale_deadline_passed = first_ended + IDLE_LINGER + 3.0
             time.sleep(max(0.0, stale_deadline_passed - time.monotonic()))
             out = _switch_show(accel_cmd)
-            assert "[up]" in out, (
+            assert "[idle]" in out, out
+            n = tunnels_active(accel_cmd)
+            assert n == 1, (
                 "tunnel closed on the *first* call's linger deadline"
                 f" ({time.monotonic() - second_ended:.1f}s after the second"
-                f" call ended, not the full window it is owed):\n{out}"
+                f" call ended, not the full window it is owed) (tunnels"
+                f" active={n})"
             )
 
-            closed, _, out = _wait_for(accel_cmd, "[down]", IDLE_LINGER)
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER)
             closed_after = time.monotonic() - second_ended
             assert closed, (
                 f"tunnel still up {closed_after:.1f}s after the second call"
-                f" ended:\n{out}"
+                f" ended (tunnels active={n})"
             )
             assert closed_after > IDLE_LINGER * 0.8, (
                 f"tunnel closed {closed_after:.1f}s after the second call"
                 f" ended -- short of its own {IDLE_LINGER:.0f}s window"
             )
+            out = _switch_show(accel_cmd)
+            assert "[idle]" in out, out
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
             config.delete_tmp(s_cfg)

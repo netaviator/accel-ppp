@@ -112,7 +112,7 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
             # within this.
             time.sleep(6.0)
             out = _switch_show(accel_cmd)
-            assert "[down]" in out, f"on-demand target connected with no call:\n{out}"
+            assert "[idle]" in out, f"on-demand target connected with no call:\n{out}"
             assert "placed: 0" in out, out
 
             # Now give it a reason to connect.
@@ -313,12 +313,12 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
         # ...and the target itself is back at rest afterwards: no
         # half-open tunnel lingering from the abandoned connect, and no
         # reconnect cadence still running with nothing left to serve.
-        at_rest, _, out = _wait_for(accel_cmd, "[down]", 20.0)
+        at_rest, _, out = _wait_for(accel_cmd, "[idle]", 20.0)
         assert at_rest, f"target left with a lingering tunnel:\n{out}"
 
         time.sleep(6.0)  # longer than the 5s reconnect cadence
         out = _switch_show(accel_cmd)
-        assert "[down]" in out, (
+        assert "[idle]" in out, (
             f"target kept retrying with no call left to serve:\n{out}"
         )
     finally:

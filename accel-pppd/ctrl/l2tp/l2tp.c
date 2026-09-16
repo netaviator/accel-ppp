@@ -422,10 +422,17 @@ void __export l2tp_switch_stat_targets_foreach(l2tp_switch_target_stat_cb cb,
 
 		/* Same reason as l2tp_switch_show_exec()'s snapshot: this runs
 		 * on whichever thread is scraping metrics, not on the context
-		 * that owns the tunnel pointer. No reference needed -- only
-		 * the pointer's NULL-ness is used, never the tunnel itself. */
+		 * that owns the tunnel pointer. No reference/hold needed here
+		 * (unlike that function's cross-lock-boundary use of the
+		 * pointer for twalk()) -- ->state is read strictly inside this
+		 * same locked section, never after unlocking, so nothing can
+		 * free the tunnel out from under this read. Checking ->state
+		 * instead of mere non-NULL-ness is this task's whole point:
+		 * target_up is meant to literally mean "genuinely STATE_ESTB",
+		 * for both modes -- a tunnel object exists from the moment
+		 * l2tp_tunnel_start() is called, well before that. */
 		pthread_mutex_lock(&t->lock);
-		up = t->tunnel != NULL;
+		up = t->tunnel != NULL && t->tunnel->state == STATE_ESTB;
 		pthread_mutex_unlock(&t->lock);
 
 		cb(t->name, up,
@@ -7055,24 +7062,71 @@ static int l2tp_switch_show_exec(const char *cmd, char * const *fields,
 	cli_send(client, "targets:\r\n");
 	list_for_each_entry(t, &l2tp_switch_targets, entry) {
 		struct l2tp_conn_t *conn;
+		const char *status;
+		unsigned int active;
 
 		/* Snapshot under the target's lock, with a reference: this
 		 * runs on the CLI thread, and an on-demand target's tunnel
 		 * pointer churns on every connect/abort/timeout cycle -- two
 		 * unlocked reads could disagree, and the second could
-		 * dereference a tunnel that has since been destroyed. */
+		 * dereference a tunnel that has since been destroyed. Reused
+		 * below for both modes' status word, so there is only ever
+		 * this one lock/hold on this pointer per line, not a second,
+		 * differently-locked read alongside it. */
 		pthread_mutex_lock(&t->lock);
 		conn = t->tunnel;
 		if (conn)
 			tunnel_hold(conn);
 		pthread_mutex_unlock(&t->lock);
 
+		active = __atomic_load_n(&t->active, __ATOMIC_RELAXED);
+
+		if (t->mode == L2TP_SWITCH_MODE_PERSISTENT) {
+			/* Tightened to genuinely STATE_ESTB: conn is non-NULL
+			 * from the moment l2tp_tunnel_start() is called, well
+			 * before the tunnel is actually usable. */
+			status = (conn && conn->state == STATE_ESTB) ?
+				"up" : "down";
+		} else {
+			/* "up" is derived from active > 0, not conn's state
+			 * directly: an on-demand tunnel can be STATE_ESTB
+			 * while idle-lingering (Task 3) with no calls on it,
+			 * which must show as "idle" here, not "up" -- a
+			 * fresh call always takes the fast path in
+			 * l2tp_switch_place_downstream_call() once the
+			 * tunnel is up, so active > 0 already implies
+			 * STATE_ESTB in practice.
+			 *
+			 * "connecting" is the real "is a connect actually
+			 * in flight" signal -- deliberately NOT
+			 * target->connect_budget_open, which (see that
+			 * field's own doc comment on struct
+			 * l2tp_switch_target_t) stays true across a failed
+			 * attempt and the idle gap before the next
+			 * reconnect_timer tick, so it does not mean "in
+			 * flight right now". conn's own state, already
+			 * snapshotted above under the lock and held with a
+			 * reference, is exactly that narrower signal.
+			 *
+			 * Everything else -- never connected, and
+			 * post-linger with the tunnel actually closed -- is
+			 * "idle": neither is an actionable fault, and this
+			 * is a human-facing summary, not the raw
+			 * tunnel-established bit (that's what the
+			 * target_up metric is for). */
+			if (active > 0)
+				status = "up";
+			else if (conn && conn->state != STATE_ESTB)
+				status = "connecting";
+			else
+				status = "idle";
+		}
+
 		cli_sendv(client, "  %s -> %s:%hu [%s] active=%u"
 				   " bytes_in=%llu bytes_out=%llu\r\n",
 			 t->name, inet_ntoa(t->peer_addr.sin_addr),
 			 ntohs(t->peer_addr.sin_port),
-			 conn ? "up" : "down",
-			 __atomic_load_n(&t->active, __ATOMIC_RELAXED),
+			 status, active,
 			 (unsigned long long)__atomic_load_n(&t->rx_bytes, __ATOMIC_RELAXED),
 			 (unsigned long long)__atomic_load_n(&t->tx_bytes, __ATOMIC_RELAXED));
 		if (conn) {

@@ -100,8 +100,8 @@ def test_switch_tunnel_on_demand_stays_down_with_no_calls(pytestconfig, accel_cm
     # session-less tunnel at startup -- doing so left a tunnel sitting idle
     # for a downstream peer's own idle-timeout policy to eventually flap
     # (e.g. JunOS tearing down a session-less tunnel after 60s). Uses
-    # today's plain "[down]" wording; Task 4 introduces a friendlier
-    # "[idle]" state and updates this same assertion once that lands.
+    # Task 4's friendlier "[idle]" wording for on-demand targets at rest
+    # (persistent targets, elsewhere in this file, keep plain "[down]").
     downstream_started, downstream_thread, downstream_ctrl, downstream_config = (
         _start_downstream(accel_pppd, accel_cmd, 2101, 12346, "downstreamsecret")
     )
@@ -148,7 +148,7 @@ def test_switch_tunnel_on_demand_stays_down_with_no_calls(pytestconfig, accel_cm
                 time.sleep(0.1)
 
             assert not up
-            assert "downstream -> 127.0.0.1:12346 [down]" in out
+            assert "downstream -> 127.0.0.1:12346 [idle]" in out
         finally:
             accel_pppd_process.end(switch_thread, switch_ctrl, accel_cmd, 10.0)
             config.delete_tmp(switch_config)

@@ -87,6 +87,14 @@
  * target that cannot be reached must not let the upstream side accumulate
  * unbounded held sessions while it keeps retrying. */
 #define L2TP_SWITCH_PENDING_MAX 64
+/* How long an on-demand target's tunnel stays up after its last call ends.
+ * Long enough that back-to-back calls reuse it instead of paying a fresh
+ * SCCRQ round trip each time (and instead of making accel-ppp itself the
+ * source of a connect/disconnect flap), short enough that accel-ppp closes
+ * the session-less tunnel on its own terms well before a downstream peer's
+ * own idle policy does it for us -- JunOS' default idle-timeout, the
+ * shortest one this feature is known to face, is 60s. */
+#define L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS 20000
 
 int conf_verbose = 0;
 int conf_hide_avps = 0;
@@ -322,6 +330,15 @@ static void l2tp_switch_teardown_peer(void *data);
  * tunnel that has just come up, and places each of them with it. */
 static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
 				      struct l2tp_conn_t *conn);
+/* l2tp-switch: the idle linger that closes an on-demand target's tunnel once
+ * its last call is gone. l2tp_session_free() -- above the rest of the switch
+ * code -- arms it for the tunnel it has just left session-less, in place of
+ * the immediate disconnect an ordinary tunnel gets there. The timer callback
+ * itself is defined much further down, next to the connect-timeout one it
+ * mirrors, because it needs tunnel_hold()/l2tp_tunnel_disconnect_push(). */
+static int l2tp_switch_target_arm_idle_linger(struct l2tp_switch_target_t *target,
+					      struct l2tp_conn_t *conn);
+static void l2tp_switch_target_idle_timer(struct triton_timer_t *t);
 
 static void l2tp_stat_inc(unsigned int *stat)
 {
@@ -1342,7 +1359,19 @@ static void l2tp_session_free(struct l2tp_sess_t *sess)
 	 */
 	session_put(sess);
 
-	if (--sess->paren_conn->sess_count == 0) {
+	/* An on-demand l2tp-switch target's tunnel is the one kind of tunnel
+	 * that deliberately outlives its last session: it closes itself
+	 * L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS later (with this very same
+	 * "general request to clear the control connection" result code),
+	 * unless another call reuses it first -- which is the whole point,
+	 * since re-running SCCRQ per call would trade the peer-driven flap
+	 * this mode exists to stop for a self-inflicted one. Every other
+	 * tunnel, including a persistent target's, keeps disconnecting the
+	 * moment it goes empty. If the linger cannot be armed, this falls
+	 * back to that immediate disconnect rather than leaking the tunnel. */
+	if (--sess->paren_conn->sess_count == 0 &&
+	    l2tp_switch_target_arm_idle_linger(sess->paren_conn->switch_target,
+					       sess->paren_conn) < 0) {
 		switch (sess->paren_conn->state) {
 		case STATE_ESTB:
 			log_tunnel(log_info1, sess->paren_conn,
@@ -1421,6 +1450,93 @@ static void l2tp_switch_target_schedule_retry(struct l2tp_switch_target_t *targe
 				  " schedule reconnect\n", target->name);
 	}
 	pthread_mutex_unlock(&target->lock);
+}
+
+/* Arms -- or pushes out -- the linger after which an on-demand target's
+ * tunnel closes itself, having just been left with nothing using it.
+ *
+ * Returns 0 only if a linger is now pending for `conn` specifically, which
+ * is what lets l2tp_session_free() use this as its "leave this tunnel open"
+ * test and fall back to its usual immediate disconnect on -1 (wrong mode,
+ * `conn` is not this target's tunnel any more, calls are queued waiting for
+ * a tunnel, or the timer could not be armed at all). `conn` may be NULL for
+ * callers that only know the target and mean "whatever its tunnel is now".
+ *
+ * Callable from any context: it touches only target-owned state under
+ * target->lock, and arming a NULL-context (default context) triton timer is
+ * already done this way by l2tp_switch_target_schedule_retry() above and by
+ * l2tp_switch_open_connect_budget_locked() further down.
+ *
+ * Deliberately permissive about "is the target really idle": callers arm
+ * where a tunnel has just become callless, and the two authoritative
+ * re-checks happen when the timer fires -- target->active on the default
+ * context, then conn->sess_count in conn's own context, where it cannot go
+ * stale under us. An arm too many costs one no-op timer tick; a missing one
+ * would strand a session-less tunnel up indefinitely, which is the exact
+ * failure this whole feature exists to avoid. */
+static int l2tp_switch_target_arm_idle_linger(struct l2tp_switch_target_t *target,
+					      struct l2tp_conn_t *conn)
+{
+	uint64_t now;
+	int res;
+
+	if (!target || target->mode != L2TP_SWITCH_MODE_ON_DEMAND)
+		return -1;
+
+	pthread_mutex_lock(&target->lock);
+
+	/* Same identity guard as l2tp_tunnel_free()'s own switch_target hook:
+	 * a tunnel that is no longer this target's (an attempt abandoned by
+	 * the connect timeout, say) has nothing to do with the target's idle
+	 * state and must not be kept alive by its linger. */
+	if (!target->tunnel || (conn && target->tunnel != conn))
+		goto err;
+	if (target->tunnel->state != STATE_ESTB)
+		goto err; /* still negotiating or already going away -- the
+			   * connect path's business, not the linger's */
+	/* An open connect budget means calls are queued waiting for this
+	 * target to produce a usable tunnel: it is about to be busy, not
+	 * idle, and arming a teardown against the very tunnel they are about
+	 * to be placed on would be backwards. */
+	if (target->connect_budget_open)
+		goto err;
+
+	now = l2tp_switch_monotonic_ms();
+	target->idle_timer.expire = l2tp_switch_target_idle_timer;
+	target->idle_timer.period = L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS;
+
+	/* The timer can still be armed from an earlier linger that was
+	 * cancelled by a call reusing the tunnel (cancelling only zeroes
+	 * idle_deadline -- see the field's own comment) or that fired while
+	 * the target was busy. Push it out to a full linger from now rather
+	 * than stacking a second registration on top of it, or inheriting
+	 * whatever was left of the previous window. Mirrors
+	 * l2tp_switch_open_connect_budget_locked() exactly. */
+	if (target->idle_timer.tpd)
+		res = triton_timer_mod(&target->idle_timer, 0);
+	else
+		res = triton_timer_add(NULL, &target->idle_timer, 0);
+
+	if (res < 0) {
+		log_error("l2tp-switch: target \"%s\": failed to arm idle"
+			  " linger\n", target->name);
+		goto err;
+	}
+
+	/* Read before arming, so the deadline the callback compares against
+	 * is never later than the timer's own expiry -- otherwise a genuine
+	 * expiry would look like a stale dispatch and cost a whole extra
+	 * period. */
+	target->idle_deadline = now + L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS;
+
+	pthread_mutex_unlock(&target->lock);
+
+	return 0;
+
+err:
+	pthread_mutex_unlock(&target->lock);
+
+	return -1;
 }
 
 static void l2tp_tunnel_free(struct l2tp_conn_t *conn)
@@ -2585,6 +2701,16 @@ static void l2tp_switch_drain_pending_calls(struct l2tp_conn_t *conn)
 		list_del(&sess->switch_pending_entry);
 		l2tp_switch_place_call_on(sess, conn);
 	}
+
+	/* Nothing left to place -- every queued call was given up on by the
+	 * connect timeout in the instant before this tunnel finished coming
+	 * up. It is a perfectly good tunnel that a later call can reuse, so
+	 * it is not an error, but nothing will ever call l2tp_session_free()
+	 * on it either: start its idle linger so it closes itself instead of
+	 * waiting for the peer to do it. (Calls that *were* placed and then
+	 * failed do the same from l2tp_switch_place_call_on()'s own tail.) */
+	if (conn->state == STATE_ESTB && conn->sess_count == 0)
+		l2tp_switch_target_arm_idle_linger(target, conn);
 }
 
 static int l2tp_tunnel_connect(struct l2tp_conn_t *conn)
@@ -4246,8 +4372,22 @@ static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 	 * which the splice-failure path (l2tp_switch_link_fail frees its
 	 * own link *before* disconnecting, so the l2tp_session_free hook
 	 * never sees it non-NULL) would get wrong. */
-	if (link->from_upstream)
-		__atomic_sub_fetch(&link->target->active, 1, __ATOMIC_RELAXED);
+	if (link->from_upstream &&
+	    __atomic_sub_fetch(&link->target->active, 1,
+			       __ATOMIC_RELAXED) == 0) {
+		/* Last call on this target just ended: start the idle linger
+		 * (a no-op unless the target is on-demand with an established
+		 * tunnel). NULL tunnel: this runs in one of the *call's* two
+		 * session contexts, neither of which is necessarily the
+		 * target's tunnel context, so the target's own current tunnel
+		 * pointer -- read under its lock -- is the only sound answer
+		 * to "which tunnel just went idle". The same linger is armed
+		 * again from l2tp_session_free() once the downstream leg
+		 * actually leaves that tunnel; arming here too means a
+		 * pairing that never got as far as its own session still
+		 * starts the clock. */
+		l2tp_switch_target_arm_idle_linger(link->target, NULL);
+	}
 
 	if (link->hnd.tpd) {
 		triton_md_unregister_handler(&link->hnd, 1 /* close fd */);
@@ -4290,7 +4430,21 @@ static void l2tp_switch_teardown_peer(void *data)
 		session_put(sess); /* the hold justified by the pointer just cleared */
 
 	if (peer->state1 != STATE_CLOSE)
-		l2tp_session_disconnect(peer, 2, 6);
+		/* _push(), not the plain disconnect: this runs as a scheduled
+		 * context call, never through l2tp_conn_read()'s own receive
+		 * loop, so nothing else would ever flush the CDN out of the
+		 * tunnel's send queue -- exactly the problem
+		 * l2tp_switch_place_call_on() already documents for its ICRQ.
+		 * Against an accel-ppp downstream it goes unnoticed, since
+		 * that peer answers the end of a call by tearing the whole
+		 * tunnel down within milliseconds, and its StopCCN flushes
+		 * the queue on the way in. Against a peer that simply keeps
+		 * the tunnel -- which, with this task's idle linger, is now
+		 * the case the switch is written for -- the CDN sat unsent
+		 * until the linger closed the tunnel 20s later and
+		 * l2tp_tunnel_disconnect() discarded it, leaving the peer
+		 * holding a call that ended long ago. */
+		l2tp_session_disconnect_push(peer, 2, 6);
 
 	session_put(peer); /* the temporary hold taken to survive the
 			     * context switch into here -- see the caller */
@@ -4782,6 +4936,104 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 	}
 }
 
+/* Closes an on-demand target's tunnel whose idle linger has run out. Runs in
+ * the tunnel's own context (crossed into by l2tp_switch_target_idle_timer()
+ * below), the only context allowed to touch its send queue and timers. */
+static void l2tp_switch_close_idle_tunnel(void *data)
+{
+	struct l2tp_conn_t *conn = data;
+
+	/* The authoritative "is it still idle" test, and the reason it lives
+	 * here rather than in the timer callback: conn->sess_count is owned
+	 * by this context, so unlike anything read from the default context
+	 * it cannot go stale between the test and the disconnect. A call
+	 * placed in the window between the timer firing and this call running
+	 * is exactly what the linger exists to let happen. */
+	if (conn->state != STATE_ESTB || conn->sess_count)
+		goto out;
+
+	log_tunnel(log_info1, conn, "l2tp-switch: target \"%s\" idle for %ds,"
+		   " closing on-demand tunnel\n",
+		   conn->switch_target ? conn->switch_target->name : "?",
+		   L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS / 1000);
+
+	/* Result 1, "general request to clear the control connection"
+	 * (RFC 2661 5.4): a voluntary administrative close, not an error --
+	 * the same code l2tp_session_free() sends when an ordinary tunnel
+	 * loses its last session, which is the disconnect this linger
+	 * postponed. _push(), not the plain disconnect: reached by a
+	 * scheduled context call rather than through l2tp_conn_read()'s
+	 * receive loop, nothing else would flush the StopCCN out of the send
+	 * queue (same reason l2tp_switch_place_call_on() pushes its ICRQ).
+	 *
+	 * l2tp_tunnel_free()'s own switch_target hook then leaves the target
+	 * cold: l2tp_switch_target_should_retry() finds an on-demand target
+	 * with no pending calls and schedules no reconnect. */
+	l2tp_tunnel_disconnect_push(conn, 1, 0);
+
+out:
+	tunnel_put(conn); /* the hold taken in
+			   * l2tp_switch_target_idle_timer() below */
+}
+
+/* An on-demand target's tunnel has now been callless for a full linger
+ * window. Hand it to its own context to be closed.
+ *
+ * Runs on the default context (the timer is armed with a NULL context),
+ * which is also the context that owns the timer -- so this is the one place
+ * allowed to delete it. Cancelling a linger from anywhere else therefore
+ * only zeroes idle_deadline (see l2tp_switch_place_downstream_call()'s fast
+ * path) and leaves the retirement to this callback; deleting a triton timer
+ * from a foreign context races triton's own dispatch, which drops its lock
+ * before dereferencing the timer it is about to call.
+ *
+ * Like l2tp_switch_on_demand_timeout(), this can therefore run with nothing
+ * to do, and for a window that no longer exists: idle_deadline is what tells
+ * a genuine expiry from a dispatch left over from an earlier, shorter
+ * linger. */
+static void l2tp_switch_target_idle_timer(struct triton_timer_t *t)
+{
+	struct l2tp_switch_target_t *target =
+		container_of(t, typeof(*target), idle_timer);
+	struct l2tp_conn_t *conn = NULL;
+
+	pthread_mutex_lock(&target->lock);
+
+	if (target->idle_deadline &&
+	    l2tp_switch_monotonic_ms() < target->idle_deadline) {
+		/* A later call's linger pushed the deadline out from under a
+		 * dispatch that was already on its way. Leave the timer
+		 * armed: it is that window's timer now, and it comes due
+		 * again at the right time. */
+		pthread_mutex_unlock(&target->lock);
+		return;
+	}
+
+	if (target->idle_timer.tpd)
+		triton_timer_del(&target->idle_timer);
+
+	/* A cancelled linger (idle_deadline == 0) retires the timer above and
+	 * stops here. Otherwise the target's own call count is the cheap
+	 * first re-check -- conn->sess_count, checked in conn's context, is
+	 * the authoritative one. */
+	if (target->idle_deadline && target->tunnel &&
+	    __atomic_load_n(&target->active, __ATOMIC_RELAXED) == 0) {
+		conn = target->tunnel;
+		tunnel_hold(conn); /* keeps it alive until the close call
+				    * below runs in its own context */
+	}
+	target->idle_deadline = 0;
+
+	pthread_mutex_unlock(&target->lock);
+
+	if (!conn)
+		return;
+
+	if (triton_context_call(&conn->ctx, l2tp_switch_close_idle_tunnel,
+				conn) < 0)
+		tunnel_put(conn);
+}
+
 /* Places upstream's downstream leg on `conn`. Two callers, both of which
  * hand over one session hold on upstream that this function releases on
  * every path:
@@ -4799,6 +5051,9 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
 				      struct l2tp_conn_t *conn)
 {
+	/* Captured up front: every failure path below releases the caller's
+	 * hold on upstream, after which upstream may already be gone. */
+	struct l2tp_switch_target_t *target = upstream->switch_target;
 	struct l2tp_sess_t *downstream;
 
 	/* This function runs in conn's context (the downstream target's
@@ -4829,7 +5084,7 @@ static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
 	 * exists. */
 	if (upstream->state1 == STATE_CLOSE) {
 		session_put(upstream);
-		return;
+		goto out_idle;
 	}
 
 	/* conn was usable when this call was handed over, but it can have been
@@ -4935,13 +5190,27 @@ err_no_pairing:
 				l2tp_switch_disconnect_upstream, upstream) < 0)
 		session_put(upstream); /* couldn't even schedule it; still
 					 * release our own hold */
-	return;
+	goto out_idle;
 
 err_pairing_done:
 	/* The Task 8 hook triggered by l2tp_session_free(downstream) above
 	 * already scheduled upstream's teardown in its own context; just
 	 * release the call-site's own temporary hold on upstream. */
 	session_put(upstream);
+	/* fall through */
+
+out_idle:
+	/* This call left conn without one. If it was the reason conn was kept
+	 * alive at all -- the fast path zeroed the target's linger window the
+	 * moment it decided to reuse this tunnel, and a call that then fails
+	 * before creating a session never reaches l2tp_session_free() to
+	 * restart it -- conn would sit here session-less forever. Restart the
+	 * linger instead, so a tunnel nothing managed to use still closes
+	 * itself. Guarded on conn's own session count, which this context
+	 * owns: other calls' sessions on the same tunnel keep it out of this
+	 * entirely. */
+	if (conn->state == STATE_ESTB && conn->sess_count == 0)
+		l2tp_switch_target_arm_idle_linger(target, conn);
 }
 
 /* What a scheduled (cross-context) call placement carries, since
@@ -5062,10 +5331,14 @@ static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 		/* Fast path: tunnel already usable (persistent mode always
 		 * takes this path when it's going to succeed at all; on-demand
 		 * takes it once its own idle/lingering tunnel is reused).
-		 * Cancel any linger-teardown armed for it (Task 3) before this
-		 * call starts using it again. */
-		if (target->idle_timer.tpd)
-			triton_timer_del(&target->idle_timer);
+		 * Cancel any linger-teardown armed for it before this call
+		 * starts using it again -- by closing the window, not by
+		 * deleting the timer: this runs in the *upstream* session's
+		 * context, and idle_timer belongs to the default context,
+		 * where l2tp_switch_target_idle_timer() retires it on its next
+		 * tick. (Same rule connect_timeout_timer already follows; see
+		 * l2tp_switch_drain_pending_calls().) */
+		target->idle_deadline = 0;
 		tunnel_hold(conn); /* taken while the lock still guarantees conn
 				    * is alive: it has to outlive the hop into
 				    * its own context below */

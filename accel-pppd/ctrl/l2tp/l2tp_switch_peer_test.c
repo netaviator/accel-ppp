@@ -428,6 +428,9 @@ static double now_monotonic(void)
  * that is the whole point of this mode, and matches production evidence
  * for the bug this exercises.
  *
+ * With --hold-seconds it then stays on the tunnel for that long, serving it
+ * as a patient LNS would -- see serve_established_tunnel() above.
+ *
  * Emits one "event=... round=N t=<monotonic seconds>" line per step so the
  * driving test can measure the gap between "sent_stopccn" and the next
  * round's "recv_sccrq" -- i.e. how long the switch actually took to
@@ -435,6 +438,139 @@ static double now_monotonic(void)
  * "[down]" status only flips once the old tunnel is actually freed (see the
  * comment on l2tp_switch_target_t.tunnel in l2tp.c).
  */
+/* --listen, after the tunnel is established: play a downstream LNS that does
+ * *not* hang up the moment a call ends.
+ *
+ * A real accel-ppp instance cannot play that role. Its l2tp_session_free()
+ * disconnects any tunnel as soon as its last session goes away, so a
+ * downstream accel-ppp always tears the tunnel down first, before anything
+ * the *switch* does with an idle tunnel of its own can be observed at all.
+ * Real peers are more patient -- JunOS keeps an idle tunnel for its own
+ * idle-timeout, 60s by default -- and that patience is the entire premise of
+ * the switch closing its on-demand tunnels on its own, earlier terms. This
+ * loop supplies it: answer ICRQ so a switched call can really establish, ack
+ * everything else so nothing is retransmitted into a timeout, and otherwise
+ * say nothing at all until --hold-seconds is up.
+ *
+ * Emits one event line per message received, with the monotonic timestamp a
+ * driving test measures its windows against. StopCCN also reports its result
+ * code, which is what tells a voluntary idle teardown (1, "general request
+ * to clear the control connection") from an error-driven one.
+ */
+static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr,
+				    uint16_t their_tid, uint16_t *my_ns,
+				    uint16_t *peer_next_nr, int round)
+{
+	double until = now_monotonic() + hold_seconds;
+	/* Short enough that the loop notices --hold-seconds running out
+	 * promptly on a silent tunnel, which is most of its life. */
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+	uint16_t next_sid = (uint16_t)(200 + round * 10);
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+		return die("setsockopt(SO_RCVTIMEO) failed");
+
+	while (now_monotonic() < until) {
+		struct l2tp_packet_t *msg = NULL, *rsp;
+		struct l2tp_attr_t *attr, *msg_type;
+		uint16_t type = 0, their_sid = 0;
+		int stop = 0;
+
+		if (l2tp_recv(fd, &msg, NULL, secret, strlen(secret)) != 0)
+			continue; /* idle (EAGAIN), or a datagram that failed
+				   * to parse -- neither is this loop's
+				   * business */
+		if (!msg)
+			continue;
+		if (list_empty(&msg->attrs)) {
+			/* A ZLB: it acks something of ours, and acking it back
+			 * would be an infinite ping-pong. */
+			l2tp_packet_free(msg);
+			continue;
+		}
+
+		*peer_next_nr = ntohs(msg->hdr.Ns) + 1;
+		/* RFC 2661 4.1: Message-Type is always the first AVP. */
+		msg_type = list_first_entry(&msg->attrs, typeof(*msg_type),
+					    entry);
+		if (msg_type->attr && msg_type->attr->id == Message_Type)
+			type = msg_type->val.uint16;
+
+		if (type == Message_Type_Incoming_Call_Request) {
+			list_for_each_entry(attr, &msg->attrs, entry)
+				if (attr->attr &&
+				    attr->attr->id == Assigned_Session_ID)
+					their_sid = (uint16_t)attr->val.int16;
+			printf("event=recv_icrq round=%d t=%.6f\n",
+			       round, now_monotonic());
+		} else if (type == Message_Type_Incoming_Call_Connected) {
+			printf("event=recv_iccn round=%d t=%.6f\n",
+			       round, now_monotonic());
+		} else if (type == Message_Type_Call_Disconnect_Notify) {
+			printf("event=recv_cdn round=%d t=%.6f\n",
+			       round, now_monotonic());
+		} else if (type == Message_Type_Stop_Ctrl_Conn_Notify) {
+			unsigned int res = 0;
+
+			list_for_each_entry(attr, &msg->attrs, entry)
+				if (attr->attr && attr->attr->id == Result_Code &&
+				    attr->length >= 2)
+					res = (unsigned int)
+						((attr->val.octets[0] << 8) |
+						 attr->val.octets[1]);
+			printf("event=recv_stopccn round=%d t=%.6f res=%u\n",
+			       round, now_monotonic(), res);
+			stop = 1;
+		}
+		l2tp_packet_free(msg);
+		fflush(stdout);
+
+		if (type == Message_Type_Incoming_Call_Request && their_sid) {
+			/* The reply's header sid is the *recipient's* own
+			 * assigned session ID (RFC 2661 5.1), i.e. the one
+			 * that arrived in the ICRQ; ours goes in the AVP. */
+			rsp = l2tp_packet_alloc(2, Message_Type_Incoming_Call_Reply,
+						their_addr, 0, secret,
+						strlen(secret));
+			if (!rsp)
+				return die("ICRP alloc failed");
+			if (l2tp_packet_add_int16(rsp, Assigned_Session_ID,
+						  next_sid, 1) < 0)
+				return die("ICRP Assigned-Session-ID add failed");
+			rsp->hdr.tid = htons(their_tid);
+			rsp->hdr.sid = htons(their_sid);
+			rsp->hdr.Ns = htons((*my_ns)++);
+			rsp->hdr.Nr = htons(*peer_next_nr);
+			if (l2tp_packet_send(fd, rsp) < 0)
+				return die("ICRP send failed");
+			l2tp_packet_free(rsp);
+			next_sid++;
+		} else {
+			/* A bare ZLB ack. It takes no slot of its own in the
+			 * sequence space (RFC 2661 5.8), so my_ns is left
+			 * alone -- but without it the switch retransmits every
+			 * message until it gives up on the whole tunnel, which
+			 * would end exactly the idle window these tests
+			 * measure. */
+			rsp = l2tp_packet_alloc(2, 0, their_addr, 0, NULL, 0);
+			if (!rsp)
+				return die("ZLB alloc failed");
+			rsp->hdr.tid = htons(their_tid);
+			rsp->hdr.sid = 0;
+			rsp->hdr.Ns = htons(*my_ns);
+			rsp->hdr.Nr = htons(*peer_next_nr);
+			if (l2tp_packet_send(fd, rsp) < 0)
+				return die("ZLB send failed");
+			l2tp_packet_free(rsp);
+		}
+
+		if (stop)
+			break;
+	}
+
+	return 0;
+}
+
 static int run_listen_mode(int rounds)
 {
 	struct sockaddr_in bind_addr = {
@@ -608,6 +744,14 @@ static int run_listen_mode(int rounds)
 			printf("event=sent_stopccn round=%d t=%.6f\n", round, now_monotonic());
 			fflush(stdout);
 		}
+
+		/* Without --hold-seconds this mode keeps its original
+		 * behaviour: establish (or establish-then-StopCCN) and move
+		 * straight on to the next round, saying nothing further. */
+		if (hold_seconds > 0 &&
+		    serve_established_tunnel(fd, &their_addr, their_tid,
+					     &my_ns, &peer_next_nr, round) < 0)
+			return 1;
 	}
 
 	return 0;
@@ -725,7 +869,8 @@ int main(int argc, char **argv)
 				   " [--wait-cdn [--cdn-timeout S]]"
 				   " [--second-call C]"
 				   " [--real-ppp] [--hold-seconds N]"
-				   " [--listen [--rounds N] [--sccrp-delay-ms M]]");
+				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
+				   " [--hold-seconds N]]");
 		}
 	}
 

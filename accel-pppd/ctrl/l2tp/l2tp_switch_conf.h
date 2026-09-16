@@ -57,6 +57,18 @@ struct l2tp_switch_target_t {
 	 * arming of this (single, embedded) timer it belongs to. */
 	uint64_t connect_deadline;
 	struct triton_timer_t connect_timeout_timer;
+	/* Monotonic ms at which the armed idle_timer's current linger
+	 * expires, or 0 when no linger is pending. Plays exactly the two
+	 * roles connect_deadline plays for connect_timeout_timer: cancelling
+	 * a linger (a new call reusing the tunnel, from that call's own
+	 * context) is a matter of zeroing this under the lock, leaving the
+	 * timer for the default context that owns it to retire on its next
+	 * tick -- deleting a triton timer from a foreign context races its
+	 * dispatch; and a dispatch left over from an earlier, shorter linger
+	 * is told apart from a genuine expiry by comparing against it, since
+	 * triton hands the callback nothing identifying which arming of this
+	 * single embedded timer it belongs to. */
+	uint64_t idle_deadline;
 	struct triton_timer_t idle_timer; /* armed by Task 3; declared here
 		because this task's own l2tp_switch_place_downstream_call()
 		fast path already references target->idle_timer (to cancel a

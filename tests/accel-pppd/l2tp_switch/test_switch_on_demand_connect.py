@@ -301,7 +301,11 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
         )
         # ...and bounded: the timer fires once, and the retry cadence does
         # not get to extend it indefinitely.
-        assert waited < CONNECT_TIMEOUT + 5.0, (
+        # Tight on purpose: the timer is periodic, so a budget that is armed
+        # but never re-armed to the current deadline fires at the *previous*
+        # deadline, no-ops, and only gives up a whole period later. Anything
+        # past ~12.5s means the deadline and the timer have drifted apart.
+        assert waited < CONNECT_TIMEOUT + 2.5, (
             f"call hung for {waited:.1f}s before being disconnected --"
             f" the {CONNECT_TIMEOUT:.0f}s connect timeout is not bounding it"
         )
@@ -316,6 +320,102 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
         out = _switch_show(accel_cmd)
         assert "[down]" in out, (
             f"target kept retrying with no call left to serve:\n{out}"
+        )
+    finally:
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        config.delete_tmp(s_cfg)
+
+
+@pytest.mark.l2tp_switch
+def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel_cmd, accel_pppd):
+    # A target that connects, is used, and loses its tunnel again leaves the
+    # connect-timeout timer behind: it is armed on the default context, and
+    # the drain that closed the first budget deliberately does not cancel it
+    # cross-context. A later call therefore re-arms an already-armed timer,
+    # and must get its own full budget from that moment -- not whatever was
+    # left of the first call's, which would disconnect it early (here: 5s
+    # in, instead of 10s).
+    gap = 5.0
+
+    s_started, s_thread, s_ctrl, s_cfg = start_instance(
+        accel_pppd,
+        accel_cmd,
+        2001,
+        "127.0.0.1",
+        17107,
+        "upstreamsecret",
+        extra="""
+    [l2tp-switch]
+    target=flaky,127.0.0.1,17106,downstreamsecret,on-demand
+    match=Calling-Number,exact,472913,flaky
+    """,
+    )
+    assert s_started
+
+    try:
+        # One round only: the downstream accepts the switch's tunnel, then
+        # exits -- taking its socket with it, so the tunnel dies and the
+        # target goes cold again with the first budget's timer still armed.
+        down_thread, down_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--listen",
+                "--peer-port", "17106",
+                "--secret", "downstreamsecret",
+                "--rounds", "1",
+            ],
+        )
+
+        first_thread, first_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--peer-addr", "127.0.0.1",
+                "--peer-port", "17107",
+                "--secret", "upstreamsecret",
+                "--calling-number", "472913",
+            ],
+        )
+        _finish(first_thread, first_ctrl, 20.0)
+        _finish(down_thread, down_ctrl, 20.0)
+
+        placed, _, out = _wait_for(accel_cmd, "placed: 1", 10.0)
+        assert placed, f"first call was never placed:\n{out}"
+
+        # Well inside the first budget's 10s, so its timer is still armed.
+        time.sleep(gap)
+
+        second_thread, second_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--peer-addr", "127.0.0.1",
+                "--peer-port", "17107",
+                "--secret", "upstreamsecret",
+                "--calling-number", "472913",
+                "--wait-cdn",
+                "--cdn-timeout", "25",
+            ],
+        )
+        rc, out, err = _finish(second_thread, second_ctrl, 40.0)
+        assert rc == 0, f"second call was never disconnected (rc={rc}): {err}\n{out}"
+
+        stamps = _timestamps(out)
+        assert "sent_iccn" in stamps and "recv_cdn" in stamps, out
+        waited = stamps["recv_cdn"] - stamps["sent_iccn"]
+
+        # Inheriting the first budget would land at ~(10 - gap) = 5s; its own
+        # budget lands at ~10s.
+        assert waited > CONNECT_TIMEOUT * 0.7, (
+            f"second call was disconnected after {waited:.1f}s -- it"
+            f" inherited what was left of the first call's budget instead of"
+            f" getting its own {CONNECT_TIMEOUT:.0f}s"
+        )
+        # Same tight bound, and here it is the real assertion: leaving the
+        # inherited timer armed at the first budget's deadline makes it fire
+        # early, no-op on the deadline check, and only disconnect a full
+        # period later -- ~14s rather than ~10s.
+        assert waited < CONNECT_TIMEOUT + 2.5, (
+            f"second call hung for {waited:.1f}s before being disconnected --"
+            " its budget's timer is not armed to its own deadline"
         )
     finally:
         accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)

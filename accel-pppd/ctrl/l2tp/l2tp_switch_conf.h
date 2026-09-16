@@ -29,19 +29,33 @@ struct l2tp_switch_target_t {
 	struct l2tp_conn_t *tunnel;
 	struct triton_timer_t reconnect_timer;
 
-	/* on-demand only (owned by l2tp.c): guards pending_calls/pending_count/
-	 * connecting below, and the tunnel pointer above. These are mutated
+	/* Guards everything below, plus the `tunnel` pointer and
+	 * `reconnect_timer`'s armed/not-armed state above. These are mutated
 	 * from whichever upstream session's own tunnel context happens to
-	 * place a call against this target -- essentially never this target's
-	 * own tunnel context, and often no context at all while the target is
-	 * cold -- so a plain list_head is not safe here without a lock,
-	 * mirroring l2tp_lock/conn->ctx_lock's existing role elsewhere in
-	 * l2tp.c for exactly this kind of cross-context-shared,
+	 * place a call against this target, from the target tunnel's own
+	 * context, and from the default context (both timers below are armed
+	 * with a NULL context) -- so a plain list_head is not safe here
+	 * without a lock, mirroring l2tp_lock/conn->ctx_lock's existing role
+	 * elsewhere in l2tp.c for exactly this kind of cross-context-shared,
 	 * non-atomic-friendly state. */
 	pthread_mutex_t lock;
 	struct list_head pending_calls; /* l2tp_sess_t.switch_pending_entry */
 	unsigned int pending_count;
-	int connecting;
+	/* "A connect budget is open": calls are queued waiting for this
+	 * target to produce a usable tunnel, and connect_timeout_timer is
+	 * armed to bound that wait. Deliberately NOT "a connect attempt is
+	 * running right now" -- the budget stays open across a failed attempt
+	 * and the idle gap before the next reconnect_timer tick. Anything
+	 * wanting the narrower "negotiating right now" (e.g. a future
+	 * [connecting] CLI state) should derive it from
+	 * `tunnel && tunnel->state != STATE_ESTB` instead. */
+	int connect_budget_open;
+	/* Monotonic ms at which the currently-open budget expires. Lets
+	 * l2tp_switch_on_demand_timeout() tell a genuine expiry from a
+	 * dispatch left over from a budget that has since been closed and
+	 * reopened -- triton hands the callback nothing that identifies which
+	 * arming of this (single, embedded) timer it belongs to. */
+	uint64_t connect_deadline;
 	struct triton_timer_t connect_timeout_timer;
 	struct triton_timer_t idle_timer; /* armed by Task 3; declared here
 		because this task's own l2tp_switch_place_downstream_call()

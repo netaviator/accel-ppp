@@ -320,7 +320,8 @@ static void l2tp_switch_teardown_peer(void *data);
  * the call-placing code. Declared here because l2tp_tunnel_connect() -- far
  * earlier in this file -- drains an on-demand target's queued calls onto the
  * tunnel that has just come up, and places each of them with it. */
-static void l2tp_switch_place_call(void *data);
+static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
+				      struct l2tp_conn_t *conn);
 
 static void l2tp_stat_inc(unsigned int *stat)
 {
@@ -400,7 +401,17 @@ void __export l2tp_switch_stat_targets_foreach(l2tp_switch_target_stat_cb cb,
 	struct l2tp_switch_target_t *t;
 
 	list_for_each_entry(t, &l2tp_switch_targets, entry) {
-		cb(t->name, t->tunnel != NULL,
+		int up;
+
+		/* Same reason as l2tp_switch_show_exec()'s snapshot: this runs
+		 * on whichever thread is scraping metrics, not on the context
+		 * that owns the tunnel pointer. No reference needed -- only
+		 * the pointer's NULL-ness is used, never the tunnel itself. */
+		pthread_mutex_lock(&t->lock);
+		up = t->tunnel != NULL;
+		pthread_mutex_unlock(&t->lock);
+
+		cb(t->name, up,
 		   __atomic_load_n(&t->active, __ATOMIC_RELAXED),
 		   __atomic_load_n(&t->rx_bytes, __ATOMIC_RELAXED),
 		   __atomic_load_n(&t->tx_bytes, __ATOMIC_RELAXED),
@@ -1358,6 +1369,18 @@ static void l2tp_session_free(struct l2tp_sess_t *sess)
 	session_put(sess);
 }
 
+/* Monotonic milliseconds, same clock triton's own timers run on. triton.h's
+ * _time() only offers second granularity, which is too coarse to compare a
+ * connect budget's deadline against. */
+static uint64_t l2tp_switch_monotonic_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
 /* Whether a target whose connection attempt just failed (or whose tunnel
  * just went away) should schedule another one. A persistent target always
  * does: its tunnel is meant to be up at all times, with or without calls. An
@@ -1379,20 +1402,25 @@ static int l2tp_switch_target_should_retry(struct l2tp_switch_target_t *target)
 	return pending;
 }
 
-/* Arms the shared 5s reconnect cadence, unless it is already armed: both
- * callers below can be reached for the same target within one failed connect
- * attempt (l2tp_switch_target_connect()'s own l2tp_tunnel_free() on a failed
- * l2tp_tunnel_start(), immediately followed by its retry label), and
- * triton_timer_add() on an already-armed timer silently leaks the previous
- * registration and leaves ->tpd pointing at the newer one. */
+/* Arms the shared 5s reconnect cadence, unless it is already armed.
+ *
+ * The armed/not-armed check has to happen under target->lock, like every
+ * other field on the target: this runs from any tunnel's context, while
+ * l2tp_switch_target_reconnect_timer() clears ->tpd from the default context
+ * and l2tp_switch_on_demand_timeout() cancels the timer outright. Unlocked,
+ * two callers can both see NULL and both add -- leaking a timerfd and a
+ * context reference -- or one can see a stale non-NULL and skip arming,
+ * leaving an on-demand target's queued calls with no further connect attempt
+ * at all until their budget expires. */
 static void l2tp_switch_target_schedule_retry(struct l2tp_switch_target_t *target)
 {
-	if (target->reconnect_timer.tpd)
-		return;
-
-	if (triton_timer_add(NULL, &target->reconnect_timer, 0) < 0)
-		log_error("l2tp-switch: target \"%s\": failed to schedule"
-			  " reconnect\n", target->name);
+	pthread_mutex_lock(&target->lock);
+	if (!target->reconnect_timer.tpd) {
+		if (triton_timer_add(NULL, &target->reconnect_timer, 0) < 0)
+			log_error("l2tp-switch: target \"%s\": failed to"
+				  " schedule reconnect\n", target->name);
+	}
+	pthread_mutex_unlock(&target->lock);
 }
 
 static void l2tp_tunnel_free(struct l2tp_conn_t *conn)
@@ -2038,8 +2066,21 @@ static void l2tp_switch_target_connect(struct l2tp_switch_target_t *target)
 		.sin_addr = { htonl(INADDR_ANY) },
 	};
 	struct l2tp_conn_t *conn;
+	int taken;
 
 	if (ap_shutdown)
+		return;
+
+	/* One attempt at a time, always. target->tunnel doubles as that
+	 * exclusion: a non-NULL value means an attempt is either still
+	 * negotiating or has already succeeded, and starting a second one
+	 * would leave whichever tunnel loses the race live but unreferenced,
+	 * with nothing to ever reap it -- and with queued calls potentially
+	 * being placed on one tunnel from the other's context. */
+	pthread_mutex_lock(&target->lock);
+	taken = target->tunnel != NULL;
+	pthread_mutex_unlock(&target->lock);
+	if (taken)
 		return;
 
 	conn = l2tp_tunnel_alloc(&target->peer_addr, &host, 3, 0, 0,
@@ -2058,25 +2099,45 @@ static void l2tp_switch_target_connect(struct l2tp_switch_target_t *target)
 		goto retry;
 	}
 	conn->secret_len = target->secret_len;
+
+	/* Publish before starting, not after: l2tp_tunnel_start() registers
+	 * conn's context, wakes it and sends the SCCRQ from it, so a peer
+	 * that answers fast enough can drive l2tp_tunnel_connect() -- and
+	 * with it the queued-call drain -- before this function would have
+	 * got around to storing the pointer. Draining with target->tunnel
+	 * still NULL disconnects every queued call on a connect that in fact
+	 * succeeded. Re-checked under the lock, so an attempt that won the
+	 * slot in the window since the check above is never overwritten. */
+	pthread_mutex_lock(&target->lock);
+	if (target->tunnel) {
+		pthread_mutex_unlock(&target->lock);
+		l2tp_tunnel_free(conn); /* conn->switch_target deliberately
+					 * still unset: this tunnel never
+					 * belonged to the target, so its
+					 * teardown must not touch it */
+		return;
+	}
 	conn->switch_target = target;
+	target->tunnel = conn;
+	pthread_mutex_unlock(&target->lock);
 
 	if (l2tp_tunnel_start(conn, l2tp_send_SCCRQ, &target->peer_addr) < 0) {
 		log_error("l2tp-switch: target \"%s\": starting tunnel"
 			  " failed, retrying in 5s\n", target->name);
+		pthread_mutex_lock(&target->lock);
+		if (target->tunnel == conn) /* same identity guard as
+					     * l2tp_tunnel_free()'s hook: never
+					     * blank out another attempt's
+					     * pointer */
+			target->tunnel = NULL;
+		pthread_mutex_unlock(&target->lock);
 		l2tp_tunnel_free(conn);
 		goto retry;
 	}
 
-	pthread_mutex_lock(&target->lock);
-	target->tunnel = conn;
-	pthread_mutex_unlock(&target->lock);
 	return;
 
 retry:
-	pthread_mutex_lock(&target->lock);
-	target->tunnel = NULL;
-	pthread_mutex_unlock(&target->lock);
-
 	if (l2tp_switch_target_should_retry(target))
 		l2tp_switch_target_schedule_retry(target);
 }
@@ -2086,7 +2147,18 @@ static void l2tp_switch_target_reconnect_timer(struct triton_timer_t *t)
 	struct l2tp_switch_target_t *target =
 		container_of(t, typeof(*target), reconnect_timer);
 
-	triton_timer_del(t);
+	pthread_mutex_lock(&target->lock);
+	if (target->reconnect_timer.tpd)
+		triton_timer_del(t);
+	pthread_mutex_unlock(&target->lock);
+
+	/* Re-checked here, not just where the cadence is armed: by the time a
+	 * tick comes due, an on-demand target's queued calls may already have
+	 * been placed or given up on, and reconnecting a target nothing is
+	 * waiting for is exactly what on-demand mode exists to avoid. */
+	if (!l2tp_switch_target_should_retry(target))
+		return;
+
 	l2tp_switch_target_connect(target);
 }
 
@@ -2476,11 +2548,16 @@ static int l2tp_session_connect(struct l2tp_sess_t *sess)
  *
  * Runs inside conn->ctx (reached from l2tp_recv_SCCRP/l2tp_recv_SCCCN, both
  * message handlers on this tunnel's own context), so the queued calls can be
- * placed with a *direct* call to l2tp_switch_place_call() -- no
+ * placed with a *direct* call to l2tp_switch_place_call_on() -- no
  * triton_context_call() hop, and no extra guard for a queued upstream session
- * having died while it waited: l2tp_switch_place_call()'s own STATE_CLOSE
- * check already handles that, releasing the hold taken when the call was
- * queued. */
+ * having died while it waited: that function's own STATE_CLOSE check already
+ * handles it, releasing the hold taken when the call was queued.
+ *
+ * Deliberately does NOT cancel connect_timeout_timer, even though this
+ * closes the budget that timer bounds: the timer belongs to the default
+ * context, and deleting it from here (a tunnel context) races triton's own
+ * dispatch. It is left to fire and retire itself instead -- see
+ * l2tp_switch_on_demand_timeout(), which no-ops on a closed budget. */
 static void l2tp_switch_drain_pending_calls(struct l2tp_conn_t *conn)
 {
 	struct l2tp_switch_target_t *target = conn->switch_target;
@@ -2488,9 +2565,16 @@ static void l2tp_switch_drain_pending_calls(struct l2tp_conn_t *conn)
 	struct l2tp_sess_t *sess;
 
 	pthread_mutex_lock(&target->lock);
-	if (target->connect_timeout_timer.tpd)
-		triton_timer_del(&target->connect_timeout_timer);
-	target->connecting = 0;
+	if (target->tunnel != conn) {
+		/* Not (or no longer) this target's tunnel: the queue belongs
+		 * to whichever attempt currently owns the target, and placing
+		 * its calls here would mean driving that other tunnel from
+		 * this one's context. Leave them queued; their own budget
+		 * still bounds the wait. */
+		pthread_mutex_unlock(&target->lock);
+		return;
+	}
+	target->connect_budget_open = 0;
 	list_splice_init(&target->pending_calls, &drained);
 	target->pending_count = 0;
 	pthread_mutex_unlock(&target->lock);
@@ -2499,7 +2583,7 @@ static void l2tp_switch_drain_pending_calls(struct l2tp_conn_t *conn)
 		sess = list_first_entry(&drained, typeof(*sess),
 					switch_pending_entry);
 		list_del(&sess->switch_pending_entry);
-		l2tp_switch_place_call(sess);
+		l2tp_switch_place_call_on(sess, conn);
 	}
 }
 
@@ -4612,7 +4696,16 @@ static void l2tp_switch_abort_stalled_tunnel(void *data)
  *
  * Runs on the default context (the timer was armed with a NULL context), not
  * on any tunnel's own context -- hence every piece of per-tunnel/per-session
- * work below is handed to the owning context via triton_context_call(). */
+ * work below is handed to the owning context via triton_context_call().
+ *
+ * This callback can run when it has nothing to do: triton re-checks a timer's
+ * registration only *before* dispatching it (triton.c's pending-timer loop
+ * drops its own lock, then tests t->ud), so a dispatch already in flight
+ * still reaches us after the budget it was armed for was closed by the drain
+ * -- possibly after a newer call has since reopened a budget with a later
+ * deadline. Since triton hands a timer callback nothing that identifies which
+ * arming it came from (the timer is a single embedded field, identical across
+ * budgets), the budget flag and its deadline are what distinguish the two. */
 static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 {
 	struct l2tp_switch_target_t *target =
@@ -4622,13 +4715,37 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 	struct l2tp_conn_t *stalled = NULL;
 
 	pthread_mutex_lock(&target->lock);
-	/* Disarm under the same lock the drain path uses, and only if it is
-	 * still armed: l2tp_switch_drain_pending_calls() may have deleted
-	 * this very timer from the target tunnel's own context while this
-	 * callback was waiting for the lock. */
+
+	if (!target->connect_budget_open) {
+		/* The connect succeeded and drained the queue itself before
+		 * this timer got a chance to fire. Retire the timer here, on
+		 * the context that owns it. */
+		if (target->connect_timeout_timer.tpd)
+			triton_timer_del(&target->connect_timeout_timer);
+		pthread_mutex_unlock(&target->lock);
+		return;
+	}
+
+	if (l2tp_switch_monotonic_ms() < target->connect_deadline) {
+		/* A newer budget pushed the deadline out from under a
+		 * dispatch that was already on its way. Leave the timer
+		 * armed -- it is the newer budget's timer now, and it will
+		 * come due again at the right time. */
+		pthread_mutex_unlock(&target->lock);
+		return;
+	}
+
 	if (target->connect_timeout_timer.tpd)
 		triton_timer_del(&target->connect_timeout_timer);
-	target->connecting = 0;
+	/* Nothing is waiting on this target any more, so the reconnect
+	 * cadence has no one left to serve: cancel it here rather than let a
+	 * tick that was armed by one of the failed attempts fire later and
+	 * start a connect for calls that have already been given up on.
+	 * Same context as this callback (both timers are armed with a NULL
+	 * context), so this deletion is not a cross-context one. */
+	if (target->reconnect_timer.tpd)
+		triton_timer_del(&target->reconnect_timer);
+	target->connect_budget_open = 0;
 	list_splice_init(&target->pending_calls, &drained);
 	target->pending_count = 0;
 	if (target->tunnel && target->tunnel->state != STATE_ESTB) {
@@ -4639,9 +4756,7 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 	pthread_mutex_unlock(&target->lock);
 
 	if (list_empty(&drained) && !stalled)
-		return; /* the connect actually succeeded and drained the queue
-			 * itself (see l2tp_switch_drain_pending_calls()) before
-			 * this timer got a chance to fire; nothing left to do */
+		return;
 
 	log_error("l2tp-switch: target \"%s\": on-demand connect timed out,"
 		  " disconnecting queued call(s)\n", target->name);
@@ -4667,16 +4782,28 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 	}
 }
 
-static void l2tp_switch_place_call(void *data)
+/* Places upstream's downstream leg on `conn`. Two callers, both of which
+ * hand over one session hold on upstream that this function releases on
+ * every path:
+ *
+ *   - l2tp_switch_place_downstream_call()'s fast path, indirectly: it
+ *     schedules the l2tp_switch_place_call() trampoline below into conn's
+ *     context, since it runs in the *upstream* session's context;
+ *   - l2tp_switch_drain_pending_calls(), directly -- it is already running
+ *     in conn's own context when a queued-up connect completes.
+ *
+ * The tunnel to use is an argument rather than re-read from
+ * upstream->switch_target->tunnel, which is not necessarily the same tunnel
+ * any more by the time this runs: using it would mean mutating one tunnel's
+ * session tree and send queue from another tunnel's context. */
+static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
+				      struct l2tp_conn_t *conn)
 {
-	struct l2tp_sess_t *upstream = data;
-	struct l2tp_conn_t *conn = upstream->switch_target->tunnel;
 	struct l2tp_sess_t *downstream;
 
 	/* This function runs in conn's context (the downstream target's
-	 * tunnel), scheduled via l2tp_switch_place_downstream_call() below --
-	 * NOT in upstream->paren_conn->ctx. Touching upstream's own state
-	 * (timers, send queue -- exactly what l2tp_session_disconnect()
+	 * tunnel) -- NOT in upstream->paren_conn->ctx. Touching upstream's own
+	 * state (timers, send queue -- exactly what l2tp_session_disconnect()
 	 * does) from here would violate this codebase's per-tunnel-context
 	 * threading model, so every path that needs to disconnect upstream
 	 * crosses into its own context first via triton_context_call()
@@ -4705,7 +4832,10 @@ static void l2tp_switch_place_call(void *data)
 		return;
 	}
 
-	if (!conn || conn->state != STATE_ESTB) {
+	/* conn was usable when this call was handed over, but it can have been
+	 * torn down since -- the scheduled path in particular crosses contexts
+	 * to get here. */
+	if (conn->state != STATE_ESTB) {
 		log_session(log_error, upstream,
 			    "l2tp-switch: target tunnel not available,"
 			    " disconnecting upstream call\n");
@@ -4814,43 +4944,106 @@ err_pairing_done:
 	session_put(upstream);
 }
 
-/* Queues this call behind an on-demand target's in-flight connect, arming the
+/* What a scheduled (cross-context) call placement carries, since
+ * triton_context_call() passes a single pointer and the tunnel to place the
+ * call on has to travel with the session rather than be looked up again on
+ * the far side. Mirrors l2tp_switch_finish_ctx's existing use of the same
+ * pattern for l2tp_switch_finish_upstream(). */
+struct l2tp_switch_place_ctx {
+	struct l2tp_sess_t *upstream;
+	struct l2tp_conn_t *conn;
+};
+
+static void l2tp_switch_place_call(void *data)
+{
+	struct l2tp_switch_place_ctx *ctx = data;
+	struct l2tp_sess_t *upstream = ctx->upstream;
+	struct l2tp_conn_t *conn = ctx->conn;
+
+	_free(ctx);
+	l2tp_switch_place_call_on(upstream, conn);
+	tunnel_put(conn); /* the hold taken when this call was scheduled, which
+			   * is what kept conn alive across the context hop */
+}
+
+/* Opens a connect budget for this target: arms the timer that bounds how long
+ * queued calls may wait, and records the deadline it was armed for. Caller
+ * holds target->lock. Returns -1 if the budget could not be armed, in which
+ * case no budget is opened -- queueing a call behind an unbounded wait would
+ * be worse than failing it now. */
+static int l2tp_switch_open_connect_budget_locked(struct l2tp_switch_target_t *target)
+{
+	uint64_t now = l2tp_switch_monotonic_ms();
+	int res;
+
+	target->connect_timeout_timer.expire = l2tp_switch_on_demand_timeout;
+	target->connect_timeout_timer.period =
+		L2TP_SWITCH_ON_DEMAND_CONNECT_TIMEOUT_MS;
+
+	/* The timer can still be armed from a previous budget that was closed
+	 * by the drain rather than cancelled (see
+	 * l2tp_switch_drain_pending_calls() for why it doesn't cancel). Push
+	 * it out to a full budget from now instead of adding a second
+	 * registration over the top of it -- and instead of inheriting its
+	 * near-expired deadline, which would give this call a budget of
+	 * whatever happened to be left. */
+	if (target->connect_timeout_timer.tpd)
+		res = triton_timer_mod(&target->connect_timeout_timer, 0);
+	else
+		res = triton_timer_add(NULL, &target->connect_timeout_timer, 0);
+
+	if (res < 0) {
+		log_error("l2tp-switch: target \"%s\": failed to arm on-demand"
+			  " connect timeout\n", target->name);
+		return -1;
+	}
+
+	/* Read before arming, so the timer's own expiry is never earlier than
+	 * the deadline the callback compares against. */
+	target->connect_deadline = now + L2TP_SWITCH_ON_DEMAND_CONNECT_TIMEOUT_MS;
+	target->connect_budget_open = 1;
+
+	return 0;
+}
+
+/* Queues this call behind an on-demand target's in-flight connect, opening a
  * connect budget if this is the call that woke the target up.
  *
  * Caller holds target->lock and keeps holding it (queueing and the
- * connecting/timer bookkeeping have to be one atomic step: a tunnel that
- * comes up in between would drain a queue this call isn't in yet, leaving it
- * stuck until the timeout). *need_connect is set when the caller must kick
+ * budget/timer bookkeeping have to be one atomic step: a tunnel that comes up
+ * in between would drain a queue this call isn't in yet, leaving it stuck
+ * until the budget expires). *need_connect is set when the caller must kick
  * off the actual connect, which it does after dropping the lock.
  *
  * Returns -1 (and queues nothing) if the target already has more calls
- * waiting than it is allowed to accumulate. */
+ * waiting than it is allowed to accumulate, or if the budget bounding that
+ * wait could not be armed. */
 static int l2tp_switch_enqueue_call_locked(struct l2tp_sess_t *upstream,
 					   struct l2tp_switch_target_t *target,
 					   int *need_connect)
 {
 	*need_connect = 0;
 
-	if (target->pending_count >= L2TP_SWITCH_PENDING_MAX)
+	if (target->pending_count >= L2TP_SWITCH_PENDING_MAX) {
+		log_session(log_error, upstream, "l2tp-switch: target \"%s\""
+			    " pending-call queue full, disconnecting"
+			    " upstream call\n", target->name);
 		return -1;
+	}
+
+	/* Before queueing anything, so a failure here needs no rollback. */
+	if (!target->connect_budget_open) {
+		if (l2tp_switch_open_connect_budget_locked(target) < 0)
+			return -1;
+		*need_connect = 1;
+	}
 
 	session_hold(upstream); /* released by whoever dequeues this call:
-				 * l2tp_switch_place_call() via the drain, or
-				 * l2tp_switch_disconnect_upstream() via the
+				 * l2tp_switch_place_call_on() via the drain,
+				 * or l2tp_switch_disconnect_upstream() via the
 				 * connect timeout */
 	list_add_tail(&upstream->switch_pending_entry, &target->pending_calls);
 	target->pending_count++;
-
-	if (!target->connecting) {
-		target->connecting = 1;
-		*need_connect = 1;
-		target->connect_timeout_timer.expire = l2tp_switch_on_demand_timeout;
-		target->connect_timeout_timer.period =
-			L2TP_SWITCH_ON_DEMAND_CONNECT_TIMEOUT_MS;
-		if (triton_timer_add(NULL, &target->connect_timeout_timer, 0) < 0)
-			log_error("l2tp-switch: target \"%s\": failed to arm"
-				  " on-demand connect timeout\n", target->name);
-	}
 
 	return 0;
 }
@@ -4858,6 +5051,7 @@ static int l2tp_switch_enqueue_call_locked(struct l2tp_sess_t *upstream,
 static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 {
 	struct l2tp_switch_target_t *target = upstream->switch_target;
+	struct l2tp_switch_place_ctx *place;
 	struct l2tp_conn_t *conn;
 	int need_connect;
 	int queued;
@@ -4872,16 +5066,31 @@ static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 		 * call starts using it again. */
 		if (target->idle_timer.tpd)
 			triton_timer_del(&target->idle_timer);
+		tunnel_hold(conn); /* taken while the lock still guarantees conn
+				    * is alive: it has to outlive the hop into
+				    * its own context below */
 		pthread_mutex_unlock(&target->lock);
 
 		/* Placing the downstream call touches conn's own tunnel
 		 * context, which is not upstream's context -- cross via
 		 * triton_context_call, same as l2tp_create_session_exec()
 		 * already does for the CLI path. */
+		place = _malloc(sizeof(*place));
+		if (!place) {
+			tunnel_put(conn);
+			log_session(log_error, upstream, "l2tp-switch: placing"
+				    " downstream call failed: out of memory\n");
+			return -1;
+		}
+		place->upstream = upstream;
+		place->conn = conn;
+
 		session_hold(upstream);
 		if (triton_context_call(&conn->ctx, l2tp_switch_place_call,
-					upstream) < 0) {
+					place) < 0) {
 			session_put(upstream);
+			tunnel_put(conn);
+			_free(place);
 			return -1;
 		}
 		return 0;
@@ -4899,12 +5108,10 @@ static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 	queued = l2tp_switch_enqueue_call_locked(upstream, target, &need_connect);
 	pthread_mutex_unlock(&target->lock);
 
-	if (queued < 0) {
-		log_session(log_error, upstream, "l2tp-switch: target \"%s\""
-			    " pending-call queue full, disconnecting"
-			    " upstream call\n", target->name);
-		return -1;
-	}
+	if (queued < 0)
+		return -1; /* both of its failure branches log their own
+			    * reason; l2tp_recv_ICCN() logs the disconnect
+			    * that follows from this return */
 
 	if (need_connect)
 		l2tp_switch_target_connect(target); /* safe from any context --
@@ -6557,17 +6764,31 @@ static int l2tp_switch_show_exec(const char *cmd, char * const *fields,
 
 	cli_send(client, "targets:\r\n");
 	list_for_each_entry(t, &l2tp_switch_targets, entry) {
+		struct l2tp_conn_t *conn;
+
+		/* Snapshot under the target's lock, with a reference: this
+		 * runs on the CLI thread, and an on-demand target's tunnel
+		 * pointer churns on every connect/abort/timeout cycle -- two
+		 * unlocked reads could disagree, and the second could
+		 * dereference a tunnel that has since been destroyed. */
+		pthread_mutex_lock(&t->lock);
+		conn = t->tunnel;
+		if (conn)
+			tunnel_hold(conn);
+		pthread_mutex_unlock(&t->lock);
+
 		cli_sendv(client, "  %s -> %s:%hu [%s] active=%u"
 				   " bytes_in=%llu bytes_out=%llu\r\n",
 			 t->name, inet_ntoa(t->peer_addr.sin_addr),
 			 ntohs(t->peer_addr.sin_port),
-			 t->tunnel ? "up" : "down",
+			 conn ? "up" : "down",
 			 __atomic_load_n(&t->active, __ATOMIC_RELAXED),
 			 (unsigned long long)__atomic_load_n(&t->rx_bytes, __ATOMIC_RELAXED),
 			 (unsigned long long)__atomic_load_n(&t->tx_bytes, __ATOMIC_RELAXED));
-		if (t->tunnel) {
+		if (conn) {
 			switch_show_client = client;
-			twalk(t->tunnel->sessions, switch_show_walk);
+			twalk(conn->sessions, switch_show_walk);
+			tunnel_put(conn);
 		}
 	}
 

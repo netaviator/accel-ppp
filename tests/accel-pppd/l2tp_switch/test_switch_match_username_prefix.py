@@ -26,7 +26,12 @@ def test_switch_matches_on_proxied_username_prefix(pytestconfig, accel_cmd, acce
             "upstreamsecret",
             extra="""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17110,downstreamsecret
+    # Pinned to persistent: this test's own subject is username-prefix
+    # matching, not connection mode -- it relies on the target's tunnel
+    # already being up before any call is placed, which on-demand mode's
+    # default no longer does. See
+    # docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17110,downstreamsecret,persistent
     match=Proxy-Authen-Name,prefix,downstream-,downstream
     """,
         )
@@ -90,7 +95,12 @@ def test_switch_calling_number_takes_precedence_over_username_prefix(
             "upstreamsecret",
             extra="""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17112,downstreamsecret
+    # Pinned to persistent: this test's own subject is match-rule
+    # precedence, not connection mode -- it relies on the target's tunnel
+    # already being up before any call is placed, which on-demand mode's
+    # default no longer does. See
+    # docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17112,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     match=Proxy-Authen-Name,prefix,downstream-,downstream
     """,

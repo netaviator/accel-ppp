@@ -28,6 +28,11 @@ static LIST_HEAD(l2tp_switch_rules);
 
 static void free_target(struct l2tp_switch_target_t *t)
 {
+	/* Safe on every caller's path: parse_target() initializes the mutex
+	 * immediately after allocating the target, before any of its own
+	 * error paths can reach here, and switch_conf_clear() only runs once
+	 * nothing can still be holding it. */
+	pthread_mutex_destroy(&t->lock);
 	if (t->secret)
 		_free(t->secret);
 	_free(t->name);
@@ -249,9 +254,9 @@ int l2tp_switch_rule_del(const char *attr_name, const char *mode_name,
 
 static int parse_target(const char *val)
 {
-	/* target=<name>,<peer-addr>,<peer-port>,<secret> */
+	/* target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>] */
 	struct l2tp_switch_target_t *t;
-	char *copy, *name, *addr, *port, *secret, *save = NULL;
+	char *copy, *name, *addr, *port, *secret, *mode_str, *save = NULL;
 	long p;
 
 	copy = _strdup(val);
@@ -262,6 +267,7 @@ static int parse_target(const char *val)
 	addr = strtok_r(NULL, ",", &save);
 	port = strtok_r(NULL, ",", &save);
 	secret = strtok_r(NULL, ",", &save);
+	mode_str = strtok_r(NULL, ",", &save); /* optional; NULL if omitted */
 
 	if (!name || !addr || !port || !secret) {
 		log_error("l2tp-switch: malformed target= \"%s\","
@@ -284,6 +290,8 @@ static int parse_target(const char *val)
 	if (!t)
 		goto err;
 	memset(t, 0, sizeof(*t));
+	pthread_mutex_init(&t->lock, NULL);
+	INIT_LIST_HEAD(&t->pending_calls);
 
 	t->name = _strdup(name);
 	t->secret = _strdup(secret);
@@ -297,6 +305,21 @@ static int parse_target(const char *val)
 	t->peer_addr.sin_port = htons((uint16_t)p);
 	if (inet_aton(addr, &t->peer_addr.sin_addr) == 0) {
 		log_error("l2tp-switch: invalid peer-addr in target=\"%s\"\n", val);
+		free_target(t);
+		goto err;
+	}
+
+	/* Default: on-demand -- see this plan's Global Constraints for why
+	 * this is safe to default immediately rather than stage behind a
+	 * later flip (L2TP switching is still unreleased). */
+	if (!mode_str || !strcmp(mode_str, "on-demand")) {
+		t->mode = L2TP_SWITCH_MODE_ON_DEMAND;
+	} else if (!strcmp(mode_str, "persistent")) {
+		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
+	} else {
+		log_error("l2tp-switch: unknown mode \"%s\" in target=\"%s\","
+			  " expected \"persistent\" or \"on-demand\"\n",
+			  mode_str, val);
 		free_target(t);
 		goto err;
 	}

@@ -21,7 +21,11 @@ def test_switch_tags_matching_call(pytestconfig, accel_cmd, accel_pppd):
             "upstreamsecret",
             extra="""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17020,downstreamsecret
+    # Pinned to persistent: this test's own subject is call matching, not
+    # connection mode -- it relies on the target's tunnel already being up
+    # before any call is placed, which on-demand mode's default no longer
+    # does. See docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17020,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
         )

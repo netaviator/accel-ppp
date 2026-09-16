@@ -31,7 +31,11 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
     [l2tp]
     secret=upstreamsecret
     [l2tp-switch]
-    target=downstream,127.0.0.1,{downstream_port},downstreamsecret
+    # Pinned to persistent: this test's own subject is persistent mode's
+    # own reconnect-after-idle-StopCCN timing -- it needs the target's
+    # tunnel to come up eagerly, with no call, in the first place. See
+    # docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,{downstream_port},downstreamsecret,persistent
     """
     )
     switch_started, switch_thread, switch_ctrl = accel_pppd_process.start(

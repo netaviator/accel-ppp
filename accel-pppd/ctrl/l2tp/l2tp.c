@@ -5030,8 +5030,17 @@ static void l2tp_switch_target_idle_timer(struct triton_timer_t *t)
 		return;
 
 	if (triton_context_call(&conn->ctx, l2tp_switch_close_idle_tunnel,
-				conn) < 0)
+				conn) < 0) {
+		/* The close never got scheduled, and this callback has
+		 * already retired the timer and consumed the window it fired
+		 * for -- leaving the tunnel session-less with nothing left to
+		 * ever close it. Start the window again rather than strand
+		 * it. (Reachable when conn's context is shutting down, in
+		 * which case the re-arm is refused too and the tunnel is
+		 * going away on its own anyway.) */
+		l2tp_switch_target_arm_idle_linger(target, conn);
 		tunnel_put(conn);
+	}
 }
 
 /* Places upstream's downstream leg on `conn`. Two callers, both of which
@@ -5350,6 +5359,13 @@ static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 		 * already does for the CLI path. */
 		place = _malloc(sizeof(*place));
 		if (!place) {
+			/* This call is not going to use the tunnel after all,
+			 * and the linger it just cancelled above is the only
+			 * thing that would ever have closed it. Same on every
+			 * failure exit below: cancelling is a promise to use
+			 * the tunnel, and a broken promise has to put the
+			 * window back. */
+			l2tp_switch_target_arm_idle_linger(target, conn);
 			tunnel_put(conn);
 			log_session(log_error, upstream, "l2tp-switch: placing"
 				    " downstream call failed: out of memory\n");
@@ -5361,6 +5377,7 @@ static int l2tp_switch_place_downstream_call(struct l2tp_sess_t *upstream)
 		session_hold(upstream);
 		if (triton_context_call(&conn->ctx, l2tp_switch_place_call,
 					place) < 0) {
+			l2tp_switch_target_arm_idle_linger(target, conn);
 			session_put(upstream);
 			tunnel_put(conn);
 			_free(place);

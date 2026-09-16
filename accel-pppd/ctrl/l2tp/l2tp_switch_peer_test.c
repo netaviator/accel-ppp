@@ -201,6 +201,16 @@ static int real_ppp;
 static int hold_seconds;
 static int listen_mode;
 static int listen_rounds = 1;
+/* --listen only: how long to stall before answering a received SCCRQ with
+ * its SCCRP. Lets a driving test hold the switch's own outbound tunnel in
+ * mid-negotiation for a known, controllable window -- the only way to
+ * observe what an on-demand target does with a call that arrives while its
+ * connect is still in flight (queue it, rather than fail it outright). */
+static int sccrp_delay_ms;
+/* How long --wait-cdn waits, in seconds. Default 5 matches every existing
+ * caller; the on-demand connect-timeout test needs a budget longer than the
+ * daemon's own 10s connect timeout to observe the CDN that follows it. */
+static int cdn_timeout = 5;
 static const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -496,6 +506,14 @@ static int run_listen_mode(int rounds)
 		printf("event=recv_sccrq round=%d t=%.6f\n", round, now_monotonic());
 		fflush(stdout);
 
+		/* Deliberately stall mid-negotiation (see sccrp_delay_ms). The
+		 * switch keeps retransmitting its SCCRQ meanwhile -- those
+		 * duplicates are filtered out by the SCCCN wait loop below,
+		 * which matches on Message-Type rather than accepting the next
+		 * packet that happens to carry any attribute at all. */
+		if (sccrp_delay_ms > 0)
+			usleep((useconds_t)sccrp_delay_ms * 1000);
+
 		my_tid = 1024 + (uint16_t)(random() % 60000);
 
 		/* --- SCCRP --- */
@@ -533,12 +551,30 @@ static int run_listen_mode(int rounds)
 		/* --- SCCCN --- */
 		for (;;) {
 			struct l2tp_packet_t *cn = NULL;
+			struct l2tp_attr_t *msg_type;
+			int is_scccn;
 
 			if (l2tp_recv(fd, &cn, NULL, secret, strlen(secret)) != 0)
 				return die("waiting for SCCCN failed");
 			if (!cn)
 				continue;
 			if (list_empty(&cn->attrs)) {
+				l2tp_packet_free(cn);
+				continue;
+			}
+			/* RFC 2661 4.1: Message-Type is always the first AVP.
+			 * Matching on it discards the SCCRQ retransmissions
+			 * that pile up while --sccrp-delay-ms stalls us --
+			 * accepting one of those as "the SCCCN" would report
+			 * the tunnel established seconds before it really is,
+			 * and would rewind peer_next_nr to a stale value. */
+			msg_type = list_first_entry(&cn->attrs,
+						    typeof(*msg_type), entry);
+			is_scccn = msg_type->attr &&
+				   msg_type->attr->id == Message_Type &&
+				   msg_type->val.uint16 ==
+					   Message_Type_Start_Ctrl_Conn_Connected;
+			if (!is_scccn) {
 				l2tp_packet_free(cn);
 				continue;
 			}
@@ -604,6 +640,8 @@ int main(int argc, char **argv)
 		{"hold-seconds", required_argument, 0, 'H'},
 		{"listen", no_argument, 0, 'L'},
 		{"rounds", required_argument, 0, 'N'},
+		{"sccrp-delay-ms", required_argument, 0, 'D'},
+		{"cdn-timeout", required_argument, 0, 'T'},
 		{0, 0, 0, 0},
 	};
 
@@ -620,7 +658,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:D:T:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -668,15 +706,26 @@ int main(int argc, char **argv)
 		case 'N':
 			listen_rounds = atoi(optarg);
 			break;
+		case 'D':
+			sccrp_delay_ms = atoi(optarg);
+			if (sccrp_delay_ms < 0)
+				return die("invalid --sccrp-delay-ms");
+			break;
+		case 'T':
+			cdn_timeout = atoi(optarg);
+			if (cdn_timeout <= 0)
+				return die("invalid --cdn-timeout");
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
 				   " [--called-number N]"
 				   " [--proxy-username U] [--proxy-password W]"
 				   " [--data-pattern D] [--send-stopccn]"
-				   " [--wait-cdn] [--second-call C]"
+				   " [--wait-cdn [--cdn-timeout S]]"
+				   " [--second-call C]"
 				   " [--real-ppp] [--hold-seconds N]"
-				   " [--listen [--rounds N]]");
+				   " [--listen [--rounds N] [--sccrp-delay-ms M]]");
 		}
 	}
 
@@ -834,6 +883,18 @@ int main(int argc, char **argv)
 	l2tp_packet_free(pack);
 	my_ns++;
 
+	/* The switch places its downstream call off *this* message, so this
+	 * timestamp is the zero point for measuring how long the switch takes
+	 * to disconnect a call it cannot place (e.g. against an unreachable
+	 * on-demand target). Only emitted under --wait-cdn, which is the only
+	 * mode that waits around for that answer: this harness's plain
+	 * "ok tid=... sid=..." output is a contract other tests assert on
+	 * as-is. */
+	if (wait_cdn) {
+		printf("event=sent_iccn t=%.6f\n", now_monotonic());
+		fflush(stdout);
+	}
+
 	if (real_ppp && (!proxy_username || !proxy_password))
 		return die("--real-ppp requires --proxy-username and --proxy-password");
 
@@ -969,8 +1030,8 @@ int main(int argc, char **argv)
 		 * since SO_RCVTIMEO bounds each individual recv(), not the
 		 * cumulative wait -- an intervening Hello/ZLB would
 		 * otherwise reset the budget. */
-		struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-		time_t deadline = time(NULL) + 5;
+		struct timeval tv = { .tv_sec = cdn_timeout, .tv_usec = 0 };
+		time_t deadline = time(NULL) + cdn_timeout;
 		int got_cdn = 0;
 
 		if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
@@ -1011,6 +1072,9 @@ int main(int argc, char **argv)
 
 		if (!got_cdn)
 			return die("timed out waiting for CDN");
+
+		printf("event=recv_cdn t=%.6f\n", now_monotonic());
+		fflush(stdout);
 	}
 
 	if (second_call_number) {
@@ -1070,6 +1134,16 @@ int main(int argc, char **argv)
 
 		printf("second_call sid=%hu\n", second_local_sid);
 	}
+
+	/* Keep this process (and so the upstream tunnel's UDP socket) alive
+	 * for a while after the handshake: without --real-ppp there is
+	 * nothing else holding it open, and a test that needs to watch what
+	 * the switch does with this call *seconds* later would otherwise be
+	 * racing this socket's own teardown. --real-ppp does its own holding
+	 * inside run_real_ppp(), so it is excluded here rather than sleeping
+	 * twice. */
+	if (hold_seconds > 0 && !real_ppp)
+		sleep((unsigned int)hold_seconds);
 
 	printf("ok tid=%hu sid=%hu\n", peer_tid, peer_sid);
 	return 0;

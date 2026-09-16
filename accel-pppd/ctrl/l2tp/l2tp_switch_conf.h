@@ -2,6 +2,7 @@
 #define __L2TP_SWITCH_CONF_H
 
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdint.h>
 
 #include "list.h"
@@ -27,6 +28,27 @@ struct l2tp_switch_target_t {
 	 * target, or NULL while down/reconnecting. */
 	struct l2tp_conn_t *tunnel;
 	struct triton_timer_t reconnect_timer;
+
+	/* on-demand only (owned by l2tp.c): guards pending_calls/pending_count/
+	 * connecting below, and the tunnel pointer above. These are mutated
+	 * from whichever upstream session's own tunnel context happens to
+	 * place a call against this target -- essentially never this target's
+	 * own tunnel context, and often no context at all while the target is
+	 * cold -- so a plain list_head is not safe here without a lock,
+	 * mirroring l2tp_lock/conn->ctx_lock's existing role elsewhere in
+	 * l2tp.c for exactly this kind of cross-context-shared,
+	 * non-atomic-friendly state. */
+	pthread_mutex_t lock;
+	struct list_head pending_calls; /* l2tp_sess_t.switch_pending_entry */
+	unsigned int pending_count;
+	int connecting;
+	struct triton_timer_t connect_timeout_timer;
+	struct triton_timer_t idle_timer; /* armed by Task 3; declared here
+		because this task's own l2tp_switch_place_downstream_call()
+		fast path already references target->idle_timer (to cancel a
+		linger-teardown when a call reuses an up tunnel) before Task 3
+		exists -- the field has to exist for this task to compile on
+		its own. */
 
 	/* Owned by l2tp.c (Task 7): live/cumulative stats for this target,
 	 * from this target's own point of view -- rx is bytes received FROM

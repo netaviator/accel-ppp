@@ -28,6 +28,11 @@ static LIST_HEAD(l2tp_switch_rules);
 
 static void free_target(struct l2tp_switch_target_t *t)
 {
+	/* Safe on every caller's path: parse_target() initializes the mutex
+	 * immediately after allocating the target, before any of its own
+	 * error paths can reach here, and switch_conf_clear() only runs once
+	 * nothing can still be holding it. */
+	pthread_mutex_destroy(&t->lock);
 	if (t->secret)
 		_free(t->secret);
 	_free(t->name);
@@ -285,6 +290,8 @@ static int parse_target(const char *val)
 	if (!t)
 		goto err;
 	memset(t, 0, sizeof(*t));
+	pthread_mutex_init(&t->lock, NULL);
+	INIT_LIST_HEAD(&t->pending_calls);
 
 	t->name = _strdup(name);
 	t->secret = _strdup(secret);

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give each `[l2tp-switch]` `target=` a per-target connection **mode** — `persistent` (today's only behavior: eager connect at startup, reconnect forever) or `on-demand` (new: connect only when a call needs the target, tear the tunnel back down after a short idle linger) — with `on-demand` becoming the default once implemented. This exists because a real downstream peer (Juniper JunOS, default `idle-timeout` 60s) tears down any of `persistent` mode's proactively-opened, session-less tunnels the moment they go idle, which every one of them always does until a real call happens to route through it — causing a permanent, noisy ~60s-up/torn-down flap cycle.
+**Goal:** Give each `[l2tp-switch]` `target=` a per-target connection **mode** — `persistent` (today's only behavior: eager connect at startup, reconnect forever) or `on-demand` (new: connect only when a call needs the target, tear the tunnel back down after a short idle linger) — with `on-demand` as the **default from Task 1 onward**, not a later flip. This exists because a real downstream peer (Juniper JunOS, default `idle-timeout` 60s) tears down any of `persistent` mode's proactively-opened, session-less tunnels the moment they go idle, which every one of them always does until a real call happens to route through it — causing a permanent, noisy ~60s-up/torn-down flap cycle.
 
 **Companion fix, out of scope here:** a narrower change shrinking the delay between receiving a peer StopCCN and `persistent` mode's own reconnect (`l2tp_tunnel_finwait()`/`l2tp_recv_StopCCN` in `l2tp.c`) is landing separately. It makes `persistent` mode's flapping *cheap* when it happens; it does not stop the flapping, and does nothing for peers with a stricter idle policy than JunOS's default. Do not touch those two functions as part of this plan.
 
@@ -14,9 +14,9 @@
 
 ## Global Constraints
 
-- **Backward-compatible config parsing.** Every existing 4-field `target=<name>,<peer-addr>,<peer-port>,<secret>` line must keep parsing exactly as today, with no `mode=` given defaulting sensibly (see the default-flip note below for exactly when that default becomes `on-demand`).
+- **Backward-compatible config parsing.** Every existing 4-field `target=<name>,<peer-addr>,<peer-port>,<secret>` line must keep parsing exactly as today; a `target=` line with no 5th field now means `on-demand` (see Task 1).
 - **No change to the switched-call data plane.** Splicing, AVP capture/forwarding, sequencing mirroring, and teardown cascading (Tasks 6-8 of the original plan) are entirely unaffected — this plan only changes *when* a target's own outbound control tunnel exists, never how a call's PPP frames are relayed once it does.
-- **The default flips late, not immediately.** Tasks 1-5 keep the *interim* default `mode=persistent` (i.e. unchanged from today) so the working tree stays fully backward-compatible and testable after every intermediate commit, even though on-demand logic exists and is independently testable via an explicit `mode=on-demand`. Task 6 flips the default to `on-demand` only once on-demand has been fully implemented, exercised, and every existing test's implicit assumption about eager connection has been made explicit (Task 5). This mirrors this codebase's own established precedent of shipping an interim shape in one task and finalizing it in a later one (the original plan's Task 3 registered a 2-level `l2tp switch` CLI command, finalized to the 3-level `l2tp switch show` in Task 9).
+- **The default is `on-demand` from Task 1, not a later flip.** No interim `mode=persistent`-by-default period: Task 1 both adds the `mode=` field *and* makes `on-demand` the default in the same commit. Because that immediately changes behavior for every existing test that implicitly relied on eager connect-at-startup, Task 1 also pins those tests to an explicit `mode=persistent` in the same breath (folded in from what would otherwise be a separate, later-landing task) — the working tree must stay green after every single commit, so the default change and the test fixes that keep it green cannot be split across commits. **Why immediately, not staged:** L2TP switching's own `CHANGELOG.md` entry is still listed under `## Unreleased` (confirmed: `CHANGELOG.md` line 14) — it has never shipped in a numbered accel-ppp release, so there is no installed base of operators whose `target=` lines would silently start behaving differently under them; every existing user of this feature so far is this repo's own active development/test setup. Treat the default as a normal, in-development design decision, not a breaking change requiring a migration story.
 - **Downstream-unreachable/rejected/timed-out always CDNs the upstream call** (matches the original plan's own constraint) — on-demand mode does not change this invariant, it only changes *how long* accel-ppp is willing to wait before giving up: today's `persistent` mode fails a call instantly if `target->tunnel` isn't already up (an on-demand target's normal resting state); on-demand mode instead queues the call and gives the connect a bounded window (10s) to succeed before CDNing it.
 - **Concurrency.** `l2tp_switch_place_downstream_call()` always runs on the *upstream* session's own tunnel context — essentially never the target's own tunnel context, and often no tunnel/context exists for the target at all yet. New per-target on-demand state (`pending_calls`, `pending_count`, `connecting`) is therefore protected by a dedicated `pthread_mutex_t lock` on `struct l2tp_switch_target_t`, mirroring this file's own existing `l2tp_lock` (global tid-table lock, `l2tp.c:264`) and `conn->ctx_lock` (per-tunnel cross-context-call guard, `l2tp.c:221`) precedents — plain `__atomic_*` ops (already used for `active`/`rx_bytes`/`tx_bytes`) are not sufficient for linked-list mutation. Kicking off a connect attempt itself needs no context-crossing: `l2tp_tunnel_alloc()`/`l2tp_tunnel_start()`/`triton_timer_add(NULL, ...)` are already safe to call from an arbitrary thread/context — confirmed by their existing use both from `l2tp_switch_target_reconnect_timer()` (a default-context timer callback) and from the CLI-thread-invoked `l2tp_create_tunnel_exec()`. Touching an *existing* tunnel's own state from elsewhere (aborting a stalled connect, closing an idle tunnel) still needs `triton_context_call(&conn->ctx, ...)` plus `tunnel_hold()`/`tunnel_put()`, exactly like this file's existing `l2tp_switch_finish_upstream()`/`l2tp_switch_teardown_peer()` cross-context patterns.
 - Use this file's existing conventions throughout: `_malloc`/`_free`/`_strdup`, `log_session`/`log_tunnel`/`log_error`, `session_hold`/`session_put`/`tunnel_hold`/`tunnel_put`, `container_of`, `triton_context_call` to cross contexts, `list_for_each_entry`/`list_add_tail`/`list_first_entry` (no `list_for_each_entry_safe` in this project's `list.h` — use the existing while/`list_first_entry` idiom for "drain a whole list", as `l2tp_switch_conf.c`'s own `switch_conf_clear()` already does).
@@ -33,26 +33,29 @@
 | `docs/l2tp_switching.md` | Modify | Document both modes, the new default, the idle-linger window, and the `[idle]`/`[connecting]` display states. |
 | `accel-pppd/accel-ppp.conf.5` | Modify | `.BI "target="` synopsis gains the optional mode field. |
 | `README.md`, `CHANGELOG.md`, `accel-pppd/accel-ppp.conf` (sample) | Modify | Brief mentions kept in sync (matching the original plan's own Task 10 precedent of updating all four together). |
-| `tests/accel-pppd/l2tp_switch/*.py` | Modify | Pin `mode=persistent` on every test whose own subject is something else but which relies on eager-connect-at-startup as a readiness gate (Task 5); rewrite `test_switch_tunnel.py` to cover both modes explicitly; add new tests for queueing/timeout/idle-teardown/display states (Tasks 2-4). |
+| `tests/accel-pppd/l2tp_switch/*.py` | Modify | Pin `mode=persistent` on every test whose own subject is something else but which relies on eager-connect-at-startup as a readiness gate, and rewrite `test_switch_tunnel.py` to cover both modes explicitly (Task 1, landing in the same commit as the default flip so the suite never goes red); add new tests for queueing/timeout/idle-teardown/display states (Tasks 2-4). |
 
 No `CMakeLists.txt` change — no new source files.
 
 ---
 
-### Task 1: `mode=` config field, interim default `persistent`
+### Task 1: `mode=` config field, default `on-demand`, and keep the suite green
 
 **Files:**
 - Modify: `accel-pppd/ctrl/l2tp/l2tp_switch_conf.h`
 - Modify: `accel-pppd/ctrl/l2tp/l2tp_switch_conf.c`
+- Modify: `accel-pppd/ctrl/l2tp/l2tp.c` (one-line startup-sweep gate only — see Step 3b)
+- Modify: `tests/accel-pppd/l2tp_switch/test_switch_avp_forward.py`, `test_switch_match.py`, `test_switch_metrics.py`, `test_switch_mixed_tunnel.py`, `test_switch_teardown.py`, `test_switch_teardown_upstream.py`, `test_switch_match_called_number.py`, `test_switch_match_username_prefix.py`, `test_switch_splice.py`, `test_switch_show.py`, `test_switch_downstream_idle_stopccn.py`
+- Rewrite: `tests/accel-pppd/l2tp_switch/test_switch_tunnel.py`
 - Test: `tests/accel-pppd/l2tp_switch/test_switch_config.py`
 
 **Interfaces:**
-- Produces: `enum l2tp_switch_conn_mode { L2TP_SWITCH_MODE_PERSISTENT, L2TP_SWITCH_MODE_ON_DEMAND }`; `target->mode`, readable by `l2tp.c` (no new function needed — `struct l2tp_switch_target_t` is already fully visible to `l2tp.c` via the existing `#include "l2tp_switch_conf.h"`).
+- Produces: `enum l2tp_switch_conn_mode { L2TP_SWITCH_MODE_PERSISTENT, L2TP_SWITCH_MODE_ON_DEMAND }`; `target->mode`, readable by `l2tp.c` (no new function needed — `struct l2tp_switch_target_t` is already fully visible to `l2tp.c` via the existing `#include "l2tp_switch_conf.h"`). A `target=` line with no 5th field parses to `L2TP_SWITCH_MODE_ON_DEMAND`.
 - Consumes: nothing new.
 
-This task is purely config-parsing — no runtime connection behavior changes yet (every existing target still connects exactly as `persistent` mode does today, since that stays the interim default).
+**Why this task is bigger than a single config change:** making `on-demand` the default the moment `mode=` exists immediately changes behavior for every target that omits it — including every existing test's `target=` line. Landing the config change without also fixing those tests in the *same* commit would leave the tree red in between; this task does both together so `git bisect` never lands on a broken commit. The on-demand *runtime* itself (actually connecting when a call needs the target, queueing, idle-teardown, CLI states) lands in Tasks 2-4 below — this task only needs on-demand targets to visibly *not* come up on their own, which needs nothing more than gating the existing startup sweep (Step 3b).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 Add to `tests/accel-pppd/l2tp_switch/test_switch_config.py` (mirroring its existing config-load-only style — these targets use unreachable TEST-NET-3 addresses purely to validate parsing, never waiting on `[up]`):
 
@@ -64,8 +67,7 @@ def test_switch_target_mode_persistent_explicit(pytestconfig, accel_cmd, accel_p
 def test_switch_target_mode_on_demand_explicit(pytestconfig, accel_cmd, accel_pppd):
     ...  # target=acme,203.0.113.50,1701,targetsecret,on-demand
 
-def test_switch_target_mode_omitted_defaults_persistent(pytestconfig, accel_cmd, accel_pppd):
-    # interim default -- Task 6 changes this same assertion to on-demand
+def test_switch_target_mode_omitted_defaults_on_demand(pytestconfig, accel_cmd, accel_pppd):
     ...  # target=acme,203.0.113.50,1701,targetsecret  (4 fields, unchanged)
 
 def test_switch_target_mode_unknown_rejected(pytestconfig, accel_pppd):
@@ -74,12 +76,37 @@ def test_switch_target_mode_unknown_rejected(pytestconfig, accel_pppd):
     ...
 ```
 
+Split `test_switch_tunnel.py`'s existing `test_switch_tunnel_comes_up` into two explicit cases:
+
+```python
+@pytest.mark.l2tp_switch
+def test_switch_tunnel_persistent_comes_up_with_no_calls(pytestconfig, accel_cmd, accel_pppd):
+    # target=downstream,...,persistent -- unchanged from the original test,
+    # just the mode made explicit; still asserts "[up]" within a few
+    # seconds with zero calls placed
+    ...
+
+@pytest.mark.l2tp_switch
+def test_switch_tunnel_on_demand_stays_down_with_no_calls(pytestconfig, accel_cmd, accel_pppd):
+    # target=downstream,...,on-demand (or the 4-field default -- both must
+    # behave the same way) -- assert the target does NOT reach "[up]" for
+    # several seconds with no call placed. Uses today's plain "[down]"
+    # wording for now; Task 4 introduces a friendlier "[idle]" state and
+    # updates this same assertion once that lands. This is the direct
+    # behavioral regression test for the bug motivating this whole plan (a
+    # session-less tunnel sitting there for a downstream peer's own
+    # idle-timeout to eventually flap).
+    ...
+```
+
+**Why these eleven files and not others:** `grep -rn '\[up\]' tests/accel-pppd/l2tp_switch/*.py` finds every test in this suite that polls `l2tp switch show` for `[up]` *before placing any call* — using it purely as a "downstream instance is ready" readiness gate. Every one of them is actually testing something else (AVP forwarding, matching rules, splicing, teardown cascades, metrics values, or — for `test_switch_downstream_idle_stopccn.py` specifically — `persistent` mode's own reconnect-after-idle-StopCCN timing, i.e. the companion fix mentioned in this plan's header). None of them are testing connection-mode itself, so once `on-demand` is the default they would all fail or hang waiting for a tunnel that no longer opens until a call arrives. `test_switch_config.py` needs no separate pinning (its targets are unreachable-by-design, config-parse-only fixtures that never wait on `[up]`). `test_switch_cli.py` needs no change (no target= tunnel involved at all — `l2tp switch add`/`del` operate purely on match rules).
+
 - [ ] **Step 2: Run, verify it fails**
 
-Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_config.py`
-Expected: FAIL on the new tests — `mode` doesn't exist yet, a 5th field is silently ignored by `strtok_r`'s existing 4-token parse (confirm this "just ignored" behavior directly, since it's the actual pre-Task-1 failure mode, not a parse error).
+Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_config.py accel-pppd/l2tp_switch/test_switch_tunnel.py`
+Expected: FAIL — `mode` doesn't exist yet (a 5th field is silently ignored by `strtok_r`'s existing 4-token parse; confirm this "just ignored" behavior directly, since it's the actual pre-Task-1 failure mode, not a parse error), and every target still connects eagerly regardless of mode.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3a: Implement config parsing**
 
 `l2tp_switch_conf.h` — add near the top, before `struct l2tp_switch_target_t`:
 
@@ -109,14 +136,13 @@ Add to `struct l2tp_switch_target_t` (right after `secret_len`, before the `l2tp
 and after the existing `t->peer_addr` validation, before `list_add_tail`:
 
 ```c
-	/* Interim default: persistent, matching today's only behavior.
-	 * Changed to L2TP_SWITCH_MODE_ON_DEMAND once on-demand mode is fully
-	 * implemented and every existing test's implicit "tunnel is already
-	 * up" assumption has been made explicit -- see this plan's Task 6. */
-	if (!mode_str || !strcmp(mode_str, "persistent")) {
-		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
-	} else if (!strcmp(mode_str, "on-demand")) {
+	/* Default: on-demand -- see this plan's Global Constraints for why
+	 * this is safe to default immediately rather than stage behind a
+	 * later flip (L2TP switching is still unreleased). */
+	if (!mode_str || !strcmp(mode_str, "on-demand")) {
 		t->mode = L2TP_SWITCH_MODE_ON_DEMAND;
+	} else if (!strcmp(mode_str, "persistent")) {
+		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
 	} else {
 		log_error("l2tp-switch: unknown mode \"%s\" in target=\"%s\","
 			  " expected \"persistent\" or \"on-demand\"\n",
@@ -126,16 +152,51 @@ and after the existing `t->peer_addr` validation, before `list_add_tail`:
 	}
 ```
 
+- [ ] **Step 3b: Gate the startup sweep**
+
+`l2tp_switch_targets_connect()` (`l2tp.c` ~line 2022) currently connects every target unconditionally at startup. Restrict that to `persistent` targets only — an `on-demand` target's tunnel isn't created until Task 2 gives it a reason to be:
+
+```diff
+ 	list_for_each_entry(target, &l2tp_switch_targets, entry) {
+ 		target->reconnect_timer.expire =
+ 			l2tp_switch_target_reconnect_timer;
+ 		target->reconnect_timer.period = 5000;
+-		l2tp_switch_target_connect(target);
++		if (target->mode == L2TP_SWITCH_MODE_PERSISTENT)
++			l2tp_switch_target_connect(target);
+ 	}
+```
+
+(This is the only `l2tp.c` change in this task. Everything else on-demand — actually connecting when a call needs the target, queueing, idle-teardown, richer CLI states — is Tasks 2-4; until those land, an `on-demand` target is simply inert, which is exactly what Step 1's new `test_switch_tunnel_on_demand_stays_down_with_no_calls` checks for.)
+
+- [ ] **Step 3c: Pin the eleven existing tests to `mode=persistent`**
+
+For each file listed above, find its own `[l2tp-switch]` `target=...` line (each test builds its own config string via `config.make_tmp()`/`helpers.start_instance(..., extra=...)`, not a shared fixture — confirmed via `helpers.py`, which only centralizes the `[l2tp]`/`[cli]`/`[client-ip-range]` boilerplate, not the `[l2tp-switch]` block itself) and append `,persistent`:
+
+```diff
+-    target=downstream,127.0.0.1,{downstream_port},downstreamsecret
++    target=downstream,127.0.0.1,{downstream_port},downstreamsecret,persistent
+```
+
+Add a one-line comment at each site explaining why, e.g.:
+
+```python
+    # Pinned to persistent: this test's own subject is AVP forwarding, not
+    # connection mode -- it relies on the target's tunnel already being up
+    # before any call is placed, which on-demand mode's default no longer
+    # does. See docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+```
+
 - [ ] **Step 4: Run, verify it passes**
 
-Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_config.py`
-Expected: PASS — all four new cases, plus every pre-existing config test in this file (regression check: 4-field lines still parse).
+Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_config.py accel-pppd/l2tp_switch/test_switch_tunnel.py`, then the **entire** `l2tp_switch` suite: `sudo python3 -m pytest -v -m l2tp_switch accel-pppd/l2tp_switch/`.
+Expected: PASS across the board — every test that depends on eager connection now says so explicitly via `mode=persistent`, so the new default changes nothing about any existing test's outcome except the ones written specifically to exercise it.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add accel-pppd/ctrl/l2tp/l2tp_switch_conf.h accel-pppd/ctrl/l2tp/l2tp_switch_conf.c tests/accel-pppd/l2tp_switch/test_switch_config.py
-git commit -m "feat(l2tp): parse optional target= connection mode (persistent/on-demand)"
+git add accel-pppd/ctrl/l2tp/l2tp_switch_conf.h accel-pppd/ctrl/l2tp/l2tp_switch_conf.c accel-pppd/ctrl/l2tp/l2tp.c tests/accel-pppd/l2tp_switch/
+git commit -m "feat(l2tp): add target= connection mode, default to on-demand"
 ```
 
 ---
@@ -328,7 +389,7 @@ retry:
 	}
 ```
 
-(`l2tp_switch_targets_connect()`, the startup sweep at ~line 2022, must also skip on-demand targets entirely: `if (target->mode == L2TP_SWITCH_MODE_PERSISTENT) l2tp_switch_target_connect(target);` — on-demand targets stay cold until a call needs them.)
+(Task 1's Step 3b already gated `l2tp_switch_targets_connect()`'s startup sweep to `persistent`-only, so on-demand targets stay cold until this function above is what actually gives them a reason to connect.)
 
 In `l2tp_tunnel_free()`'s existing `switch_target` hook (~line 1374), apply the same gate:
 
@@ -613,7 +674,7 @@ git commit -m "feat(l2tp): close on-demand target tunnels after a 20s idle linge
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `test_switch_show.py`: place a call on an on-demand target, assert `[connecting]` appears briefly (best-effort/racy — acceptable to assert loosely or skip if too flaky in CI, matching this suite's own existing tolerance for timing-sensitive assertions elsewhere), then `[up]` once active, then `[idle]` some time after the call ends but before the tunnel actually closes, and finally back to resting `[idle]` (no tunnel) once Task 3's linger fires.
+Add to `test_switch_show.py`: place a call on an on-demand target, assert `[connecting]` appears briefly (best-effort/racy — acceptable to assert loosely or skip if too flaky in CI, matching this suite's own existing tolerance for timing-sensitive assertions elsewhere), then `[up]` once active, then `[idle]` some time after the call ends but before the tunnel actually closes, and finally back to resting `[idle]` (no tunnel) once Task 3's linger fires. Also update `test_switch_tunnel_on_demand_stays_down_with_no_calls` (Task 1) to assert the friendlier `[idle]` wording instead of the plain `[down]` it used before this task existed.
 
 Add to `test_switch_metrics.py`: assert `accel_ppp_l2tp_switch_target_up{target="..."}` reads `0` at rest, `1` once connected, and stays `1` through the idle-linger window (only dropping to `0` once the linger timer actually closes the tunnel) — asserting the tightened, literal `STATE_ESTB`-based semantics rather than "tunnel object exists".
 
@@ -710,125 +771,7 @@ git commit -m "feat(l2tp): show idle/connecting states for on-demand targets, ti
 
 ---
 
-### Task 5: Fix existing tests' implicit "tunnel is already up" assumption
-
-**Files:**
-- Modify: `tests/accel-pppd/l2tp_switch/test_switch_avp_forward.py`, `test_switch_match.py`, `test_switch_metrics.py`, `test_switch_mixed_tunnel.py`, `test_switch_teardown.py`, `test_switch_teardown_upstream.py`, `test_switch_match_called_number.py`, `test_switch_match_username_prefix.py`, `test_switch_splice.py`, `test_switch_show.py`, `test_switch_downstream_idle_stopccn.py`
-- Rewrite: `test_switch_tunnel.py`
-
-**Why these and not others:** `grep -rn '\[up\]' tests/accel-pppd/l2tp_switch/*.py` finds every test in this suite that polls `l2tp switch show` for `[up]` *before placing any call* — using it purely as a "downstream instance is ready" readiness gate. Every one of them is actually testing something else (AVP forwarding, matching rules, splicing, teardown cascades, metrics values, or — for `test_switch_downstream_idle_stopccn.py` specifically — `persistent` mode's own reconnect-after-idle-StopCCN timing, i.e. the exact behavior the companion fix mentioned in this plan's header targets). None of them are testing connection-mode itself, so once the default flips to `on-demand` (Task 6) they would all fail or hang waiting for a tunnel that no longer opens until a call arrives. `test_switch_config.py` needs no change (its targets are unreachable-by-design, config-parse-only fixtures that never wait on `[up]`). `test_switch_cli.py` needs no change (no target= tunnel involved at all — `l2tp switch add`/`del` operate purely on match rules).
-
-- [ ] **Step 1: Pin `mode=persistent` on the eleven files above**
-
-For each, find its own `[l2tp-switch]` `target=...` line (each test builds its own config string via `config.make_tmp()`/`helpers.start_instance(..., extra=...)`, not a shared fixture — confirmed via `helpers.py`, which only centralizes the `[l2tp]`/`[cli]`/`[client-ip-range]` boilerplate, not the `[l2tp-switch]` block itself) and append `,persistent`:
-
-```diff
--    target=downstream,127.0.0.1,{downstream_port},downstreamsecret
-+    target=downstream,127.0.0.1,{downstream_port},downstreamsecret,persistent
-```
-
-Add a one-line comment at each site explaining why, e.g.:
-
-```python
-    # Pinned to persistent: this test's own subject is AVP forwarding, not
-    # connection mode -- it relies on the target's tunnel already being up
-    # before any call is placed, which is on-demand mode's default *not*
-    # to do. See docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
-```
-
-- [ ] **Step 2: Run, verify the full suite still passes unchanged (regression only)**
-
-Run: `sudo python3 -m pytest -v -m l2tp_switch accel-pppd/l2tp_switch/`
-Expected: PASS, identical results to before this task — this step is purely defensive (confirms pinning `persistent` explicitly didn't change any of these tests' actual behavior, since it was already the implicit default).
-
-- [ ] **Step 3: Rewrite `test_switch_tunnel.py`**
-
-Split `test_switch_tunnel_comes_up` into two explicit cases:
-
-```python
-@pytest.mark.l2tp_switch
-def test_switch_tunnel_persistent_comes_up_with_no_calls(pytestconfig, accel_cmd, accel_pppd):
-    # target=downstream,...,persistent -- unchanged from the original test,
-    # just the mode made explicit; still asserts "[up]" within a few
-    # seconds with zero calls placed
-    ...
-
-@pytest.mark.l2tp_switch
-def test_switch_tunnel_on_demand_stays_idle_with_no_calls(pytestconfig, accel_cmd, accel_pppd):
-    # target=downstream,...,on-demand -- assert the target reports "[idle]"
-    # (Task 4), NOT "[up]", for several seconds with no call placed; this
-    # is the direct behavioral regression test for the bug motivating this
-    # whole plan (a session-less tunnel sitting there for a downstream
-    # peer's own idle-timeout to eventually flap)
-    ...
-```
-
-- [ ] **Step 4: Run, verify it passes**
-
-Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_tunnel.py`
-Expected: PASS, both cases.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add tests/accel-pppd/l2tp_switch/
-git commit -m "test(l2tp): make existing switch tests' connection-mode assumption explicit"
-```
-
----
-
-### Task 6: Flip the default to `on-demand`
-
-**Files:**
-- Modify: `accel-pppd/ctrl/l2tp/l2tp_switch_conf.c`
-- Modify: `tests/accel-pppd/l2tp_switch/test_switch_config.py`
-
-**Interfaces:**
-- Changes: a `target=` line with no 5th field now parses to `L2TP_SWITCH_MODE_ON_DEMAND` instead of `L2TP_SWITCH_MODE_PERSISTENT`.
-
-**Why this is safe to do without a deprecation path.** L2TP switching's own `CHANGELOG.md` entry is still listed under `## Unreleased` (confirmed: `CHANGELOG.md` line 14) — it has never shipped in a numbered accel-ppp release. There is therefore no installed base of operators whose `target=` lines (with no `mode=`) would silently start behaving differently under them; every existing user of this feature so far is this repo's own active development/test setup, per the history in `docs/l2tp_switching.md` and the (now-removed-from-tree, git-history-only) original implementation plan. This plan treats the default flip as a normal, in-development design decision, not a breaking change requiring a migration story or a deprecation window.
-
-- [ ] **Step 1: Update the failing test**
-
-In `test_switch_config.py`, flip `test_switch_target_mode_omitted_defaults_persistent` (Task 1) to `test_switch_target_mode_omitted_defaults_on_demand`, asserting the opposite: `l2tp switch show` reports `[idle]` (Task 4's new on-demand-at-rest wording), not `[up]`, for a `target=` line with no 5th field.
-
-- [ ] **Step 2: Run, verify it fails**
-
-Expected: FAIL — the parser still defaults to `persistent` until this task's implementation step.
-
-- [ ] **Step 3: Implement**
-
-One-line change in `parse_target()` (`l2tp_switch_conf.c`):
-
-```diff
--	if (!mode_str || !strcmp(mode_str, "persistent")) {
--		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
--	} else if (!strcmp(mode_str, "on-demand")) {
-+	if (!mode_str || !strcmp(mode_str, "on-demand")) {
-+		t->mode = L2TP_SWITCH_MODE_ON_DEMAND;
-+	} else if (!strcmp(mode_str, "persistent")) {
- 		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
--	} else if (!strcmp(mode_str, "on-demand")) {
--		t->mode = L2TP_SWITCH_MODE_ON_DEMAND;
- 	} else {
- 		log_error(...);
-```
-
-- [ ] **Step 4: Run, verify it passes**
-
-Run: `sudo python3 -m pytest -v accel-pppd/l2tp_switch/test_switch_config.py`, then the **entire** `l2tp_switch` suite: `sudo python3 -m pytest -v -m l2tp_switch accel-pppd/l2tp_switch/`.
-Expected: PASS across the board — this is exactly why Task 5 had to land first; every test that depends on eager connection now says so explicitly via `mode=persistent`, so this default flip should change nothing about any existing test's outcome except the two `test_switch_config.py`/`test_switch_tunnel.py` cases written specifically to exercise the default.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add accel-pppd/ctrl/l2tp/l2tp_switch_conf.c tests/accel-pppd/l2tp_switch/test_switch_config.py
-git commit -m "feat(l2tp): default switch target connection mode to on-demand"
-```
-
----
-
-### Task 7: Documentation
+### Task 5: Documentation
 
 **Files:**
 - Modify: `docs/l2tp_switching.md`

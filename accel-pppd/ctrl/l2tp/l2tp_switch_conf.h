@@ -24,8 +24,16 @@ struct l2tp_switch_target_t {
 	size_t secret_len;
 	enum l2tp_switch_conn_mode mode;
 
-	/* Owned by l2tp.c (Task 3): the persistent outbound tunnel for this
-	 * target, or NULL while down/reconnecting. */
+	/* Owned by l2tp.c: this target's current outbound tunnel, or NULL
+	 * when it has none. What NULL means depends on the mode: for a
+	 * persistent target it is a transient state (down, or reconnecting),
+	 * while for an on-demand target it is the normal resting state --
+	 * no tunnel exists until a call needs one, and the idle linger
+	 * returns the target to it once the last call is gone. A non-NULL
+	 * value also doubles as the "one connect attempt at a time"
+	 * exclusion in l2tp_switch_target_connect(), so it is set as soon as
+	 * an attempt starts, not once it establishes: use
+	 * `tunnel->state == STATE_ESTB` to test for a usable tunnel. */
 	struct l2tp_conn_t *tunnel;
 	struct triton_timer_t reconnect_timer;
 
@@ -69,12 +77,13 @@ struct l2tp_switch_target_t {
 	 * triton hands the callback nothing identifying which arming of this
 	 * single embedded timer it belongs to. */
 	uint64_t idle_deadline;
-	struct triton_timer_t idle_timer; /* armed by Task 3; declared here
-		because this task's own l2tp_switch_place_downstream_call()
-		fast path already references target->idle_timer (to cancel a
-		linger-teardown when a call reuses an up tunnel) before Task 3
-		exists -- the field has to exist for this task to compile on
-		its own. */
+	/* Fires once idle_deadline has passed, closing an on-demand target's
+	 * now-callless tunnel. Armed and re-armed on the default context by
+	 * l2tp_switch_target_arm_idle_linger(), and retired only by its own
+	 * callback, l2tp_switch_target_idle_timer(), which runs there too.
+	 * Unused for persistent targets, whose tunnels are never closed for
+	 * being idle. */
+	struct triton_timer_t idle_timer;
 
 	/* Owned by l2tp.c (Task 7): live/cumulative stats for this target,
 	 * from this target's own point of view -- rx is bytes received FROM

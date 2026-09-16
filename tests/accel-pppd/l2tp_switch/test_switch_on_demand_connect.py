@@ -335,7 +335,12 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     # and must get its own full budget from that moment -- not whatever was
     # left of the first call's, which would disconnect it early (here: 5s
     # in, instead of 10s).
-    gap = 5.0
+    #
+    # Seconds to wait after the first tunnel is gone before making the
+    # second call. Small enough that the whole first phase (the downstream's
+    # own --hold-seconds included) plus this still lands comfortably inside
+    # the first budget's 10s, which is what leaves its timer armed.
+    gap = 2.0
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
@@ -353,9 +358,30 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     assert s_started
 
     try:
-        # One round only: the downstream accepts the switch's tunnel, then
-        # exits -- taking its socket with it, so the tunnel dies and the
-        # target goes cold again with the first budget's timer still armed.
+        # One round only: the downstream accepts the switch's tunnel and
+        # then immediately hangs it up, so the target goes cold again with
+        # the first budget's timer still armed.
+        #
+        # Both extra flags are about making that sequence deterministic:
+        #
+        #   --send-stopccn ends the tunnel explicitly, the instant it is
+        #   established. Just exiting instead (which is what this test used
+        #   to do) leaves the switch holding a tunnel whose peer is gone but
+        #   which it has no reason to send anything on, so it only notices
+        #   when the idle linger closes it 20s later -- long after the first
+        #   budget's timer has fired and retired itself, which is the very
+        #   thing this test needs to still be armed.
+        #
+        #   --hold-seconds keeps the harness's socket open past that, so the
+        #   switch's own ICRQ -- pushed synchronously from the drain, a few
+        #   instructions after it sends the SCCCN this harness is waiting
+        #   for -- never lands on an already-closed port. Losing that race
+        #   means the call is never placed and "placed: 1" never appears; it
+        #   failed that way ~3 runs in 5 under ASan, which slows the daemon
+        #   side just enough to lose it most of the time. The tunnel is
+        #   already gone from the switch's point of view by then (the
+        #   StopCCN above saw to that), so holding costs nothing but the
+        #   wait.
         down_thread, down_ctrl = l2tp_peer_process.start(
             PEER_BIN,
             [
@@ -363,6 +389,8 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
                 "--peer-port", "17106",
                 "--secret", "downstreamsecret",
                 "--rounds", "1",
+                "--send-stopccn",
+                "--hold-seconds", "3",
             ],
         )
 
@@ -402,8 +430,9 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         assert "sent_iccn" in stamps and "recv_cdn" in stamps, out
         waited = stamps["recv_cdn"] - stamps["sent_iccn"]
 
-        # Inheriting the first budget would land at ~(10 - gap) = 5s; its own
-        # budget lands at ~10s.
+        # Inheriting the first budget would land at whatever was left of it
+        # (~5s here, and less the longer this phase takes); its own budget
+        # always lands at ~10s, which is what the bound below pins down.
         assert waited > CONNECT_TIMEOUT * 0.7, (
             f"second call was disconnected after {waited:.1f}s -- it"
             f" inherited what was left of the first call's budget instead of"

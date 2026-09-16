@@ -20,6 +20,10 @@
  * pppd, handed the bearer socket the same way xl2tpd hands it to its own
  * LAC-side pppd -- see run_real_ppp()'s own comment. Requires an
  * /etc/ppp/pap-secrets entry for --proxy-username beforehand.
+ *
+ * --listen flips this harness to the opposite role: a downstream l2tp-switch
+ * target, accepting the switch's own outbound SCCRQ instead of sending one.
+ * See run_listen_mode()'s own comment.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +198,9 @@ static const char *data_pattern;
 static int send_stopccn;
 static int wait_cdn;
 static int real_ppp;
+static int hold_seconds;
+static int listen_mode;
+static int listen_rounds = 1;
 static const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -330,6 +337,13 @@ static int run_real_ppp(int data_fd)
 		}
 	}
 
+	/* Give the caller a window to drive real traffic (e.g. ping the
+	 * peer address) over the now-up interface before tearing the call
+	 * down -- otherwise ip_up is only ever proven at the control-plane
+	 * level (auth + IPCP), never on the actual data path. */
+	if (ip_up && hold_seconds > 0)
+		sleep((unsigned int)hold_seconds);
+
 	kill(pid, SIGTERM);
 	{
 		int waited_ms = 0;
@@ -384,6 +398,185 @@ static int send_and_recv(int fd, struct l2tp_packet_t *pack,
 	return 0;
 }
 
+static double now_monotonic(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/*
+ * Plays the *downstream target's* role instead of the usual upstream/MK
+ * one: binds --peer-port (any source address, since the switch's own
+ * outbound tunnel socket uses an ephemeral local port) and, for each of
+ * --rounds tunnels, completes SCCRQ -> SCCRP -> SCCCN and then, if
+ * --send-stopccn was given, immediately sends an unprompted StopCCN with a
+ * zero-session tunnel -- exactly what a real peer's own idle-tunnel policy
+ * does (e.g. JunOS's [edit services l2tp tunnel] idle-timeout, 60s default,
+ * firing on a tunnel that never carried a session). No ICRQ is ever sent:
+ * that is the whole point of this mode, and matches production evidence
+ * for the bug this exercises.
+ *
+ * Emits one "event=... round=N t=<monotonic seconds>" line per step so the
+ * driving test can measure the gap between "sent_stopccn" and the next
+ * round's "recv_sccrq" -- i.e. how long the switch actually took to
+ * reconnect -- without depending on `l2tp switch show`, whose "[up]"/
+ * "[down]" status only flips once the old tunnel is actually freed (see the
+ * comment on l2tp_switch_target_t.tunnel in l2tp.c).
+ */
+static int run_listen_mode(int rounds)
+{
+	struct sockaddr_in bind_addr = {
+		.sin_family = AF_INET,
+		.sin_addr = { htonl(INADDR_ANY) },
+		.sin_port = peer_addr.sin_port,
+	};
+	int fd, round;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return die("listen socket() failed");
+	if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
+		return die("listen bind() failed");
+
+	for (round = 0; round < rounds; ++round) {
+		struct l2tp_packet_t *pack, *req;
+		struct l2tp_attr_t *attr;
+		struct sockaddr_in their_addr;
+		uint16_t their_tid = 0, my_tid;
+		uint16_t my_ns = 0, peer_next_nr;
+		uint8_t chall[16];
+		/* l2tp.c's own l2tp_send_SCCRQ()/l2tp_send_SCCRP() randomize
+		 * their Challenge length per tunnel: (random & 0x7F) +
+		 * MD5_DIGEST_LENGTH, i.e. up to 143 bytes -- confirmed by
+		 * hitting a truncated-buffer silent-skip bug here with a
+		 * fixed 64-byte buffer on exactly the second tunnel of a
+		 * two-round run (first draw 64 bytes, second 82). 160 covers
+		 * the real max with margin. */
+		uint8_t their_chall[160];
+		int their_chall_len = 0;
+		uint8_t challresp[MD5_DIGEST_LENGTH];
+		int err;
+
+		for (;;) {
+			if (l2tp_recv(fd, &req, NULL, secret, strlen(secret)) != 0)
+				return die("waiting for SCCRQ failed");
+			if (!req)
+				continue;
+			if (list_empty(&req->attrs)) {
+				l2tp_packet_free(req);
+				continue;
+			}
+			break;
+		}
+		their_addr = req->addr;
+		peer_next_nr = ntohs(req->hdr.Ns) + 1;
+		list_for_each_entry(attr, &req->attrs, entry) {
+			if (attr->attr && attr->attr->id == Assigned_Tunnel_ID)
+				their_tid = (uint16_t)attr->val.int16;
+			/* RFC 2661 5.1.1 mutual tunnel auth: the SCCRQ's own
+			 * Challenge (present whenever the switch has a
+			 * [l2tp] secret=, which every fixture in this plan
+			 * does) must be answered by a Challenge-Response in
+			 * *this* SCCRP -- not in some later message -- or
+			 * the switch rejects the SCCRP outright and never
+			 * proceeds to SCCCN. Copied out before req is freed
+			 * below. */
+			if (attr->attr && attr->attr->id == Challenge &&
+			    attr->length <= (int)sizeof(their_chall)) {
+				memcpy(their_chall, attr->val.octets, attr->length);
+				their_chall_len = attr->length;
+			}
+		}
+		l2tp_packet_free(req);
+		if (!their_tid)
+			return die("SCCRQ carried no Assigned-Tunnel-ID");
+
+		printf("event=recv_sccrq round=%d t=%.6f\n", round, now_monotonic());
+		fflush(stdout);
+
+		my_tid = 1024 + (uint16_t)(random() % 60000);
+
+		/* --- SCCRP --- */
+		if (strlen(secret) > 0 && u_randbuf(chall, sizeof(chall), &err) < 0)
+			return die("u_randbuf(challenge) failed");
+		if (their_chall_len > 0 && strlen(secret) > 0)
+			comp_chap_md5(challresp, Message_Type_Start_Ctrl_Conn_Reply,
+				     secret, strlen(secret), their_chall,
+				     their_chall_len);
+
+		pack = l2tp_packet_alloc(2, Message_Type_Start_Ctrl_Conn_Reply,
+					 &their_addr, 0, secret, strlen(secret));
+		if (!pack)
+			return die("SCCRP alloc failed");
+		l2tp_packet_add_int16(pack, Protocol_Version, L2TP_V2_PROTOCOL_VERSION, 1);
+		l2tp_packet_add_int32(pack, Framing_Capabilities, 3, 1);
+		l2tp_packet_add_string(pack, Host_Name, "fake-downstream", 1);
+		l2tp_packet_add_int16(pack, Assigned_Tunnel_ID, my_tid, 1);
+		if (strlen(secret) > 0)
+			l2tp_packet_add_octets(pack, Challenge, chall, sizeof(chall), 1);
+		if (their_chall_len > 0 && strlen(secret) > 0) {
+			if (l2tp_packet_add_octets(pack, Challenge_Response,
+						   challresp, MD5_DIGEST_LENGTH, 1) < 0)
+				return die("SCCRP Challenge-Response add failed");
+		}
+		pack->hdr.tid = htons(their_tid);
+		pack->hdr.sid = 0;
+		pack->hdr.Ns = htons(my_ns);
+		pack->hdr.Nr = htons(peer_next_nr);
+		if (l2tp_packet_send(fd, pack) < 0)
+			return die("SCCRP send failed");
+		l2tp_packet_free(pack);
+		my_ns++;
+
+		/* --- SCCCN --- */
+		for (;;) {
+			struct l2tp_packet_t *cn = NULL;
+
+			if (l2tp_recv(fd, &cn, NULL, secret, strlen(secret)) != 0)
+				return die("waiting for SCCCN failed");
+			if (!cn)
+				continue;
+			if (list_empty(&cn->attrs)) {
+				l2tp_packet_free(cn);
+				continue;
+			}
+			peer_next_nr = ntohs(cn->hdr.Ns) + 1;
+			l2tp_packet_free(cn);
+			break;
+		}
+
+		printf("event=established round=%d t=%.6f\n", round, now_monotonic());
+		fflush(stdout);
+
+		if (send_stopccn) {
+			struct l2tp_avp_result_code rc = { htons(1), htons(6) };
+
+			pack = l2tp_packet_alloc(2, Message_Type_Stop_Ctrl_Conn_Notify,
+						 &their_addr, 0, secret, strlen(secret));
+			if (!pack)
+				return die("StopCCN alloc failed");
+			l2tp_packet_add_int16(pack, Assigned_Tunnel_ID, my_tid, 1);
+			l2tp_packet_add_octets(pack, Result_Code, (uint8_t *)&rc,
+					       sizeof(rc), 1);
+			pack->hdr.tid = htons(their_tid);
+			pack->hdr.sid = 0;
+			pack->hdr.Ns = htons(my_ns);
+			pack->hdr.Nr = htons(peer_next_nr);
+			if (l2tp_packet_send(fd, pack) < 0)
+				return die("StopCCN send failed");
+			l2tp_packet_free(pack);
+			my_ns++;
+
+			printf("event=sent_stopccn round=%d t=%.6f\n", round, now_monotonic());
+			fflush(stdout);
+		}
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int fd, opt;
@@ -408,6 +601,9 @@ int main(int argc, char **argv)
 		{"wait-cdn", no_argument, 0, 'W'},
 		{"second-call", required_argument, 0, 'S'},
 		{"real-ppp", no_argument, 0, 'R'},
+		{"hold-seconds", required_argument, 0, 'H'},
+		{"listen", no_argument, 0, 'L'},
+		{"rounds", required_argument, 0, 'N'},
 		{0, 0, 0, 0},
 	};
 
@@ -424,7 +620,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:R", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -463,6 +659,15 @@ int main(int argc, char **argv)
 		case 'R':
 			real_ppp = 1;
 			break;
+		case 'H':
+			hold_seconds = atoi(optarg);
+			break;
+		case 'L':
+			listen_mode = 1;
+			break;
+		case 'N':
+			listen_rounds = atoi(optarg);
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -470,9 +675,13 @@ int main(int argc, char **argv)
 				   " [--proxy-username U] [--proxy-password W]"
 				   " [--data-pattern D] [--send-stopccn]"
 				   " [--wait-cdn] [--second-call C]"
-				   " [--real-ppp]");
+				   " [--real-ppp] [--hold-seconds N]"
+				   " [--listen [--rounds N]]");
 		}
 	}
+
+	if (listen_mode)
+		return run_listen_mode(listen_rounds);
 
 	/* connect()ed to the peer, exactly like the real daemon's own
 	 * l2tp_tunnel_alloc() (l2tp.c ~1776) connect()s its per-tunnel UDP

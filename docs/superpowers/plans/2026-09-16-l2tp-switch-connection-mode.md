@@ -239,6 +239,12 @@ Add to `struct l2tp_switch_target_t` (`l2tp_switch_conf.h`, after `reconnect_tim
 	unsigned int pending_count;
 	int connecting;
 	struct triton_timer_t connect_timeout_timer;
+	struct triton_timer_t idle_timer; /* armed by Task 3; declared here
+		because this task's own l2tp_switch_place_downstream_call()
+		fast path already references target->idle_timer (to cancel a
+		linger-teardown when a call reuses an up tunnel) before Task 3
+		exists -- the field has to exist for this task to compile on
+		its own. */
 ```
 
 (`pthread_mutex_init(&t->lock, NULL)` and `INIT_LIST_HEAD(&t->pending_calls)` added to `parse_target()` right after the existing `memset(t, 0, sizeof(*t))`; `pthread_mutex_destroy(&t->lock)` added to `free_target()`.)
@@ -533,11 +539,7 @@ git commit -m "feat(l2tp): connect on-demand targets lazily, queue calls during 
 - Consumes: `target->active` (existing, Task 7 of the original plan), `target->mode` (Task 1).
 - Produces: an on-demand target's tunnel closes itself ~20s after its last active call ends, unless a new call arrives first (which cancels the pending teardown).
 
-**Struct addition** (`l2tp_switch_conf.h`, next to `connect_timeout_timer`):
-
-```c
-	struct triton_timer_t idle_timer;
-```
+**Struct addition:** none — `idle_timer` was already declared on `struct l2tp_switch_target_t` in Task 2 (that task's own code needed to reference it early; see its comment). This task only arms and fires it.
 
 Add near the other constants:
 

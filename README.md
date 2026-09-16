@@ -121,10 +121,13 @@ terminating PPP and RADIUS locally (RFC 2661 section 5.1). Enable l2tp in
     target=acme,203.0.113.50,1701,targetsecret
     match=Calling-Number,exact,472913,acme
 
-Targets are persistent, auto-reconnecting outbound tunnels; match rules route
-calls to a target by any string-typed AVP (Calling-Number, Called-Number, or
-a realm/prefix embedded in the proxied username), in exact or prefix mode.
-Manage rules at runtime with `l2tp switch show|add|del` over the CLI. See
+By default a target's outbound tunnel connects on demand (only once a call
+needs it, closing itself after 20s idle) rather than staying up persistently;
+add `,persistent` after the secret to opt a target back into an eager,
+always-reconnecting tunnel instead. Match rules route calls to a target by
+any string-typed AVP (Calling-Number, Called-Number, or a realm/prefix
+embedded in the proxied username), in exact or prefix mode. Manage rules at
+runtime with `l2tp switch show|add|del` over the CLI. See
 docs/l2tp_switching.md for the full configuration reference, observability
 (native Prometheus/JSON metrics), and operational constraints, and
 "man 5 accel-ppp.conf" for the [l2tp-switch] option reference.

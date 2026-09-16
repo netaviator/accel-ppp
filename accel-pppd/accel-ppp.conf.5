@@ -987,10 +987,16 @@ configured subset of incoming L2TP calls, relay the Proxy LCP/Auth AVPs and
 PPP frames to a second, downstream L2TP LNS instead of terminating PPP and
 RADIUS locally.
 .TP
-.BI "target=" name,peer-addr,peer-port,secret
-Defines a downstream LNS. Repeatable. accel-ppp brings up one persistent
-outbound tunnel per target at startup and reconnects automatically if it
-drops.
+.BI "target=" name,peer-addr,peer-port,secret[,mode]
+Defines a downstream LNS. Repeatable.
+.B mode
+is
+.B persistent
+(eager connect at startup, reconnect forever, regardless of active calls)
+or
+.B on-demand
+(default: connect only when a call needs it, close again after 20s idle).
+See docs/l2tp_switching.md for the full rationale and lifecycle.
 .TP
 .BI "match=" attr-name,mode,value,target-name
 Routes calls to one target based on the value of one L2TP AVP. Repeatable;

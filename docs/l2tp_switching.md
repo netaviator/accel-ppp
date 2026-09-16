@@ -11,13 +11,32 @@ touched for a switched call.
 
 ```
 [l2tp-switch]
-target=<name>,<peer-addr>,<peer-port>,<secret>
+target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>]
 match=<attr-name>,<mode>,<value>,<target-name>
 ```
 
-- `target=<name>,<peer-addr>,<peer-port>,<secret>` — a downstream LNS.
-  Repeatable. accel-ppp brings up one persistent outbound tunnel per
-  target at startup and reconnects automatically if it drops.
+- `target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>]` — a downstream
+  LNS. Repeatable. `<mode>` is `persistent` or `on-demand` (default:
+  `on-demand`):
+  - `on-demand` (default) — the outbound tunnel to this target opens only
+    once a call actually needs it, and closes itself again after the
+    target has had no active calls for 20 seconds (a fresh call within
+    that window reuses the tunnel and cancels the pending close). Chosen
+    as the default because many real downstream peers (e.g. Juniper
+    JunOS, whose own tunnel `idle-timeout` defaults to 60 seconds) tear
+    down a session-less tunnel on their own idle policy; `on-demand`
+    tears its own side down first, on its own terms, comfortably inside
+    that window, rather than flapping forever against the peer's policy.
+    A call placed while the tunnel is still connecting queues rather than
+    failing immediately, and is only given up on (CDNing the upstream
+    call) if the connect hasn't completed within 10 seconds.
+  - `persistent` — the original behavior: accel-ppp opens the tunnel
+    eagerly at startup and keeps it open indefinitely with automatic
+    reconnect, regardless of whether any call is currently using it. Use
+    this only if the downstream peer is known to tolerate (or is itself
+    configured to tolerate, e.g. JunOS `idle-timeout 0`) an idle,
+    session-less control tunnel, and avoiding tunnel-setup latency on a
+    call's critical path matters more than the idle-tunnel cost above.
 - `match=<attr-name>,<mode>,<value>,<target-name>` — routes calls to one
   target based on the value of one L2TP AVP. Repeatable; several rules
   may point at the same target.
@@ -64,6 +83,35 @@ counters are running totals: they only increase, even as individual
 calls end, so a target's numbers reflect everything ever spliced to it,
 not just its currently-active calls.
 
+The status word in `[...]` depends on the target's mode:
+
+- `persistent` targets report `[up]` (tunnel established) or `[down]`
+  (not currently established — a connect/reconnect is pending or in
+  progress). This is unchanged from before mode support existed.
+- `on-demand` targets report `[up]` whenever `active` is non-zero (at
+  least one call is currently bridged through it — this already implies
+  the tunnel is established, since a call cannot be placed on one that
+  isn't); `[connecting]` when a connect is actually in flight — i.e. a
+  call is waiting on a tunnel that hasn't reached `STATE_ESTB` yet, and
+  is bounded by the 10-second connect timeout above; and `[idle]`
+  otherwise. `[idle]` is deliberately the catch-all for two states that
+  look identical from a call's perspective but are not identical on the
+  wire: a target that has never been asked for, and one that is still in
+  its 20-second idle-linger tail — established, with nothing bridged
+  through it, ticking down to closing itself. Collapsing both into
+  `[idle]` is intentional: neither is a fault, a human skimming the CLI
+  for problems doesn't need to tell them apart, and `[idle]` reads as
+  "at rest" either way. Anyone who *does* need the finer-grained answer
+  — e.g. to alert on "this on-demand target has been sitting idle-open
+  for suspiciously long" — can reconstruct it precisely from the two
+  metrics below: `target_up=1` with `target_active=0` is the
+  idle-lingering tail specifically, while `target_up=0` (which implies
+  `target_active=0`, since a call can't be active on a tunnel that
+  isn't established) is genuinely closed. There is no separate CLI or
+  metric state for "lingering" on its own, since the 20-second window is
+  short and the distinction only matters to something already watching
+  the numeric metrics rather than reading the CLI by eye.
+
 `accel-cmd show stat` includes an `l2tp-switch:` block alongside the
 existing `l2tp:` one, with the aggregate (not per-target) `active:`,
 `lns_rx_bytes:`, and `lns_tx_bytes:` — the totals to/from MK
@@ -79,7 +127,19 @@ Prometheus format and `format=json`:
 
 - `accel_ppp_l2tp_switch_active` (gauge) — aggregate active calls.
 - `accel_ppp_l2tp_switch_lns_bytes_total{direction="rx"|"tx"}` (counter) — aggregate, to/from MK.
-- `accel_ppp_l2tp_switch_target_up{target="..."}` (gauge) — per-target tunnel status.
+- `accel_ppp_l2tp_switch_target_up{target="..."}` (gauge) — 1 if this
+  target's tunnel is currently established (`STATE_ESTB`), for both
+  modes, 0 otherwise. For an `on-demand` target this is 1 throughout its
+  20-second idle-linger tail too — the tunnel is technically still open
+  even though nothing is bridged through it — so combine it with
+  `target_active` below to distinguish "up and busy" (`up=1`,
+  `active>0`) from "up but idle" (`up=1`, `active=0` — an on-demand
+  target's idle-linger tail, or a `persistent` target simply between
+  calls) from "on-demand and genuinely at rest, tunnel actually closed"
+  (`up=0`, which also implies `active=0`). There is deliberately no
+  separate metric for the CLI's `[connecting]` state (tunnel not yet
+  established, at least one call queued on it), since it is brief and
+  bounded by the 10-second connect timeout.
 - `accel_ppp_l2tp_switch_target_active{target="..."}` (gauge) — per-target active calls.
 - `accel_ppp_l2tp_switch_target_bytes_total{target="...",direction="rx"|"tx"}` (counter) — per-target, to/from that target's own LNS.
 

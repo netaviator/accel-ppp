@@ -31,7 +31,12 @@ def test_downstream_failure_does_not_affect_locally_terminated_session(
             "upstreamsecret",
             extra="""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17100,downstreamsecret
+    # Pinned to persistent: this test's own subject is mixed switched/local
+    # call isolation, not connection mode -- it relies on the target's
+    # tunnel already being up before any call is placed, which on-demand
+    # mode's default no longer does. See
+    # docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17100,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
         )
@@ -49,6 +54,16 @@ def test_downstream_failure_does_not_affect_locally_terminated_session(
             # and, on the *same* tunnel, a second call with a calling number
             # that does NOT match any match= entry -- an ordinary,
             # locally-terminated call on the switch instance's own PPP stack.
+            #
+            # --hold-seconds keeps this "MK" alive -- and with it the
+            # upstream tunnel's socket -- for the whole teardown below.
+            # Without it the harness exits as soon as both calls are up, and
+            # the switched call's own CDN (sent to the upstream leg when its
+            # downstream leg fails) lands on a closed port: the ICMP
+            # unreachable that comes back takes the entire upstream tunnel
+            # down, locally-terminated session and all, with nothing to do
+            # with the isolation this test is about. A real MK does not
+            # vanish between placing a call and hearing that it ended.
             peer_thread, peer_ctrl = l2tp_peer_process.start(
                 "/tmp/l2tp_switch_peer_test",
                 [
@@ -57,10 +72,9 @@ def test_downstream_failure_does_not_affect_locally_terminated_session(
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     "--second-call", "999999",
+                    "--hold-seconds", "20",
                 ],
             )
-            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
-            assert rc == 0, err
 
             active = None
             for _ in range(50):
@@ -100,6 +114,9 @@ def test_downstream_failure_does_not_affect_locally_terminated_session(
                 "locally-terminated session was torn down alongside the "
                 "unrelated switched call's failure:\n" + sessions_out
             )
+
+            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 30.0)
+            assert rc == 0, err
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
             config.delete_tmp(s_cfg)

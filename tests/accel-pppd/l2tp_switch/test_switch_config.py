@@ -3,6 +3,87 @@ from common import process
 
 
 @pytest.mark.l2tp_switch
+class TestTargetModePersistentExplicit:
+    """explicit "persistent" parses and the target still shows in
+    `l2tp switch show` -- config-parse-only, the peer-addr is an
+    unreachable TEST-NET-3 address by design, so this never waits on
+    "[up]"."""
+
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    target=acme,203.0.113.50,1701,targetsecret,persistent
+    """
+
+    def test_switch_target_mode_persistent_explicit(self, accel_pppd_instance, accel_cmd):
+        assert accel_pppd_instance
+
+        (exit, out, err) = process.run([accel_cmd, "l2tp switch show"])
+
+        assert exit == 0
+        assert "acme -> 203.0.113.50:1701" in out
+
+
+@pytest.mark.l2tp_switch
+class TestTargetModeOnDemandExplicit:
+    """explicit "on-demand" parses and the target still shows in
+    `l2tp switch show`."""
+
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    target=acme,203.0.113.50,1701,targetsecret,on-demand
+    """
+
+    def test_switch_target_mode_on_demand_explicit(self, accel_pppd_instance, accel_cmd):
+        assert accel_pppd_instance
+
+        (exit, out, err) = process.run([accel_cmd, "l2tp switch show"])
+
+        assert exit == 0
+        assert "acme -> 203.0.113.50:1701" in out
+
+
+@pytest.mark.l2tp_switch
+class TestTargetModeOmittedDefaultsOnDemand:
+    """4-field target= (mode omitted) must still parse successfully and
+    default to on-demand -- not a parse error, not a crash."""
+
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    target=acme,203.0.113.50,1701,targetsecret
+    """
+
+    def test_switch_target_mode_omitted_defaults_on_demand(self, accel_pppd_instance, accel_cmd):
+        assert accel_pppd_instance
+
+        (exit, out, err) = process.run([accel_cmd, "l2tp switch show"])
+
+        assert exit == 0
+        assert "acme -> 203.0.113.50:1701" in out
+
+
+@pytest.mark.l2tp_switch
+class TestTargetModeUnknownRejected:
+    """An unrecognized 5th field must be a fatal config-load error, same as
+    an unknown match= mode today -- not silently ignored, not a crash."""
+
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    target=acme,203.0.113.50,1701,targetsecret,bogus
+    """
+
+    def test_switch_target_mode_unknown_rejected(self, accel_pppd_instance):
+        assert accel_pppd_instance is False
+
+
+@pytest.mark.l2tp_switch
 def test_l2tp_switch_show_empty(accel_pppd_instance, accel_cmd):
     assert accel_pppd_instance
 

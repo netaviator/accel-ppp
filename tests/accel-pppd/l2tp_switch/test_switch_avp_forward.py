@@ -21,7 +21,11 @@ def test_switch_forwards_proxy_avps(pytestconfig, accel_cmd, accel_pppd):
             "upstreamsecret",
             extra="""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17030,downstreamsecret
+    # Pinned to persistent: this test's own subject is AVP forwarding, not
+    # connection mode -- it relies on the target's tunnel already being up
+    # before any call is placed, which on-demand mode's default no longer
+    # does. See docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17030,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
         )

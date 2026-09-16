@@ -10,12 +10,18 @@
 struct l2tp_dict_attr_t;
 struct l2tp_conn_t;
 
+enum l2tp_switch_conn_mode {
+	L2TP_SWITCH_MODE_PERSISTENT,
+	L2TP_SWITCH_MODE_ON_DEMAND,
+};
+
 struct l2tp_switch_target_t {
 	struct list_head entry;
 	char *name;
 	struct sockaddr_in peer_addr;
 	char *secret;
 	size_t secret_len;
+	enum l2tp_switch_conn_mode mode;
 
 	/* Owned by l2tp.c (Task 3): the persistent outbound tunnel for this
 	 * target, or NULL while down/reconnecting. */

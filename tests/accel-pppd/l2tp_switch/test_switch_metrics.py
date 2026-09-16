@@ -55,7 +55,11 @@ def test_switch_metrics_exposed_via_native_endpoint(pytestconfig, accel_cmd, acc
     secret=upstreamsecret
 
     [l2tp-switch]
-    target=downstream,127.0.0.1,17090,downstreamsecret
+    # Pinned to persistent: this test's own subject is metrics values, not
+    # connection mode -- it relies on the target's tunnel already being up
+    # before any call is placed, which on-demand mode's default no longer
+    # does. See docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
+    target=downstream,127.0.0.1,17090,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
 
     [metrics]

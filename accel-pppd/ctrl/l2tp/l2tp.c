@@ -2027,7 +2027,8 @@ static void l2tp_switch_targets_connect(void)
 		target->reconnect_timer.expire =
 			l2tp_switch_target_reconnect_timer;
 		target->reconnect_timer.period = 5000;
-		l2tp_switch_target_connect(target);
+		if (target->mode == L2TP_SWITCH_MODE_PERSISTENT)
+			l2tp_switch_target_connect(target);
 	}
 }
 

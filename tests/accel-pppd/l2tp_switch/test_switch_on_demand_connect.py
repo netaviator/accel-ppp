@@ -22,12 +22,15 @@ import time
 
 import pytest
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance
+from helpers import start_instance, wait_for_tunnels_active
 
 PEER_BIN = "/tmp/l2tp_switch_peer_test"
 
 # The daemon's own L2TP_SWITCH_ON_DEMAND_CONNECT_TIMEOUT_MS, in seconds.
 CONNECT_TIMEOUT = 10.0
+
+# The daemon's own L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS, in seconds.
+IDLE_LINGER = 20.0
 
 
 def _switch_show(accel_cmd, cli_port=2001):
@@ -446,6 +449,155 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
             f"second call hung for {waited:.1f}s before being disconnected --"
             " its budget's timer is not armed to its own deadline"
         )
+    finally:
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        config.delete_tmp(s_cfg)
+
+
+@pytest.mark.l2tp_switch
+def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
+    pytestconfig, accel_cmd, accel_pppd
+):
+    """A tunnel that establishes in the same instant its budget expires must
+    still end up with something that will close it.
+
+    When the connect timeout gives up on a still-negotiating tunnel it
+    releases the target's connect slot (target->tunnel = NULL) before
+    scheduling the abort into that tunnel's own context -- deliberately, so a
+    dying attempt cannot block the next one for the tens of seconds its
+    StopCCN/FIN_WAIT takes. But the peer's SCCRP can be processed in between,
+    and triton runs a context's pending md handlers before its pending
+    context calls, so it *wins* that race whenever it lands anywhere in the
+    gap. The tunnel then establishes, its queued-call drain no-ops (the
+    identity guard it checks was just falsified), and the abort finds an
+    established tunnel it is not allowed to tear down.
+
+    What is left is reachable from nothing: no call can find it (the target's
+    slot is NULL), and no idle linger can be armed for it (arming requires
+    the same identity that is now false). It stays up against a live peer
+    until the daemon exits -- and because the target looks free, the next
+    call starts a *second* tunnel, so every recurrence adds another one.
+
+    The reproduction: a downstream that answers ~100ms before the 10s budget
+    expires, but buries its SCCRP in a 400ms flood of junk datagrams
+    (--sccrp-storm-ms). The flood keeps the switch's socket readable
+    continuously, so the SCCRP is not processed until the flood ends, while
+    the connect deadline -- aimed a quarter of the way into it, far outside
+    the few ms of jitter either side -- fires in the middle of it. That turns
+    a sub-millisecond ordering into a reliable one: it came out this way in
+    every run while this was written (nine runs of a standalone driver, four
+    against the unfixed daemon and five against the fixed one, plus this test
+    on both sides of the fix).
+
+    The assertion is the invariant rather than the mechanism: however the
+    race falls out, no l2tp tunnel is still active a linger later. It fails
+    only on the orphan, never on a run where the ordering did not happen.
+    """
+    sccrp_delay = 9.9
+    storm = 0.4
+
+    s_started, s_thread, s_ctrl, s_cfg = start_instance(
+        accel_pppd,
+        accel_cmd,
+        2001,
+        "127.0.0.1",
+        17111,
+        "upstreamsecret",
+        extra="""
+    [l2tp-switch]
+    target=racy,127.0.0.1,17110,downstreamsecret,on-demand
+    match=Calling-Number,exact,472913,racy
+    """,
+    )
+    assert s_started
+
+    try:
+        # Patient enough to outlast the whole observation window below: a
+        # harness that exited early would take its socket with it and the
+        # switch would notice the peer was gone, which is not what this
+        # test is about.
+        down_thread, down_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--listen",
+                "--peer-port", "17110",
+                "--secret", "downstreamsecret",
+                "--sccrp-delay-ms", str(int(sccrp_delay * 1000)),
+                "--sccrp-storm-ms", str(int(storm * 1000)),
+                "--rounds", "1",
+                "--hold-seconds", "50",
+            ],
+        )
+
+        try:
+            peer_thread, peer_ctrl = l2tp_peer_process.start(
+                PEER_BIN,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", "17111",
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "472913",
+                    "--wait-cdn",
+                    "--cdn-timeout", "25",
+                ],
+            )
+            rc, out, err = _finish(peer_thread, peer_ctrl, 40.0)
+            assert rc == 0, (
+                f"call against the slow target was never disconnected (rc={rc}):"
+                f" {err}\n{out}"
+            )
+            stamps = _timestamps(out)
+            # The precondition for the whole scenario: the budget really did
+            # expire on this call, i.e. the connect timeout ran and released
+            # the target's slot. Without it there is no race to lose.
+            assert "recv_cdn" in stamps, (
+                "the call was placed instead of timing out -- the downstream"
+                f" answered too early for this test's timing:\n{out}"
+            )
+
+            # The CDN is sent when the budget expires, which is *before* the
+            # flood ends and the tunnel comes up -- so the tunnel count is
+            # still settling right now, and reading it immediately would see
+            # the zero that follows the upstream call's own teardown and
+            # conclude far too early. Let the downstream tunnel finish
+            # establishing first.
+            time.sleep(storm + 2.0)
+
+            # The invariant. An orphan sits here at 1 forever; a tunnel the
+            # abort tore down is gone in milliseconds; a tunnel that was
+            # re-claimed closes itself one idle linger later.
+            settled, after, count = wait_for_tunnels_active(
+                accel_cmd, 0, IDLE_LINGER + 12.0
+            )
+            assert settled, (
+                f"{count} l2tp tunnel(s) still active {after:.0f}s after the"
+                " on-demand connect timed out -- a tunnel that established"
+                " just as its budget expired was left with no call able to"
+                " reach it and no idle linger able to close it"
+            )
+        finally:
+            # Short: on the run this test is about, the harness has already
+            # exited on the switch's StopCCN by now, and on a run where the
+            # tunnel never came up it is stuck waiting for an SCCCN that will
+            # never arrive, with nothing left to wait for it to say.
+            rc, down_out, down_err = _finish(down_thread, down_ctrl, 5.0)
+
+        events = _events(down_out)
+        if 0 in events.get("established", {}):
+            # The intended ordering really happened, so the stronger claim
+            # holds too: the switch closed the tunnel itself, voluntarily
+            # (result 1), rather than it dying with the daemon.
+            assert re.search(r"event=recv_stopccn round=0 [^\n]*res=1", down_out), (
+                "the tunnel established after the budget expired but the"
+                " switch never closed it -- it was orphaned, and only the"
+                f" harness's own timeout ended this test:\n{down_out}"
+            )
+        else:
+            print(
+                "note: the downstream's SCCRP never established the tunnel,"
+                " so this run exercised the plain abort path rather than the"
+                " establish-vs-abort ordering"
+            )
     finally:
         accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
         config.delete_tmp(s_cfg)

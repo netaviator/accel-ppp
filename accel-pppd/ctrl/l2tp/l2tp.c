@@ -2683,11 +2683,13 @@ static int l2tp_session_connect(struct l2tp_sess_t *sess)
  * to the tunnel that has just come up.
  *
  * Runs inside conn->ctx (reached from l2tp_recv_SCCRP/l2tp_recv_SCCCN, both
- * message handlers on this tunnel's own context), so the queued calls can be
- * placed with a *direct* call to l2tp_switch_place_call_on() -- no
- * triton_context_call() hop, and no extra guard for a queued upstream session
- * having died while it waited: that function's own STATE_CLOSE check already
- * handles it, releasing the hold taken when the call was queued.
+ * message handlers on this tunnel's own context, and from
+ * l2tp_switch_abort_stalled_tunnel(), a scheduled call on that same context),
+ * so the queued calls can be placed with a *direct* call to
+ * l2tp_switch_place_call_on() -- no triton_context_call() hop, and no extra
+ * guard for a queued upstream session having died while it waited: that
+ * function's own STATE_CLOSE check already handles it, releasing the hold
+ * taken when the call was queued.
  *
  * Deliberately does NOT cancel connect_timeout_timer, even though this
  * closes the budget that timer bounds: the timer belongs to the default
@@ -4875,31 +4877,99 @@ static void l2tp_switch_disconnect_upstream(void *data)
 				 * l2tp_switch_place_downstream_call() below */
 }
 
-/* Tears down a tunnel that is still mid-negotiation once its on-demand
- * connect budget is spent. Runs in the tunnel's own context (crossed into by
- * l2tp_switch_on_demand_timeout() below), which is the only context allowed
- * to touch its timers and send queue. */
+/* Disposes of a tunnel whose on-demand connect budget was spent while it was
+ * still mid-negotiation: tears it down if it really did stall, or takes the
+ * target's connect slot back if it turns out to have established after all.
+ *
+ * Runs in the tunnel's own context (crossed into by
+ * l2tp_switch_on_demand_timeout() below), which is the only context allowed to
+ * touch its timers and send queue -- and the only one where conn->state cannot
+ * go stale between the test and what is done about it. The timeout's own read
+ * of conn->state, from the default context, is necessarily a guess; this is
+ * where that guess is re-checked authoritatively. */
 static void l2tp_switch_abort_stalled_tunnel(void *data)
 {
 	struct l2tp_conn_t *conn = data;
+	struct l2tp_switch_target_t *target = conn->switch_target;
+	int reclaimed;
 
-	/* It may well have finished establishing (or been torn down for an
-	 * unrelated reason) in the window between the timeout firing and this
-	 * call being scheduled -- in which case it is a perfectly good tunnel
-	 * that later calls can reuse, and must not be killed here. */
-	if (conn->state != STATE_CLOSE && conn->state != STATE_ESTB)
-		/* Result 2: general error, matching this file's existing
-		 * convention for aborting a tunnel that failed to establish.
+	if (conn->state != STATE_ESTB) {
+		if (conn->state != STATE_CLOSE)
+			/* Result 2: general error, matching this file's
+			 * existing convention for aborting a tunnel that
+			 * failed to establish.
+			 *
+			 * _push(), not the plain disconnect: this runs as a
+			 * scheduled context call from
+			 * l2tp_switch_on_demand_timeout(), never through
+			 * l2tp_conn_read()'s receive loop, so nothing else
+			 * would flush the StopCCN out of the send queue before
+			 * l2tp_tunnel_free()'s l2tp_tunnel_clear_sendqueue()
+			 * discards it. Same fix, same reason, as
+			 * l2tp_switch_teardown_peer(). */
+			l2tp_tunnel_disconnect_push(conn, 2, 0);
+		goto out;
+	}
+
+	/* It established between the timeout's state check and this call being
+	 * dispatched -- which is not an exotic window at all: triton's
+	 * ctx_thread() runs a context's pending md handlers *before* its
+	 * pending context calls, so a peer SCCRP landing any time between that
+	 * check and this call getting its turn is processed first. The tunnel
+	 * then reached STATE_ESTB, and l2tp_tunnel_connect()'s drain ran and
+	 * did nothing, its `target->tunnel == conn` identity guard having
+	 * already been falsified by the timeout releasing the slot.
+	 *
+	 * So this is the only place left that can keep such a tunnel from
+	 * becoming an orphan: established, with conn->switch_target still set,
+	 * but reachable from nothing -- no call can find it (target->tunnel is
+	 * NULL) and no idle linger can be armed for it (arming demands
+	 * target->tunnel == conn), leaving it up against a live peer until the
+	 * daemon exits or the peer itself hangs up. */
+	pthread_mutex_lock(&target->lock);
+	/* Same "one tunnel at a time" rule, and the same locked test, that
+	 * l2tp_switch_target_connect() publishes an attempt under: take the
+	 * slot back only if it is still free. A newer attempt that claimed it
+	 * in the meantime owns the target now, and its own calls are queued
+	 * against it. */
+	reclaimed = !target->tunnel || target->tunnel == conn;
+	if (reclaimed)
+		target->tunnel = conn;
+	pthread_mutex_unlock(&target->lock);
+
+	if (reclaimed) {
+		log_tunnel(log_info1, conn, "l2tp-switch: target \"%s\":"
+			   " tunnel established just as its connect budget"
+			   " expired, keeping it\n", target->name);
+		/* Everything a normally-drained connect does, and for the same
+		 * reasons -- place whatever is queued now (a call that arrived
+		 * after the timeout gave up on the old queue would otherwise
+		 * wait out its own budget behind a tunnel that is already
+		 * usable), close that budget, and arm the idle linger if
+		 * nothing was placed, so a tunnel nobody ends up using still
+		 * closes itself.
 		 *
-		 * _push(), not the plain disconnect: this runs as a scheduled
-		 * context call from l2tp_switch_on_demand_timeout(), never
-		 * through l2tp_conn_read()'s receive loop, so nothing else
-		 * would flush the StopCCN out of the send queue before
-		 * l2tp_tunnel_free()'s l2tp_tunnel_clear_sendqueue() discards
-		 * it. Same fix, same reason, as
-		 * l2tp_switch_teardown_peer(). */
-		l2tp_tunnel_disconnect_push(conn, 2, 0);
+		 * Safe to call directly: it must run in conn's own context,
+		 * which is exactly where we are, and no call can slip past it
+		 * -- l2tp_switch_place_downstream_call() decides between its
+		 * fast path and queueing in a single hold of target->lock, so
+		 * after the re-claim above every new call takes the fast path
+		 * instead of queueing. */
+		l2tp_switch_drain_pending_calls(conn);
+	} else {
+		log_tunnel(log_info1, conn, "l2tp-switch: target \"%s\":"
+			   " tunnel established too late, a newer attempt"
+			   " already owns the target -- closing it\n",
+			   target->name);
+		/* Result 1, "general request to clear the control connection"
+		 * (RFC 2661 5.4): nothing is wrong with this tunnel, it simply
+		 * has no owner any more. Leaving it up would leak exactly the
+		 * orphan described above. Same _push() reason as every other
+		 * disconnect reached by a scheduled context call. */
+		l2tp_tunnel_disconnect_push(conn, 1, 0);
+	}
 
+out:
 	tunnel_put(conn); /* the hold taken in
 			   * l2tp_switch_on_demand_timeout() below */
 }
@@ -4981,7 +5051,17 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 		 * belongs to this target for accounting and for
 		 * l2tp_tunnel_free()'s own hook, whose `target->tunnel ==
 		 * conn` identity guard is exactly what keeps that later
-		 * teardown from blanking out a newer attempt's pointer. */
+		 * teardown from blanking out a newer attempt's pointer.
+		 *
+		 * Releasing the slot here means the tunnel is unreachable from
+		 * the target from now on -- no later call can find it, and no
+		 * idle linger can be armed for it. That is deliberate for a
+		 * tunnel that really is stalled, but the state read just above
+		 * is read from the wrong context to be final: it can already
+		 * be establishing. l2tp_switch_abort_stalled_tunnel() re-tests
+		 * it where it is authoritative and takes this slot back if so,
+		 * which is what keeps a tunnel that beat the deadline by a
+		 * hair from being stranded up with nothing referencing it. */
 		target->tunnel = NULL;
 	}
 	pthread_mutex_unlock(&target->lock);

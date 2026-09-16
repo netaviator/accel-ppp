@@ -207,6 +207,33 @@ static int listen_rounds = 1;
  * observe what an on-demand target does with a call that arrives while its
  * connect is still in flight (queue it, rather than fail it outright). */
 static int sccrp_delay_ms;
+/* --listen only: instead of answering the SCCRQ with a single SCCRP, flood
+ * the switch's tunnel socket for this many milliseconds with cheap junk
+ * datagrams (wrong tunnel ID, discarded by l2tp_conn_read()'s own tid check
+ * before anything else looks at them), sprinkling copies of the real SCCRP
+ * through the flood.
+ *
+ * Why a flood makes a microsecond-wide race a deterministic one. Two
+ * properties of the switch's own machinery combine:
+ *
+ *   * l2tp_conn_read() drains its socket in a loop and only *processes*
+ *     what it read afterwards, so an SCCRP buried in the flood is not acted
+ *     on until the flood stops feeding that loop -- the tunnel establishes
+ *     at the end of the window, not when the SCCRP was sent;
+ *   * triton's ctx_thread() serves a context's pending md handlers before
+ *     its pending context calls, so while the socket keeps going readable
+ *     the handler keeps winning and anything scheduled into this tunnel's
+ *     context meanwhile (the on-demand connect timeout's abort, which is
+ *     the point of the exercise) is starved until the flood ends.
+ *
+ * Aiming a flood an order of magnitude wider than the jitter at the connect
+ * deadline therefore reproduces, every time, an ordering that is otherwise a
+ * sub-millisecond coin flip.
+ *
+ * Duplicate SCCRPs are free: the switch stores control messages by Ns, so
+ * copies past the first are deduplicated, and those the kernel drops when
+ * the receive buffer is full cost nothing either. */
+static int sccrp_storm_ms;
 /* How long --wait-cdn waits, in seconds. Default 5 matches every existing
  * caller; the on-demand connect-timeout test needs a budget longer than the
  * daemon's own 10s connect timeout to observe the CDN that follows it. */
@@ -414,6 +441,133 @@ static double now_monotonic(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* How many junk datagrams one sendmmsg() hands the kernel. The flood has to
+ * comfortably outrun the switch's own draining of its socket -- a per-datagram
+ * sendto() loop only just keeps up with it (both sides are usually built with
+ * the same sanitizers), and every moment the switch wins leaves its read loop
+ * with an empty socket, which is when the window this flood creates snaps
+ * shut. Batching moves the sender an order of magnitude ahead instead. */
+#define STORM_BATCH 64
+
+/* --sccrp-storm-ms: keep the switch's tunnel socket continuously readable for
+ * that long, so its l2tp_conn_read() never finds the socket dry, and finish by
+ * letting the SCCRP sprinkled through the flood establish the tunnel. See
+ * sccrp_storm_ms's own comment for what that buys a driving test.
+ *
+ * The junk carries a tunnel ID the switch has never assigned, which its
+ * l2tp_conn_read() drops on the spot ("discarding message with invalid tid")
+ * without queueing, acking or otherwise reacting to it -- the cheapest
+ * harmless datagram this protocol has. It is the exact 12 bytes
+ * l2tp_packet_send() would have put on the wire for an attribute-less control
+ * message, built once and then blasted with sendmmsg(); the kernel silently
+ * discards whatever overflows the switch's receive buffer, which is precisely
+ * the "switch is behind" state this wants.
+ *
+ * Returns 0 once the flood is over and the SCCRP has been handed to the
+ * kernel, non-zero (already reported via die()) on a send error.
+ */
+static int send_sccrp_storm(int fd, const struct sockaddr_in *their_addr,
+			    struct l2tp_packet_t *sccrp)
+{
+	/* One SCCRP copy per this many junk batches. Small enough that
+	 * hundreds of copies are offered across a typical flood (so a full
+	 * receive buffer dropping most of them does not matter), large enough
+	 * that the junk, not the SCCRP, is what keeps the socket busy. */
+	static const int sccrp_every = 4;
+	/* Junk-only for the first half of the flood. The switch's read loop
+	 * exits the moment its socket runs dry, so an SCCRP offered before
+	 * the flood has built up a backlog is simply read, the loop ends, and
+	 * the tunnel establishes right there -- which is the one outcome this
+	 * flood exists to prevent. Half the window is spent getting the
+	 * switch chronically behind before the SCCRP is offered at all; the
+	 * connect deadline a driving test aims at belongs in this half. */
+	double started = now_monotonic();
+	double until = started + (double)sccrp_storm_ms / 1000.0;
+	double offer_sccrp_from = started + (double)sccrp_storm_ms / 2000.0;
+	/* ...and stop the junk for the last tenth, sending nothing but SCCRP
+	 * copies. While the junk is flowing the receive buffer stays full, so
+	 * most of what is offered is dropped by the kernel; stopping it lets
+	 * the buffer drain just enough for a copy to get in, while the switch
+	 * still has a backlog of junk to chew through and so has not yet left
+	 * its read loop. Without this tail the flood can end with every SCCRP
+	 * copy dropped, and the tunnel never comes up at all. */
+	double junk_until = started + (double)sccrp_storm_ms * 0.9 / 1000.0;
+	struct mmsghdr msgs[STORM_BATCH];
+	struct l2tp_packet_t *junk;
+	struct l2tp_hdr_t wire;
+	struct iovec iov;
+	unsigned long batches = 0, sent = 0;
+	int i;
+
+	junk = l2tp_packet_alloc(2, 0, their_addr, 0, NULL, 0);
+	if (!junk)
+		return die("storm junk alloc failed");
+	junk->hdr.tid = htons(0xffff); /* never a live tunnel ID here: the
+					* switch assigns its own from
+					* l2tp_conn[], which this harness's
+					* real messages echo back instead */
+	junk->hdr.sid = 0;
+	/* What l2tp_packet_send() does to an attribute-less packet's header
+	 * on its way out: length is the bare header, and flags -- the one
+	 * field kept in host order in struct l2tp_hdr_t -- is byte-swapped. */
+	wire = junk->hdr;
+	wire.length = htons(sizeof(wire));
+	wire.flags = htons(junk->hdr.flags);
+	l2tp_packet_free(junk);
+
+	iov.iov_base = &wire;
+	iov.iov_len = sizeof(wire);
+	memset(msgs, 0, sizeof(msgs));
+	for (i = 0; i < STORM_BATCH; i++) {
+		msgs[i].msg_hdr.msg_name = (void *)their_addr;
+		msgs[i].msg_hdr.msg_namelen = sizeof(*their_addr);
+		msgs[i].msg_hdr.msg_iov = &iov;
+		msgs[i].msg_hdr.msg_iovlen = 1;
+	}
+
+	printf("event=storm_start t=%.6f\n", now_monotonic());
+	fflush(stdout);
+
+	while (1) {
+		double now = now_monotonic();
+		int n;
+
+		if (now >= until)
+			break;
+		if (now >= junk_until ||
+		    (now >= offer_sccrp_from && (batches % sccrp_every) == 0)) {
+			if (l2tp_packet_send(fd, sccrp) < 0)
+				return die("SCCRP send failed");
+			if (now >= junk_until) {
+				batches++;
+				continue;
+			}
+		}
+		n = sendmmsg(fd, msgs, STORM_BATCH, 0);
+		if (n < 0)
+			/* ENOBUFS/EAGAIN just mean the local send path is
+			 * momentarily full, which is this loop's normal
+			 * steady state, not a failure. */
+			n = 0;
+		sent += (unsigned long)n;
+		batches++;
+	}
+
+	/* The flood is over but the switch is still working through what it
+	 * buffered, so these land in the same read loop -- insurance for the
+	 * case where every in-flood copy was dropped by a full receive
+	 * buffer. */
+	for (i = 0; i < 8; i++) {
+		if (l2tp_packet_send(fd, sccrp) < 0)
+			return die("SCCRP send failed");
+	}
+
+	printf("event=storm_end t=%.6f junk=%lu\n", now_monotonic(), sent);
+	fflush(stdout);
+
+	return 0;
 }
 
 /*
@@ -679,8 +833,12 @@ static int run_listen_mode(int rounds)
 		pack->hdr.sid = 0;
 		pack->hdr.Ns = htons(my_ns);
 		pack->hdr.Nr = htons(peer_next_nr);
-		if (l2tp_packet_send(fd, pack) < 0)
+		if (sccrp_storm_ms > 0) {
+			if (send_sccrp_storm(fd, &their_addr, pack) != 0)
+				return 1;
+		} else if (l2tp_packet_send(fd, pack) < 0) {
 			return die("SCCRP send failed");
+		}
 		l2tp_packet_free(pack);
 		my_ns++;
 
@@ -785,6 +943,7 @@ int main(int argc, char **argv)
 		{"listen", no_argument, 0, 'L'},
 		{"rounds", required_argument, 0, 'N'},
 		{"sccrp-delay-ms", required_argument, 0, 'D'},
+		{"sccrp-storm-ms", required_argument, 0, 'M'},
 		{"cdn-timeout", required_argument, 0, 'T'},
 		{0, 0, 0, 0},
 	};
@@ -802,7 +961,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:D:T:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:D:M:T:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -855,6 +1014,11 @@ int main(int argc, char **argv)
 			if (sccrp_delay_ms < 0)
 				return die("invalid --sccrp-delay-ms");
 			break;
+		case 'M':
+			sccrp_storm_ms = atoi(optarg);
+			if (sccrp_storm_ms < 0)
+				return die("invalid --sccrp-storm-ms");
+			break;
 		case 'T':
 			cdn_timeout = atoi(optarg);
 			if (cdn_timeout <= 0)
@@ -870,7 +1034,7 @@ int main(int argc, char **argv)
 				   " [--second-call C]"
 				   " [--real-ppp] [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
-				   " [--hold-seconds N]]");
+				   " [--sccrp-storm-ms M] [--hold-seconds N]]");
 		}
 	}
 

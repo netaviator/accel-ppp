@@ -213,6 +213,10 @@ struct l2tp_sess_t
 	struct l2tp_switch_link_t *switch_link; /* this session's own
 						  * read-and-forward link,
 						  * once paired (Task 7) */
+	struct l2tp_switch_pap_watcher_t *switch_pap_watcher; /* live-PAP
+		injection watcher for this pairing's downstream leg; only
+		ever set on the downstream session, NULL everywhere else
+		(see l2tp_switch_pap_watcher_create()) */
 	struct list_head switch_pending_entry; /* linked into
 		target->pending_calls while an on-demand connect for this
 		call's target is in flight; unused otherwise */
@@ -320,6 +324,14 @@ static int l2tp_session_place_call(struct l2tp_sess_t *sess);
  * body available this early, not just a forward tag, since
  * l2tp_send_ICCN() dereferences it well before l2tp_recv_ICCN().) */
 struct l2tp_switch_link_t;
+
+/* l2tp-switch: live-PAP injection watcher (see the big comment above its
+ * implementation, next to l2tp_switch_link_read() below). Forward-declared
+ * here for the same reason as l2tp_switch_link_t just above: the teardown
+ * hook in l2tp_session_free() needs to free it well before its natural
+ * definition point. */
+struct l2tp_switch_pap_watcher_t;
+static void l2tp_switch_pap_watcher_free(struct l2tp_switch_pap_watcher_t *w);
 
 static unsigned int l2tp_switch_active_total(void);
 static void l2tp_switch_link_free(struct l2tp_switch_link_t *link);
@@ -1303,6 +1315,11 @@ static void l2tp_session_free(struct l2tp_sess_t *sess)
 	}
 
 	sess->state1 = STATE_CLOSE;
+
+	if (sess->switch_pap_watcher) {
+		l2tp_switch_pap_watcher_free(sess->switch_pap_watcher);
+		sess->switch_pap_watcher = NULL;
+	}
 
 	if (sess->switch_downstream || sess->switch_upstream) {
 		struct l2tp_sess_t *peer = sess->switch_downstream ?
@@ -4265,11 +4282,336 @@ struct l2tp_switch_link_t {
 			     * link's bytes are "upstream rx" / "target tx";
 			     * 0: src is the downstream (target-facing) leg,
 			     * this link's bytes are "target rx" / "upstream tx" */
+
+	struct l2tp_sess_t *downstream_sess; /* whichever of src/dst is the
+		downstream leg, set once at create time so
+		l2tp_switch_link_read() can reach switch_pap_watcher without
+		re-deriving it from from_upstream on every read */
+	int peek_pipe_rd, peek_pipe_wr; /* small side pipe tee() duplicates a
+		peek copy of in-flight frames into, for the live-PAP watcher;
+		always created alongside pipe_rd/pipe_wr and closed the same
+		way, whether or not a watcher ever actually gets attached */
 };
 
 #define L2TP_SWITCH_SPLICE_LEN (1 << 16)
 
 static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link);
+
+/* l2tp-switch: live-PAP injection watcher for a switched call's downstream
+ * leg (see docs/l2tp_switching.md). A switched call never runs a local PPP
+ * session -- both legs' real peers negotiate LCP with each other directly
+ * through the splice(2) pipe below (l2tp_switch_link_read()), which is why
+ * LCP already works untouched. PAP alone breaks: the upstream LAC proxies
+ * auth via this call's ICCN Proxy-Authen-* AVPs (already captured into
+ * sess->switch_avps, see l2tp_switch_capture_avp()) instead of ever putting
+ * a live PAP frame on the wire, and nothing downstream ever gets one to
+ * answer. This watcher passively tee(2)s a peek copy of each direction's
+ * traffic -- never touching the real splice -- until it has seen an LCP
+ * CONFACK both ways, then injects one synthesized PAP Authenticate-Request
+ * built from the already-captured credentials directly onto the downstream
+ * leg's socket, and watches the same way for the one Ack/Nak reply. This is
+ * a relay, not an authenticator: the credential bytes are never inspected
+ * or validated, only relayed verbatim, and the downstream target's own
+ * Ack/Nak is the only verdict that matters -- there is no local RADIUS/
+ * subscriber data for the downstream target to validate against anyway.
+ *
+ * PAP only: production traffic never sends a Proxy-Authen-Challenge, and no
+ * challenge means PAP (RFC 2661 4.4.2, Proxy-Authen-Type 3). CHAP client
+ * support is out of scope.
+ *
+ * Concurrency: l2tp_switch_link_create() registers each direction's own
+ * link on *its source session's* tunnel context -- the upstream-fed link
+ * (from_upstream=1, carrying the real client's frames towards downstream,
+ * including the real client's own CONFACK) runs in upstream->paren_conn->ctx,
+ * while the downstream-fed link (from_upstream=0, carrying the downstream
+ * target's frames towards upstream, including its CONFACK and its PAP
+ * Ack/Nak reply) runs in downstream->paren_conn->ctx. This watcher's state
+ * is therefore written from two different contexts. It is guarded by its
+ * own lock (mirroring l2tp_switch_target_t.lock's role for the same kind of
+ * cross-context-shared state), and every actual side effect -- the injected
+ * write(), the timer, teardown -- is only ever performed from the
+ * downstream leg's own context: directly when already there
+ * (from_upstream=0, or the timer callback, armed on that same context), or
+ * via triton_context_call() when observed from the upstream side
+ * (from_upstream=1). */
+
+#define L2TP_SWITCH_PAP_TIMEOUT_MS 3000 /* strictly less than the ~5s a real
+	downstream LNS has been observed to wait for PAP before giving up on
+	its own -- so our own timeout produces an attributable log line
+	instead of racing its CDN */
+
+struct l2tp_switch_pap_watcher_t {
+	pthread_mutex_t lock;
+	struct l2tp_sess_t *downstream; /* owning session; also gives us
+					   ->paren_conn->ctx and ->ppp.fd */
+	struct triton_timer_t timeout_timer;
+	uint8_t next_id;
+	unsigned int seen_confack_from_upstream:1;
+	unsigned int seen_confack_from_downstream:1;
+	unsigned int request_sent:1;
+	unsigned int resolved:1; /* success, failure, or freed -- observe()
+				    becomes a no-op once set */
+};
+
+/* Mirrors accel-pppd/auth/auth_pap.c's struct pap_hdr exactly (RFC 1334
+ * 2.1/2.2) -- that file is a self-contained static translation unit, so
+ * this is a deliberate field-for-field copy, not a divergence. */
+struct l2tp_switch_pap_hdr {
+	uint16_t proto;
+	uint8_t code;
+	uint8_t id;
+	uint16_t len;
+} __attribute__((packed));
+
+#define L2TP_SWITCH_PAP_REQ 1
+#define L2TP_SWITCH_PAP_ACK 2
+#define L2TP_SWITCH_PAP_NAK 3
+
+/* Mirrors accel-pppd/ppp/ppp_lcp.h's struct lcp_hdr_t/CONFACK/PPP_LCP:
+ * that header also pulls in triton.h/ppp.h/ppp_fsm.h, coupling to the
+ * generic PPP layer-chain framework this feature deliberately never
+ * touches (no struct ppp_t involvement anywhere in this file), so this is
+ * a deliberate mirror rather than an #include -- same reasoning as
+ * l2tp_switch_pap_hdr above. */
+struct l2tp_switch_lcp_hdr {
+	uint16_t proto;
+	uint8_t code;
+	uint8_t id;
+	uint16_t len;
+} __attribute__((packed));
+
+#define L2TP_SWITCH_PPP_LCP 0xc021
+#define L2TP_SWITCH_PPP_PAP 0xc023
+#define L2TP_SWITCH_LCP_CONFACK 2
+
+static void l2tp_switch_pap_timeout(struct triton_timer_t *t);
+
+static struct l2tp_switch_pap_watcher_t *l2tp_switch_pap_watcher_create(struct l2tp_sess_t *downstream)
+{
+	struct l2tp_switch_pap_watcher_t *w = _malloc(sizeof(*w));
+
+	if (!w)
+		return NULL;
+
+	memset(w, 0, sizeof(*w));
+	pthread_mutex_init(&w->lock, NULL);
+	w->downstream = downstream;
+	w->next_id = 1;
+
+	return w;
+}
+
+static void l2tp_switch_pap_watcher_free(struct l2tp_switch_pap_watcher_t *w)
+{
+	if (!w)
+		return;
+
+	pthread_mutex_lock(&w->lock);
+	w->resolved = 1;
+	pthread_mutex_unlock(&w->lock);
+
+	/* Only ever armed on downstream->paren_conn->ctx, and this function
+	 * is only ever called either from that same context (the teardown
+	 * hook runs in the session's own context) or after the watcher was
+	 * never resolved via that path at all -- triton_timer_del() on an
+	 * unarmed timer (tpd == NULL) is not reached due to the guard. */
+	if (w->timeout_timer.tpd)
+		triton_timer_del(&w->timeout_timer);
+
+	pthread_mutex_destroy(&w->lock);
+	_free(w);
+}
+
+/* Builds and sends the one injected PAP Authenticate-Request, and arms the
+ * reply timeout. Must only ever run on downstream->paren_conn->ctx -- called
+ * either directly (already there) or via triton_context_call() (Concurrency
+ * note above). Matches the void(*)(void*) signature triton_context_call()
+ * requires, which is also why the watcher is looked up via `data` rather
+ * than passed as a typed argument. */
+static void l2tp_switch_pap_send_request(void *data)
+{
+	struct l2tp_switch_pap_watcher_t *w = data;
+	struct l2tp_sess_t *downstream = w->downstream;
+	struct l2tp_switch_avp_t *name = NULL, *resp = NULL;
+	uint8_t buf[256]; /* Proxy-Authen-Name/Response are both bounded well
+		under this in every observed call; if a future one isn't,
+		fail closed rather than truncating credentials silently --
+		truncated auth data must never be sent as if complete */
+	struct l2tp_switch_pap_hdr *hdr = (struct l2tp_switch_pap_hdr *)buf;
+	uint8_t *p = buf + sizeof(*hdr);
+	int i;
+
+	if (downstream->switch_avps) {
+		for (i = 0; i < downstream->switch_avps->count; i++) {
+			struct l2tp_switch_avp_t *a = &downstream->switch_avps->avp[i];
+
+			if (a->id == Proxy_Authen_Name)
+				name = a;
+			else if (a->id == Proxy_Authen_Response)
+				resp = a;
+		}
+	}
+
+	if (!name || !resp ||
+	    sizeof(*hdr) + 1 + (size_t)name->len + 1 + (size_t)resp->len > sizeof(buf)) {
+		log_session(log_error, downstream,
+			    "l2tp-switch: no usable Proxy-Authen-Name/Response"
+			    " to inject as live PAP, disconnecting call\n");
+		pthread_mutex_lock(&w->lock);
+		w->resolved = 1;
+		pthread_mutex_unlock(&w->lock);
+		l2tp_session_disconnect_push(downstream, 2, 6);
+		return;
+	}
+
+	hdr->proto = htons(L2TP_SWITCH_PPP_PAP);
+	hdr->code = L2TP_SWITCH_PAP_REQ;
+	hdr->id = w->next_id++;
+	*p++ = (uint8_t)name->len;
+	memcpy(p, name->val, name->len); p += name->len;
+	*p++ = (uint8_t)resp->len;
+	memcpy(p, resp->val, resp->len); p += resp->len;
+	hdr->len = htons((uint16_t)(p - buf - 2)); /* everything after proto,
+		per RFC 1334 + auth_pap.c's own HDR_LEN convention */
+
+	if (write(downstream->ppp.fd, buf, p - buf) < 0) {
+		log_session(log_error, downstream,
+			    "l2tp-switch: injecting live PAP request failed:"
+			    " %s, disconnecting call\n", strerror(errno));
+		pthread_mutex_lock(&w->lock);
+		w->resolved = 1;
+		pthread_mutex_unlock(&w->lock);
+		l2tp_session_disconnect_push(downstream, 2, 6);
+		return;
+	}
+
+	log_session(log_info1, downstream,
+		    "l2tp-switch: injected live PAP request on downstream leg\n");
+
+	w->timeout_timer.expire = l2tp_switch_pap_timeout;
+	w->timeout_timer.period = L2TP_SWITCH_PAP_TIMEOUT_MS;
+	if (triton_timer_add(&downstream->paren_conn->ctx, &w->timeout_timer, 0) < 0)
+		log_session(log_warn, downstream,
+			    "l2tp-switch: failed to arm live PAP reply timeout"
+			    " (will rely on downstream's own timeout instead)\n");
+}
+
+/* Fires L2TP_SWITCH_PAP_TIMEOUT_MS after the injected request went out with
+ * no Ack/Nak seen. Timer is only ever armed on downstream->paren_conn->ctx,
+ * so this always runs there too. */
+static void l2tp_switch_pap_timeout(struct triton_timer_t *t)
+{
+	struct l2tp_switch_pap_watcher_t *w = container_of(t, typeof(*w), timeout_timer);
+	int already_resolved;
+
+	pthread_mutex_lock(&w->lock);
+	already_resolved = w->resolved;
+	w->resolved = 1;
+	pthread_mutex_unlock(&w->lock);
+
+	triton_timer_del(&w->timeout_timer);
+
+	if (already_resolved)
+		return; /* raced a reply that landed the same instant --
+			   whichever path saw it first already handled it */
+
+	log_session(log_error, w->downstream,
+		    "l2tp-switch: downstream never answered our injected live"
+		    " PAP request within %ims, disconnecting call\n",
+		    L2TP_SWITCH_PAP_TIMEOUT_MS);
+	l2tp_session_disconnect_push(w->downstream, 2, 6);
+}
+
+/* Called from l2tp_switch_link_read() with a tee()'d, read-only peek copy of
+ * a chunk that just passed through in the given direction. Does nothing
+ * once the watcher has already resolved (success, failure, or freed). See
+ * the big comment above this section for the concurrency rules this
+ * function and its helpers above follow. */
+static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int from_upstream,
+				    const uint8_t *buf, size_t len)
+{
+	int trigger_send = 0;
+	int resolved_now = 0;
+	int is_nak = 0;
+
+	if (len < 4)
+		return; /* shorter than any control-frame header we care about */
+
+	pthread_mutex_lock(&w->lock);
+	if (w->resolved) {
+		pthread_mutex_unlock(&w->lock);
+		return;
+	}
+
+	if (!w->request_sent) {
+		const struct l2tp_switch_lcp_hdr *lcp = (const struct l2tp_switch_lcp_hdr *)buf;
+
+		if (lcp->proto == htons(L2TP_SWITCH_PPP_LCP) &&
+		    lcp->code == L2TP_SWITCH_LCP_CONFACK) {
+			if (from_upstream)
+				w->seen_confack_from_upstream = 1;
+			else
+				w->seen_confack_from_downstream = 1;
+
+			if (w->seen_confack_from_upstream && w->seen_confack_from_downstream) {
+				w->request_sent = 1;
+				trigger_send = 1;
+			}
+		}
+	} else if (!from_upstream) {
+		/* Downstream's own reply, if any -- only meaningful once we
+		 * have actually sent the request, and only ever arrives on
+		 * the downstream-fed direction. */
+		const struct l2tp_switch_pap_hdr *pap = (const struct l2tp_switch_pap_hdr *)buf;
+
+		if (pap->proto == htons(L2TP_SWITCH_PPP_PAP)) {
+			if (pap->code == L2TP_SWITCH_PAP_ACK) {
+				w->resolved = 1;
+				resolved_now = 1;
+			} else if (pap->code == L2TP_SWITCH_PAP_NAK) {
+				w->resolved = 1;
+				resolved_now = 1;
+				is_nak = 1;
+			}
+		}
+	}
+	pthread_mutex_unlock(&w->lock);
+
+	if (trigger_send) {
+		if (from_upstream) {
+			int res = -1;
+
+			pthread_mutex_lock(&w->downstream->paren_conn->ctx_lock);
+			if (w->downstream->paren_conn->ctx.tpd)
+				res = triton_context_call(&w->downstream->paren_conn->ctx,
+							  l2tp_switch_pap_send_request, w);
+			pthread_mutex_unlock(&w->downstream->paren_conn->ctx_lock);
+			if (res < 0) {
+				/* Downstream's own context is already gone --
+				 * that leg is tearing down on its own; nothing
+				 * left for this watcher to do. */
+				pthread_mutex_lock(&w->lock);
+				w->resolved = 1;
+				pthread_mutex_unlock(&w->lock);
+			}
+		} else {
+			l2tp_switch_pap_send_request(w);
+		}
+	}
+
+	if (resolved_now) {
+		if (is_nak) {
+			log_session(log_error, w->downstream,
+				    "l2tp-switch: downstream NAKed the injected"
+				    " live PAP request, disconnecting call\n");
+			l2tp_session_disconnect_push(w->downstream, 2, 6);
+		} else {
+			log_session(log_info1, w->downstream,
+				    "l2tp-switch: downstream ACKed the injected"
+				    " live PAP request\n");
+		}
+	}
+}
 
 static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 {
@@ -4305,6 +4647,32 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 					   (uint64_t)n, __ATOMIC_RELAXED);
 			__atomic_add_fetch(&l2tp_stat.switch_lns_tx_bytes,
 					   (uint64_t)n, __ATOMIC_RELAXED);
+		}
+
+		/* live-PAP watcher: peek at what just landed in link->pipe_rd
+		 * -- tee(2) duplicates, it does not consume, so the real
+		 * splice(out) loop just below sees pipe_rd exactly as if this
+		 * block were not here. Must run before that loop drains
+		 * pipe_rd. The unlocked ->resolved read here is a deliberate,
+		 * cheap fast-path check (this flag only ever goes 0->1,
+		 * observe() itself re-checks it under the lock before acting
+		 * on anything) -- its only purpose is skipping the tee()/
+		 * read() syscalls entirely once done, not correctness. */
+		if (link->downstream_sess->switch_pap_watcher &&
+		    !link->downstream_sess->switch_pap_watcher->resolved) {
+			uint8_t peek[16]; /* only the first few bytes of one
+				control frame's header ever matter */
+			ssize_t teed = tee(link->pipe_rd, link->peek_pipe_wr,
+					   sizeof(peek), SPLICE_F_NONBLOCK);
+
+			if (teed > 0) {
+				ssize_t got = read(link->peek_pipe_rd, peek, sizeof(peek));
+
+				if (got > 0)
+					l2tp_switch_pap_observe(link->downstream_sess->switch_pap_watcher,
+								link->from_upstream, peek,
+								(size_t)got);
+			}
 		}
 
 		{
@@ -4423,6 +4791,8 @@ static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 	}
 	close(link->pipe_rd);
 	close(link->pipe_wr);
+	close(link->peek_pipe_rd);
+	close(link->peek_pipe_wr);
 	link->src->switch_link = NULL;
 	_free(link);
 }
@@ -4502,26 +4872,44 @@ static int l2tp_switch_link_create(struct l2tp_sess_t *src,
 				   int from_upstream)
 {
 	struct l2tp_switch_link_t *link;
-	int pfd[2];
+	int pfd[2], peek_pfd[2];
 
 	if (pipe(pfd) < 0)
 		return -1;
 	fcntl(pfd[0], F_SETFL, O_NONBLOCK);
 	fcntl(pfd[1], F_SETFL, O_NONBLOCK);
 
+	/* live-PAP watcher's peek target -- created once here, alongside the
+	 * real splice pipe, and reused for the link's whole lifetime rather
+	 * than per-read (see l2tp_switch_link_read()): a pipe pair per read
+	 * call would be wasteful for a link that keeps carrying steady-state
+	 * data traffic long after PAP resolves. */
+	if (pipe(peek_pfd) < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return -1;
+	}
+	fcntl(peek_pfd[0], F_SETFL, O_NONBLOCK);
+	fcntl(peek_pfd[1], F_SETFL, O_NONBLOCK);
+
 	link = _malloc(sizeof(*link));
 	if (!link) {
 		close(pfd[0]);
 		close(pfd[1]);
+		close(peek_pfd[0]);
+		close(peek_pfd[1]);
 		return -1;
 	}
 	memset(link, 0, sizeof(*link));
 	link->pipe_rd = pfd[0];
 	link->pipe_wr = pfd[1];
+	link->peek_pipe_rd = peek_pfd[0];
+	link->peek_pipe_wr = peek_pfd[1];
 	link->src = src;
 	link->dst = dst;
 	link->target = target;
 	link->from_upstream = from_upstream;
+	link->downstream_sess = from_upstream ? dst : src;
 	/* No session_hold() here: src and dst are already kept alive for the
 	 * whole pairing's lifetime by the two holds l2tp_switch_place_call()
 	 * (Task 6) took once -- see the note above this function. */
@@ -4548,6 +4936,8 @@ static int l2tp_switch_link_create(struct l2tp_sess_t *src,
 		triton_md_unregister_handler(&link->hnd, 0);
 		close(pfd[0]);
 		close(pfd[1]);
+		close(peek_pfd[0]);
+		close(peek_pfd[1]);
 		_free(link);
 		return -1;
 	}
@@ -4624,6 +5014,21 @@ static void l2tp_switch_finish_upstream(void *data)
 		log_session(log_error, upstream,
 			    "l2tp-switch: creating downstream->upstream"
 			    " splice link failed\n");
+		l2tp_switch_link_free(upstream->switch_link);
+		goto err;
+	}
+
+	/* Without this, the downstream leg's own target LNS never sees a
+	 * live PAP request at all (see the big comment above
+	 * l2tp_switch_link_read()) and every switched call dead-ends at its
+	 * own timeout -- a pairing with no watcher is never going to work,
+	 * so treat this exactly like the two l2tp_switch_link_create()
+	 * failures just above rather than limping on without one. */
+	downstream->switch_pap_watcher = l2tp_switch_pap_watcher_create(downstream);
+	if (!downstream->switch_pap_watcher) {
+		log_session(log_error, upstream,
+			    "l2tp-switch: creating live-PAP watcher failed\n");
+		l2tp_switch_link_free(downstream->switch_link);
 		l2tp_switch_link_free(upstream->switch_link);
 		goto err;
 	}

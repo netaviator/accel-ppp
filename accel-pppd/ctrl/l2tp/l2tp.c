@@ -4351,6 +4351,16 @@ struct l2tp_switch_pap_watcher_t {
 	unsigned int request_sent:1;
 	unsigned int resolved:1; /* success, failure, or freed -- observe()
 				    becomes a no-op once set */
+	unsigned int refcount; /* the owning session's pointer counts as one
+		(taken in _create(), released by _free()/_put()); scheduling
+		l2tp_switch_pap_send_request() onto another context via
+		triton_context_call() takes one more first -- see the
+		Concurrency note above and _put()'s own comment for why: that
+		queued call is a bare pointer with no liveness check of its
+		own, and l2tp_session_free() can free this watcher out from
+		under it before it runs (triton serves a context's pending md
+		handlers before its pending context calls, so a CDN handled
+		directly on downstream's own context always wins that race). */
 };
 
 /* Mirrors accel-pppd/auth/auth_pap.c's struct pap_hdr exactly (RFC 1334
@@ -4397,24 +4407,49 @@ static struct l2tp_switch_pap_watcher_t *l2tp_switch_pap_watcher_create(struct l
 	pthread_mutex_init(&w->lock, NULL);
 	w->downstream = downstream;
 	w->next_id = 1;
+	w->refcount = 1; /* the owning session's pointer */
 
 	return w;
 }
 
-static void l2tp_switch_pap_watcher_free(struct l2tp_switch_pap_watcher_t *w)
+/* Takes one reference. Must be called before handing `w` to something that
+ * outlives the current call frame without a liveness guarantee of its own --
+ * today, only the triton_context_call() scheduling in observe()'s
+ * from_upstream branch below. */
+static void l2tp_switch_pap_watcher_hold(struct l2tp_switch_pap_watcher_t *w)
 {
+	pthread_mutex_lock(&w->lock);
+	w->refcount++;
+	pthread_mutex_unlock(&w->lock);
+}
+
+/* Releases one reference, freeing `w` once none remain. Every call site that
+ * used to just free the watcher outright (the owning session's teardown
+ * hook) now goes through this instead, so a hold taken for an
+ * already-in-flight triton_context_call() (see _hold() above) can keep it
+ * alive until that call actually runs and releases its own hold -- rather
+ * than the old unconditional free leaving that queued call with a dangling
+ * pointer. */
+static void l2tp_switch_pap_watcher_put(struct l2tp_switch_pap_watcher_t *w)
+{
+	int refs;
+
 	if (!w)
 		return;
 
 	pthread_mutex_lock(&w->lock);
 	w->resolved = 1;
+	refs = --w->refcount;
 	pthread_mutex_unlock(&w->lock);
 
-	/* Only ever armed on downstream->paren_conn->ctx, and this function
-	 * is only ever called either from that same context (the teardown
-	 * hook runs in the session's own context) or after the watcher was
-	 * never resolved via that path at all -- triton_timer_del() on an
-	 * unarmed timer (tpd == NULL) is not reached due to the guard. */
+	if (refs > 0)
+		return;
+
+	/* Only ever armed on downstream->paren_conn->ctx, and every path
+	 * that can bring the refcount to zero (the owning session's
+	 * teardown hook, or l2tp_switch_pap_send_request() releasing its
+	 * own hold) only ever runs on that same context -- triton_timer_del()
+	 * on an unarmed timer (tpd == NULL) is not reached due to the guard. */
 	if (w->timeout_timer.tpd)
 		triton_timer_del(&w->timeout_timer);
 
@@ -4422,12 +4457,22 @@ static void l2tp_switch_pap_watcher_free(struct l2tp_switch_pap_watcher_t *w)
 	_free(w);
 }
 
+static void l2tp_switch_pap_watcher_free(struct l2tp_switch_pap_watcher_t *w)
+{
+	l2tp_switch_pap_watcher_put(w);
+}
+
 /* Builds and sends the one injected PAP Authenticate-Request, and arms the
  * reply timeout. Must only ever run on downstream->paren_conn->ctx -- called
  * either directly (already there) or via triton_context_call() (Concurrency
  * note above). Matches the void(*)(void*) signature triton_context_call()
  * requires, which is also why the watcher is looked up via `data` rather
- * than passed as a typed argument. */
+ * than passed as a typed argument.
+ *
+ * Every caller -- the direct call and the triton_context_call() scheduling,
+ * both in observe()'s trigger_send block -- takes exactly one
+ * l2tp_switch_pap_watcher_hold() first; this function releases exactly that
+ * one hold itself, on every exit path, via the `out` label below. */
 static void l2tp_switch_pap_send_request(void *data)
 {
 	struct l2tp_switch_pap_watcher_t *w = data;
@@ -4440,6 +4485,17 @@ static void l2tp_switch_pap_send_request(void *data)
 	struct l2tp_switch_pap_hdr *hdr = (struct l2tp_switch_pap_hdr *)buf;
 	uint8_t *p = buf + sizeof(*hdr);
 	int i;
+	int already_resolved;
+
+	/* The hold taken before scheduling this call keeps the watcher's
+	 * memory alive, but the call it was scheduled for can still have
+	 * been overtaken by a teardown in the meantime (session gone, NAK
+	 * already processed, ...) -- resolved is exactly that signal. */
+	pthread_mutex_lock(&w->lock);
+	already_resolved = w->resolved;
+	pthread_mutex_unlock(&w->lock);
+	if (already_resolved)
+		goto out;
 
 	if (downstream->switch_avps) {
 		for (i = 0; i < downstream->switch_avps->count; i++) {
@@ -4461,7 +4517,7 @@ static void l2tp_switch_pap_send_request(void *data)
 		w->resolved = 1;
 		pthread_mutex_unlock(&w->lock);
 		l2tp_session_disconnect_push(downstream, 2, 6);
-		return;
+		goto out;
 	}
 
 	hdr->proto = htons(L2TP_SWITCH_PPP_PAP);
@@ -4482,7 +4538,7 @@ static void l2tp_switch_pap_send_request(void *data)
 		w->resolved = 1;
 		pthread_mutex_unlock(&w->lock);
 		l2tp_session_disconnect_push(downstream, 2, 6);
-		return;
+		goto out;
 	}
 
 	log_session(log_info1, downstream,
@@ -4494,6 +4550,10 @@ static void l2tp_switch_pap_send_request(void *data)
 		log_session(log_warn, downstream,
 			    "l2tp-switch: failed to arm live PAP reply timeout"
 			    " (will rely on downstream's own timeout instead)\n");
+
+out:
+	l2tp_switch_pap_watcher_put(w); /* releases the hold the caller took
+		before reaching this function -- see the doc comment above */
 }
 
 /* Fires L2TP_SWITCH_PAP_TIMEOUT_MS after the injected request went out with
@@ -4578,6 +4638,20 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 	pthread_mutex_unlock(&w->lock);
 
 	if (trigger_send) {
+		/* One hold per call to l2tp_switch_pap_send_request(), taken
+		 * here regardless of which path reaches it -- direct call or
+		 * scheduled via triton_context_call(). That function releases
+		 * exactly this hold itself (its own `out` label); the res < 0
+		 * branch below releases it here instead, for the one case
+		 * where the scheduling itself failed and send_request() will
+		 * never run at all. Without this, a bare pointer to `w` would
+		 * sit in another context's call queue with nothing keeping
+		 * the watcher's memory alive until it runs -- see this
+		 * struct's own refcount field comment for the concrete race
+		 * (a downstream CDN handled directly, freeing `w`, before a
+		 * queued call already aimed at it gets to execute). */
+		l2tp_switch_pap_watcher_hold(w);
+
 		if (from_upstream) {
 			int res = -1;
 
@@ -4589,10 +4663,14 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 			if (res < 0) {
 				/* Downstream's own context is already gone --
 				 * that leg is tearing down on its own; nothing
-				 * left for this watcher to do. */
+				 * left for this watcher to do. send_request()
+				 * was never scheduled, so it will never run to
+				 * release the hold taken above -- release it
+				 * here instead. */
 				pthread_mutex_lock(&w->lock);
 				w->resolved = 1;
 				pthread_mutex_unlock(&w->lock);
+				l2tp_switch_pap_watcher_put(w);
 			}
 		} else {
 			l2tp_switch_pap_send_request(w);

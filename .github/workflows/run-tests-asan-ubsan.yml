@@ -21,6 +21,10 @@ jobs:
             sanitizer: "undefined"
             env_name: "UBSAN_OPTIONS"
             env_value: "print_stacktrace=1"
+          - distro: "ubuntu-latest"
+            sanitizer: "thread"
+            env_name: "TSAN_OPTIONS"
+            env_value: "halt_on_error=1:second_deadlock_stack=1"
 
     runs-on: ${{ matrix.distro }}
     steps:

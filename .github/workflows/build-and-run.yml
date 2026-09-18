@@ -119,7 +119,7 @@ jobs:
       - name: Install build tools
         run: >
           apt update && apt -y upgrade && apt -y dist-upgrade &&
-          NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt -y install git build-essential cmake gcc 
+          NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt -y install git build-essential cmake gcc
           linux-headers-${{ env.HEADERS_SUFFIX }}
           libpcre2-dev libssl-dev liblua5.1-0-dev kmod
       - name: Get kernel name from headers

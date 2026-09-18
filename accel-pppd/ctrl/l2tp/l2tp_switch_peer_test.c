@@ -198,6 +198,7 @@ static const char *data_pattern;
 static int send_stopccn;
 static int wait_cdn;
 static int real_ppp;
+static int minimal_lcp;
 static int hold_seconds;
 static int listen_mode;
 static int listen_rounds = 1;
@@ -402,6 +403,115 @@ static int run_real_ppp(int data_fd)
 
 	fputs(buf, stderr);
 	printf("ppp_ip_up: %d\n", ip_up);
+
+	return 0;
+}
+
+/* Mirrors l2tp.c's own field-for-field mirror of struct lcp_hdr_t (see
+ * l2tp_switch_pap_watcher_t's comment block, accel-pppd/ctrl/l2tp/l2tp.c) --
+ * this harness is a standalone translation unit and cannot #include l2tp.c's
+ * private definitions, so it is a deliberate copy, not a divergence. */
+struct minimal_lcp_hdr {
+	uint16_t proto;
+	uint8_t code;
+	uint8_t id;
+	uint16_t len;
+} __attribute__((packed));
+
+#define MINIMAL_PPP_LCP 0xc021
+#define MINIMAL_LCP_CONFREQ 1
+#define MINIMAL_LCP_CONFACK 2
+
+/* Plays real, minimal LCP directly over the bearer socket -- no pppd, no
+ * /etc/ppp/pap-secrets dependency (unlike run_real_ppp() above), and
+ * deliberately never sends or answers PAP: this harness's --minimal-lcp mode
+ * exists specifically to reproduce production's actual upstream behaviour
+ * (the real calling client negotiates real LCP with the far end through the
+ * switch's splice, but the upstream LAC proxies authentication via this
+ * call's ICCN AVPs instead of ever putting a live PAP frame on the wire --
+ * see l2tp_switch_pap_watcher_t's own comment in l2tp.c). --real-ppp's full
+ * pppd instead negotiates *and* sends genuine live PAP, which is a different,
+ * untested scenario (a downstream target receiving two PAP requests -- see
+ * docs/l2tp_switching.md's "Authentication" section) -- do not conflate the
+ * two when picking a mode for a new test.
+ *
+ * Any Configure-Request the peer sends is ACKed unconditionally, echoing its
+ * options back verbatim: this harness has no LCP requirements of its own to
+ * negotiate, so there is nothing to legitimately NAK or REJ, and a real
+ * accel-ppp downstream's default options (MRU, magic-number, possibly an
+ * auth-protocol request) are all things a real client would routinely just
+ * accept anyway. Returns once both directions have been seen (our own
+ * request ACKed, and at least one of the peer's ACKed by us) or the deadline
+ * passes -- either way, `data_fd` is left open and untouched for the caller
+ * (unlike run_real_ppp(), which takes ownership of it): the existing
+ * --hold-seconds sleep after this function returns is what keeps the
+ * process, and so this socket, alive long enough for a test to observe
+ * whatever the switch's live-PAP watcher does with the LCP this function
+ * just opened. */
+static int run_minimal_lcp(int data_fd, int timeout_seconds)
+{
+	uint8_t buf[64];
+	struct minimal_lcp_hdr our_req; /* a stack copy, not an alias into
+		`buf` -- `buf` gets overwritten by every read() in the loop
+		below, so the code this once pointed at "our own request's id"
+		would silently start comparing against whatever was just read
+		instead if this were a pointer into the same buffer */
+	time_t deadline = time(NULL) + timeout_seconds;
+	int our_req_acked = 0, acked_a_peer_req = 0;
+
+	our_req.proto = htons(MINIMAL_PPP_LCP);
+	our_req.code = MINIMAL_LCP_CONFREQ;
+	our_req.id = 1;
+	our_req.len = htons(sizeof(our_req));
+	if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+		fprintf(stderr, "run_minimal_lcp: initial Configure-Request"
+			" write failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	while (!(our_req_acked && acked_a_peer_req)) {
+		struct pollfd pfd = { .fd = data_fd, .events = POLLIN };
+		time_t remaining = deadline - time(NULL);
+		ssize_t n;
+
+		if (remaining <= 0) {
+			fprintf(stderr, "run_minimal_lcp: timed out waiting"
+				" for LCP to open both ways (our_req_acked=%d"
+				" acked_a_peer_req=%d)\n", our_req_acked,
+				acked_a_peer_req);
+			return -1;
+		}
+
+		if (poll(&pfd, 1, (int)(remaining * 1000)) <= 0)
+			continue; /* timeout or EINTR -- loop re-checks deadline */
+
+		n = read(data_fd, buf, sizeof(buf));
+		if (n < (ssize_t)sizeof(struct minimal_lcp_hdr))
+			continue; /* too short to be a control frame we care about */
+
+		{
+			struct minimal_lcp_hdr *hdr = (struct minimal_lcp_hdr *)buf;
+
+			if (hdr->proto != htons(MINIMAL_PPP_LCP))
+				continue; /* not LCP (e.g. the watcher's injected
+					     PAP, or downstream's reply to it --
+					     this harness deliberately never
+					     touches either) */
+
+			if (hdr->code == MINIMAL_LCP_CONFREQ) {
+				hdr->code = MINIMAL_LCP_CONFACK;
+				if (write(data_fd, buf, (size_t)n) < 0) {
+					fprintf(stderr, "run_minimal_lcp: Configure-Ack"
+						" write failed: %s\n", strerror(errno));
+					return -1;
+				}
+				acked_a_peer_req = 1;
+			} else if (hdr->code == MINIMAL_LCP_CONFACK &&
+				  hdr->id == our_req.id) {
+				our_req_acked = 1;
+			}
+		}
+	}
 
 	return 0;
 }
@@ -939,6 +1049,7 @@ int main(int argc, char **argv)
 		{"wait-cdn", no_argument, 0, 'W'},
 		{"second-call", required_argument, 0, 'S'},
 		{"real-ppp", no_argument, 0, 'R'},
+		{"minimal-lcp", no_argument, 0, 'm'},
 		{"hold-seconds", required_argument, 0, 'H'},
 		{"listen", no_argument, 0, 'L'},
 		{"rounds", required_argument, 0, 'N'},
@@ -961,7 +1072,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:D:M:T:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -999,6 +1110,9 @@ int main(int argc, char **argv)
 			break;
 		case 'R':
 			real_ppp = 1;
+			break;
+		case 'm':
+			minimal_lcp = 1;
 			break;
 		case 'H':
 			hold_seconds = atoi(optarg);
@@ -1207,7 +1321,7 @@ int main(int argc, char **argv)
 	if (real_ppp && (!proxy_username || !proxy_password))
 		return die("--real-ppp requires --proxy-username and --proxy-password");
 
-	if (data_pattern || real_ppp) {
+	if (data_pattern || real_ppp || minimal_lcp) {
 		struct sockaddr_pppol2tp pppox_addr;
 		int data_fd, reg_fd, lns_mode = 0;
 
@@ -1288,6 +1402,14 @@ int main(int argc, char **argv)
 			 * inherited by the pppd child and closed by the
 			 * parent right after fork(). */
 			if (run_real_ppp(data_fd) != 0)
+				return 1;
+		} else if (minimal_lcp) {
+			/* run_minimal_lcp() leaves data_fd open -- it is held
+			 * alive by the existing --hold-seconds sleep below,
+			 * same as the plain data_pattern branch's socket stays
+			 * registered via `fd` (the control channel) rather
+			 * than this one. */
+			if (run_minimal_lcp(data_fd, 5) != 0)
 				return 1;
 		} else {
 			ssize_t n = write(data_fd, data_pattern, strlen(data_pattern));

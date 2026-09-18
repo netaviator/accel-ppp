@@ -72,6 +72,8 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     bind={l2tp_bind}
     port={l2tp_port}
     secret={secret}
+    [ppp]
+    verbose=1
     {extra}
     """
         )

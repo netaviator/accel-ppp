@@ -161,6 +161,45 @@ RADIUS accounting records — they never create a PPP session object at
 all. If a switched line needs to be billed or usage-tracked, use these
 counters or accounting on the downstream LNS itself.
 
+## Authentication
+
+A switched call's two legs never run a local PPP session — both real
+peers (the actual calling client, relayed via the upstream LAC, and the
+downstream target LNS) negotiate LCP with each other directly through the
+existing `splice(2)` byte pipe, with accel-ppp acting as a transparent
+pipe. This is why LCP works with no special handling.
+
+PAP alone needs help: some upstream LACs proxy authentication via this
+call's ICCN `Proxy-Authen-*` AVPs instead of ever putting a live PAP frame
+on the wire, and a downstream LNS that doesn't implement consuming those
+AVPs (most don't) never sees anything to authenticate against. To make a
+switched call work against an unmodified downstream LNS in that case, the
+switch passively watches the already-spliced stream (via `tee(2)`, which
+duplicates without consuming — the real splice is never disturbed) for an
+LCP `Configure-Ack` in both directions, then injects **one** synthesized
+PAP `Authenticate-Request` directly onto the downstream leg's socket,
+built from the `Proxy-Authen-Name`/`Proxy-Authen-Response` bytes already
+captured from the upstream ICCN, exactly as if the real client had sent
+it. The one `Ack`/`Nak` reply is picked off the same way: `Ack` lets the
+untouched splice continue; `Nak`, or no reply within 3 seconds, tears the
+call down.
+
+This is a relay, not an authentication decision: the credential bytes are
+never inspected or validated on this end, only relayed verbatim, and the
+downstream target's own `Ack`/`Nak` is the only verdict that matters.
+
+**PAP only.** No challenge in the proxied AVPs means PAP (RFC 2661 4.4.2,
+`Proxy-Authen-Type` 3) — CHAP client support is not implemented, and the
+watcher does not check whether AVP-proxied auth was even offered before
+injecting: it fires unconditionally once it has seen an LCP
+`Configure-Ack` in both directions. Production traffic this was built
+against always proxies auth via AVPs rather than relaying a live PAP/CHAP
+exchange, so this has not been exercised against an upstream LAC that
+does the latter; a duplicate PAP `Authenticate-Request` reaching a
+downstream LNS that already received a real one from the LAC is
+untested. If your upstream ever relays live auth instead of proxying it,
+verify this mechanism doesn't interfere before relying on it.
+
 ## Operational constraints
 
 - **MTU is not renegotiated.** The Proxy LCP AVPs forwarded to the

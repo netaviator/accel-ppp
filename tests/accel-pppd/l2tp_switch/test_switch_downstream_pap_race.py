@@ -100,28 +100,28 @@ def test_downstream_pap_watcher_survives_teardown_racing_its_own_injected_send(
     )
     assert s_started
 
-    try:
-        # The downstream target: real minimal LCP, then a CDN 50ms after
-        # it settles. 50ms is comfortably inside the window between the
-        # cross-leg trigger firing (both legs' LCP typically settles
-        # within a few ms of each other over loopback) and this test's own
-        # later assertions, while still being short enough that, if the
-        # daemon is not yet even connected when it fires, the harness's
-        # own die()-on-failure paths surface that plainly rather than
-        # this test hanging.
-        down_thread, down_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
-            [
-                "--listen",
-                "--peer-port", "17141",
-                "--secret", "downstreamsecret",
-                "--rounds", "1",
-                "--hold-seconds", "10",
-                "--minimal-lcp",
-                "--cdn-after-lcp-ms", "50",
-            ],
-        )
+    # The downstream target: real minimal LCP, then a CDN 50ms after
+    # it settles. 50ms is comfortably inside the window between the
+    # cross-leg trigger firing (both legs' LCP typically settles
+    # within a few ms of each other over loopback) and this test's own
+    # later assertions, while still being short enough that, if the
+    # daemon is not yet even connected when it fires, the harness's
+    # own die()-on-failure paths surface that plainly rather than
+    # this test hanging.
+    down_thread, down_ctrl = l2tp_peer_process.start(
+        PEER_BIN,
+        [
+            "--listen",
+            "--peer-port", "17141",
+            "--secret", "downstreamsecret",
+            "--rounds", "1",
+            "--hold-seconds", "10",
+            "--minimal-lcp",
+            "--cdn-after-lcp-ms", "50",
+        ],
+    )
 
+    try:
         try:
             peer_thread, peer_ctrl = l2tp_peer_process.start(
                 PEER_BIN,
@@ -138,8 +138,6 @@ def test_downstream_pap_watcher_survives_teardown_racing_its_own_injected_send(
             )
             rc, out, err = _finish(peer_thread, peer_ctrl, 15.0)
             assert rc == 0, f"upstream peer harness failed (rc={rc}): {err}\n{out}"
-
-            _finish(down_thread, down_ctrl, 15.0)
 
             # The invariant: the daemon is still alive and answering CLI
             # commands. A crash here (segfault under a plain build, an
@@ -163,7 +161,12 @@ def test_downstream_pap_watcher_survives_teardown_racing_its_own_injected_send(
                 f" prevent"
             )
         finally:
-            l2tp_peer_process.end(down_thread, down_ctrl)
+            # Guaranteed regardless of what happened above (in particular,
+            # the upstream assertion failing) -- left alone, --listen mode
+            # blocks on its bound UDP port until --hold-seconds is up
+            # (10s here), poisoning every later test in the same run that
+            # needs that port.
+            _finish(down_thread, down_ctrl, 15.0)
     finally:
         accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
         config.delete_tmp(s_cfg)

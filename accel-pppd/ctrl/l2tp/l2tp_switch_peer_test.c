@@ -239,6 +239,28 @@ static int sccrp_storm_ms;
  * caller; the on-demand connect-timeout test needs a budget longer than the
  * daemon's own 10s connect timeout to observe the CDN that follows it. */
 static int cdn_timeout = 5;
+/* --listen + --minimal-lcp only: after this call's own minimal LCP settles
+ * (both directions CONFACKed -- see run_minimal_lcp()), wait this many ms
+ * then send a CDN for it over the control channel, instead of just holding
+ * the tunnel per --hold-seconds like every other --listen mode does.
+ *
+ * This is the lever for forcing l2tp.c's live-PAP watcher's cross-context
+ * race deterministically instead of relying on rare natural timing: the
+ * watcher's cross-leg trigger (both directions' CONFACK seen) fires a
+ * triton_context_call() into the downstream leg's own tunnel context to
+ * send the injected PAP request -- a call that sits *queued* on that
+ * context until its next context-calls pass. A CDN arriving on that same
+ * downstream leg's control channel is instead handled directly from an md
+ * handler already running on that context (l2tp_conn_read() -> ... ->
+ * l2tp_session_free()), and -- per sccrp_storm_ms's own comment above on
+ * this exact ordering rule -- md handlers run before context calls on every
+ * pass, regardless of which was scheduled first. So a CDN timed to land
+ * once the trigger has *just* been queued, but before that context next
+ * processes its queued calls, reliably wins the race and frees the
+ * watcher out from under its own already-queued send -- a use-after-free
+ * if l2tp_switch_pap_send_request() has no liveness check on the watcher
+ * it dereferences (see test_switch_downstream_pap_race.py). */
+static int cdn_after_lcp_ms;
 static const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -744,15 +766,131 @@ static int send_sccrp_storm(int fd, const struct sockaddr_in *their_addr,
  * code, which is what tells a voluntary idle teardown (1, "general request
  * to clear the control connection") from an error-driven one.
  */
+/* --listen + --minimal-lcp only, called once this call's ICCN arrives: opens
+ * the session-level pppol2tp data socket for it (mirroring the caller
+ * role's own setup further down in this file -- same tunnel-registration-
+ * before-session-connect two-step, same reasoning, just LNS-mode=1 here
+ * since this harness is playing the downstream target rather than the
+ * calling client's LAC), runs real minimal LCP over it, and -- if
+ * --cdn-after-lcp-ms was given -- sends this call's CDN after the
+ * requested delay. See cdn_after_lcp_ms's own comment for why that delay
+ * is the deterministic race lever, not just a convenience. Always closes
+ * the data socket before returning; the CDN, when sent, goes out over the
+ * control channel `fd`, not this one. */
+static int serve_minimal_lcp_and_cdn(int fd, const struct sockaddr_in *their_addr,
+				     uint16_t my_tid, uint16_t their_tid,
+				     uint16_t our_sid, uint16_t their_sid,
+				     uint16_t *my_ns, uint16_t *peer_next_nr,
+				     int round)
+{
+	struct sockaddr_pppol2tp pppox_addr;
+	int data_fd, reg_fd, lns_mode = 1;
+
+	reg_fd = socket(AF_PPPOX, SOCK_DGRAM, PX_PROTO_OL2TP);
+	if (reg_fd < 0)
+		return die("tunnel registration socket() failed");
+
+	memset(&pppox_addr, 0, sizeof(pppox_addr));
+	pppox_addr.sa_family = AF_PPPOX;
+	pppox_addr.sa_protocol = PX_PROTO_OL2TP;
+	pppox_addr.pppol2tp.fd = fd;
+	pppox_addr.pppol2tp.addr = *their_addr;
+	pppox_addr.pppol2tp.s_tunnel = my_tid;
+	pppox_addr.pppol2tp.d_tunnel = their_tid;
+	/* s_session/d_session left at 0: tunnel-level registration only. */
+
+	if (connect(reg_fd, (struct sockaddr *)&pppox_addr, sizeof(pppox_addr)) < 0) {
+		close(reg_fd);
+		return die("tunnel registration connect() failed");
+	}
+	close(reg_fd);
+
+	data_fd = socket(AF_PPPOX, SOCK_DGRAM, PX_PROTO_OL2TP);
+	if (data_fd < 0)
+		return die("data socket() failed");
+
+	memset(&pppox_addr, 0, sizeof(pppox_addr));
+	pppox_addr.sa_family = AF_PPPOX;
+	pppox_addr.sa_protocol = PX_PROTO_OL2TP;
+	pppox_addr.pppol2tp.fd = fd;
+	pppox_addr.pppol2tp.addr = *their_addr;
+	pppox_addr.pppol2tp.s_tunnel = my_tid;
+	pppox_addr.pppol2tp.d_tunnel = their_tid;
+	pppox_addr.pppol2tp.s_session = our_sid;
+	pppox_addr.pppol2tp.d_session = their_sid;
+
+	if (connect(data_fd, (struct sockaddr *)&pppox_addr, sizeof(pppox_addr)) < 0) {
+		close(data_fd);
+		return die("data socket connect() failed");
+	}
+
+	if (setsockopt(data_fd, SOL_PPPOL2TP, PPPOL2TP_SO_LNSMODE,
+		      &lns_mode, sizeof(lns_mode)) < 0) {
+		close(data_fd);
+		return die("data socket setsockopt(LNSMODE) failed");
+	}
+
+	if (run_minimal_lcp(data_fd, 5) != 0) {
+		close(data_fd);
+		return -1;
+	}
+
+	printf("event=downstream_lcp_settled round=%d t=%.6f\n",
+	       round, now_monotonic());
+	fflush(stdout);
+
+	if (cdn_after_lcp_ms > 0) {
+		struct l2tp_packet_t *pack;
+		struct l2tp_avp_result_code res = { htons(1), htons(0) };
+
+		usleep((useconds_t)cdn_after_lcp_ms * 1000);
+
+		pack = l2tp_packet_alloc(2, Message_Type_Call_Disconnect_Notify,
+					 their_addr, 0, secret, strlen(secret));
+		if (!pack) {
+			close(data_fd);
+			return die("CDN alloc failed");
+		}
+		/* RFC 2661 5.1: Assigned-Session-ID here is the *sender's*
+		 * own id for this call -- ours -- while the header sid is
+		 * always the recipient's, same convention the ICRP above
+		 * already follows for their_sid/our_sid. */
+		l2tp_packet_add_int16(pack, Assigned_Session_ID, our_sid, 1);
+		l2tp_packet_add_octets(pack, Result_Code, (uint8_t *)&res,
+				       sizeof(res), 1);
+		pack->hdr.tid = htons(their_tid);
+		pack->hdr.sid = htons(their_sid);
+		pack->hdr.Ns = htons((*my_ns)++);
+		pack->hdr.Nr = htons(*peer_next_nr);
+		if (l2tp_packet_send(fd, pack) < 0) {
+			l2tp_packet_free(pack);
+			close(data_fd);
+			return die("CDN send failed");
+		}
+		l2tp_packet_free(pack);
+
+		printf("event=sent_cdn round=%d t=%.6f\n", round, now_monotonic());
+		fflush(stdout);
+	}
+
+	close(data_fd);
+	return 0;
+}
+
 static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr,
-				    uint16_t their_tid, uint16_t *my_ns,
-				    uint16_t *peer_next_nr, int round)
+				    uint16_t my_tid, uint16_t their_tid,
+				    uint16_t *my_ns, uint16_t *peer_next_nr,
+				    int round)
 {
 	double until = now_monotonic() + hold_seconds;
 	/* Short enough that the loop notices --hold-seconds running out
 	 * promptly on a silent tunnel, which is most of its life. */
 	struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
 	uint16_t next_sid = (uint16_t)(200 + round * 10);
+	/* Set from the ICRQ branch below, read back once its matching ICCN
+	 * arrives -- the loop-local `their_sid`/`next_sid` of that earlier
+	 * iteration are both gone by then. */
+	uint16_t call_our_sid = 0, call_their_sid = 0;
 
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
 		return die("setsockopt(SO_RCVTIMEO) failed");
@@ -788,6 +926,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 				if (attr->attr &&
 				    attr->attr->id == Assigned_Session_ID)
 					their_sid = (uint16_t)attr->val.int16;
+			call_their_sid = their_sid;
 			printf("event=recv_icrq round=%d t=%.6f\n",
 			       round, now_monotonic());
 		} else if (type == Message_Type_Incoming_Call_Connected) {
@@ -831,6 +970,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			if (l2tp_packet_send(fd, rsp) < 0)
 				return die("ICRP send failed");
 			l2tp_packet_free(rsp);
+			call_our_sid = next_sid;
 			next_sid++;
 		} else {
 			/* A bare ZLB ack. It takes no slot of its own in the
@@ -849,6 +989,20 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			if (l2tp_packet_send(fd, rsp) < 0)
 				return die("ZLB send failed");
 			l2tp_packet_free(rsp);
+		}
+
+		/* Deliberately after the ZLB ack just above, not before: a real
+		 * peer's own ICCN handling would also finish acking the control
+		 * message before doing anything else with the newly-connected
+		 * call. */
+		if (type == Message_Type_Incoming_Call_Connected && minimal_lcp) {
+			if (serve_minimal_lcp_and_cdn(fd, their_addr, my_tid, their_tid,
+						      call_our_sid, call_their_sid,
+						      my_ns, peer_next_nr, round) < 0)
+				return 1;
+			if (cdn_after_lcp_ms > 0)
+				break; /* the race this round exists to force is
+					  already over; nothing more to serve */
 		}
 
 		if (stop)
@@ -1040,7 +1194,7 @@ static int run_listen_mode(int rounds)
 		 * behaviour: establish (or establish-then-StopCCN) and move
 		 * straight on to the next round, saying nothing further. */
 		if (hold_seconds > 0 &&
-		    serve_established_tunnel(fd, &their_addr, their_tid,
+		    serve_established_tunnel(fd, &their_addr, my_tid, their_tid,
 					     &my_ns, &peer_next_nr, round) < 0)
 			return 1;
 	}
@@ -1079,6 +1233,7 @@ int main(int argc, char **argv)
 		{"sccrp-delay-ms", required_argument, 0, 'D'},
 		{"sccrp-storm-ms", required_argument, 0, 'M'},
 		{"cdn-timeout", required_argument, 0, 'T'},
+		{"cdn-after-lcp-ms", required_argument, 0, 'C'},
 		{0, 0, 0, 0},
 	};
 
@@ -1095,7 +1250,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -1161,6 +1316,11 @@ int main(int argc, char **argv)
 			if (cdn_timeout <= 0)
 				return die("invalid --cdn-timeout");
 			break;
+		case 'C':
+			cdn_after_lcp_ms = atoi(optarg);
+			if (cdn_after_lcp_ms < 0)
+				return die("invalid --cdn-after-lcp-ms");
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -1171,9 +1331,13 @@ int main(int argc, char **argv)
 				   " [--second-call C]"
 				   " [--real-ppp | --minimal-lcp] [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
-				   " [--sccrp-storm-ms M] [--hold-seconds N]]");
+				   " [--sccrp-storm-ms M] [--hold-seconds N]"
+				   " [--minimal-lcp [--cdn-after-lcp-ms M]]]");
 		}
 	}
+
+	if (cdn_after_lcp_ms > 0 && !(listen_mode && minimal_lcp))
+		return die("--cdn-after-lcp-ms requires --listen and --minimal-lcp");
 
 	if (listen_mode)
 		return run_listen_mode(listen_rounds);

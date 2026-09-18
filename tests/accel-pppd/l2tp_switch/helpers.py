@@ -64,6 +64,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     [log]
     log-file={log}
     level=5
+    copy=1
     [cli]
     tcp=127.0.0.1:{cli_port}
     [client-ip-range]

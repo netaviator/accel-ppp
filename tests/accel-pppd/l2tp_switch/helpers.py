@@ -55,6 +55,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
         f.write(
             f"""
     [modules]
+    log_file
     log_syslog
     l2tp
 

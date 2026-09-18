@@ -443,6 +443,7 @@ struct minimal_lcp_hdr {
 #define MINIMAL_PPP_LCP 0xc021
 #define MINIMAL_LCP_CONFREQ 1
 #define MINIMAL_LCP_CONFACK 2
+#define MINIMAL_LCP_RETRANSMIT_SECONDS 1
 
 /* Plays real, minimal LCP directly over the bearer socket -- no pppd, no
  * /etc/ppp/pap-secrets dependency (unlike run_real_ppp() above), and
@@ -485,6 +486,20 @@ static int run_minimal_lcp(int data_fd, int timeout_seconds)
 		would silently start comparing against whatever was just read
 		instead if this were a pointer into the same buffer */
 	time_t deadline = time(NULL) + timeout_seconds;
+	/* RFC 1661 3.2/4.6: a real LCP implementation always retransmits an
+	 * unacknowledged Configure-Request on a timer (its own default is
+	 * 3s) rather than sending it exactly once -- not just a nicety here.
+	 * This data socket's peer-side splice/watcher wiring on the switch
+	 * (l2tp_switch_finish_upstream(), scheduled off the *downstream*
+	 * leg's own ICRP, which is a further round-trip after this function
+	 * is already sending) is set up asynchronously, so there is a real
+	 * window early on where this function's very first write() can
+	 * reach a socket nothing is relaying from yet and be silently
+	 * dropped. One-shot send + no retransmission turns that single lost
+	 * packet into permanent silence for the rest of `timeout_seconds`,
+	 * exactly matching a CONFREQ that a real, spec-following peer would
+	 * have simply seen retransmitted a moment later. */
+	time_t next_retransmit;
 	int our_req_acked = 0, acked_a_peer_req = 0;
 
 	our_req.proto = htons(MINIMAL_PPP_LCP);
@@ -503,10 +518,13 @@ static int run_minimal_lcp(int data_fd, int timeout_seconds)
 			" write failed: %s\n", strerror(errno));
 		return -1;
 	}
+	next_retransmit = time(NULL) + MINIMAL_LCP_RETRANSMIT_SECONDS;
 
 	while (!(our_req_acked && acked_a_peer_req)) {
 		struct pollfd pfd = { .fd = data_fd, .events = POLLIN };
-		time_t remaining = deadline - time(NULL);
+		time_t now = time(NULL);
+		time_t remaining = deadline - now;
+		time_t poll_for;
 		ssize_t n;
 
 		if (remaining <= 0) {
@@ -517,8 +535,28 @@ static int run_minimal_lcp(int data_fd, int timeout_seconds)
 			return -1;
 		}
 
-		if (poll(&pfd, 1, (int)(remaining * 1000)) <= 0)
+		/* Never wait past the next scheduled retransmit, whether or
+		 * not it's actually still needed by then -- rechecked below,
+		 * same as the overall deadline is rechecked on every lap
+		 * regardless of why poll() returned. */
+		poll_for = our_req_acked ? remaining : next_retransmit - now;
+		if (poll_for < 0)
+			poll_for = 0;
+		if (poll_for > remaining)
+			poll_for = remaining;
+
+		if (poll(&pfd, 1, (int)(poll_for * 1000)) <= 0) {
+			if (!our_req_acked && time(NULL) >= next_retransmit) {
+				if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+					fprintf(stderr, "run_minimal_lcp:"
+						" retransmitting Configure-Request"
+						" failed: %s\n", strerror(errno));
+					return -1;
+				}
+				next_retransmit = time(NULL) + MINIMAL_LCP_RETRANSMIT_SECONDS;
+			}
 			continue; /* timeout or EINTR -- loop re-checks deadline */
+		}
 
 		n = read(data_fd, buf, sizeof(buf));
 		if (n < 0) {

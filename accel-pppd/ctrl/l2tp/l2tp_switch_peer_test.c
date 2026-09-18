@@ -450,7 +450,13 @@ struct minimal_lcp_hdr {
  * just opened. */
 static int run_minimal_lcp(int data_fd, int timeout_seconds)
 {
-	uint8_t buf[64];
+	/* Generously over any realistic LCP frame a default accel-ppp
+	 * Configure-Request carries (MRU + magic-number + maybe an
+	 * auth-protocol option is well under 32 bytes); sized to a PPP MTU so
+	 * a read() here can never silently truncate a real frame and echo
+	 * back a Configure-Ack whose Length field no longer matches what was
+	 * actually sent. */
+	uint8_t buf[1500];
 	struct minimal_lcp_hdr our_req; /* a stack copy, not an alias into
 		`buf` -- `buf` gets overwritten by every read() in the loop
 		below, so the code this once pointed at "our own request's id"
@@ -462,7 +468,14 @@ static int run_minimal_lcp(int data_fd, int timeout_seconds)
 	our_req.proto = htons(MINIMAL_PPP_LCP);
 	our_req.code = MINIMAL_LCP_CONFREQ;
 	our_req.id = 1;
-	our_req.len = htons(sizeof(our_req));
+	/* RFC 1661: the LCP Length field covers Code+Identifier+Length+Data,
+	 * not the preceding 2-byte PPP Protocol field -- sizeof(our_req)
+	 * includes that field, so it overstates this zero-option request's
+	 * real length by 2. A real accel-ppp peer's lcp_recv() checks the
+	 * claimed length against the bytes actually received and silently
+	 * drops anything that claims more than it got, so getting this wrong
+	 * means this Configure-Request is never acked by a real LNS. */
+	our_req.len = htons(sizeof(our_req) - sizeof(our_req.proto));
 	if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
 		fprintf(stderr, "run_minimal_lcp: initial Configure-Request"
 			" write failed: %s\n", strerror(errno));
@@ -486,6 +499,16 @@ static int run_minimal_lcp(int data_fd, int timeout_seconds)
 			continue; /* timeout or EINTR -- loop re-checks deadline */
 
 		n = read(data_fd, buf, sizeof(buf));
+		if (n < 0) {
+			fprintf(stderr, "run_minimal_lcp: read failed: %s\n",
+				strerror(errno));
+			return -1;
+		}
+		if (n == 0) {
+			fprintf(stderr, "run_minimal_lcp: peer closed the"
+				" data socket\n");
+			return -1;
+		}
 		if (n < (ssize_t)sizeof(struct minimal_lcp_hdr))
 			continue; /* too short to be a control frame we care about */
 
@@ -1146,7 +1169,7 @@ int main(int argc, char **argv)
 				   " [--data-pattern D] [--send-stopccn]"
 				   " [--wait-cdn [--cdn-timeout S]]"
 				   " [--second-call C]"
-				   " [--real-ppp] [--hold-seconds N]"
+				   " [--real-ppp | --minimal-lcp] [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
 				   " [--sccrp-storm-ms M] [--hold-seconds N]]");
 		}
@@ -1320,6 +1343,9 @@ int main(int argc, char **argv)
 
 	if (real_ppp && (!proxy_username || !proxy_password))
 		return die("--real-ppp requires --proxy-username and --proxy-password");
+
+	if (real_ppp && minimal_lcp)
+		return die("--real-ppp and --minimal-lcp are mutually exclusive");
 
 	if (data_pattern || real_ppp || minimal_lcp) {
 		struct sockaddr_pppol2tp pppox_addr;

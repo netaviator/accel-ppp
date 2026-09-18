@@ -1,7 +1,7 @@
 import pytest
 import time
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance
+from helpers import start_instance, read_log
 
 
 @pytest.mark.l2tp_switch
@@ -101,10 +101,16 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
                 "downstream accel-pppd never reached an active session --"
                 " the injected PAP request was never sent, malformed, or"
                 f" rejected:\n{out}"
+                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
+                f"\n--- downstream log ---\n{read_log(d_cfg)}"
             )
 
             rc, harness_out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
-            assert rc == 0, f"upstream harness failed (rc={rc}): {err}\n{harness_out}"
+            assert rc == 0, (
+                f"upstream harness failed (rc={rc}): {err}\n{harness_out}"
+                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
+                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+            )
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
             config.delete_tmp(s_cfg)
@@ -180,7 +186,11 @@ def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd,
             # must send the upstream leg a CDN once the paired downstream
             # leg is gone, not just update an internal counter silently.
             rc, harness_out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
-            assert rc == 0, f"upstream harness never saw a CDN (rc={rc}): {err}\n{harness_out}"
+            assert rc == 0, (
+                f"upstream harness never saw a CDN (rc={rc}): {err}\n{harness_out}"
+                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
+                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+            )
 
             active = None
             out = ""
@@ -191,7 +201,11 @@ def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd,
                     active = 0
                     break
                 time.sleep(0.1)
-            assert active == 0, f"switch pairing left active after NAK:\n{out}"
+            assert active == 0, (
+                f"switch pairing left active after NAK:\n{out}"
+                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
+                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+            )
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2002)
             config.delete_tmp(s_cfg)

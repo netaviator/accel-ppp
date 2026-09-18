@@ -1,12 +1,59 @@
 import re
+import tempfile
 import time
 
-from common import config, accel_pppd_process, process
+from common import accel_pppd_process, process
+
+
+def log_path(cfg):
+    """The on-disk log file start_instance() points this config's daemon
+    at, deterministic from the config's own tmp path so a test only ever
+    needs to keep track of `cfg` itself. See read_log()'s own doc comment
+    for why this exists instead of the log-file=/dev/stdout this module
+    used before."""
+    return cfg + ".log"
+
+
+def read_log(cfg):
+    """Best-effort read of the daemon log for the instance started with
+    this config path. Returns "" (never raises) if the file doesn't exist
+    yet -- e.g. a caller diagnosing a start_instance() failure before the
+    daemon got far enough to open its own log file.
+
+    log-file=/dev/stdout used to be captured by accel_pppd_process.py's own
+    Popen(stdout=PIPE) instead, via `ctrl["out"]`/`ctrl["err"]`. In
+    practice that has come back empty across every observed failure in
+    this directory regardless of how the daemon actually exited (a clean
+    `shutdown hard`, not just a kill) -- the exact mechanism wasn't pinned
+    down (accel-ppp's own log_file.c writes with raw open()/write(), no
+    userspace buffering of its own, so the usual "buffered output lost on
+    abrupt exit" explanation doesn't obviously fit either), but capturing
+    a real on-disk file sidesteps needing to know it: kernel-durable the
+    moment write() returns, independent of Python's pipe-reading timing or
+    however the process's own stdio ended up behaving. A test whose
+    failure needs the daemon's own log should read this file instead of
+    ctrl["out"]/ctrl["err"] from here on.
+    """
+    try:
+        with open(log_path(cfg), "r", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra=""):
-    cfg = config.make_tmp(
-        f"""
+    # cfg's own path has to be known before the config text (which
+    # references log_path(cfg)) can be written, so it's reserved directly
+    # rather than through config.make_tmp(), which only returns a name
+    # after writing content to it. Otherwise unchanged from that
+    # function's own approach -- same tempfile module, caller (here,
+    # start_instance() itself) tracks the name and is responsible for it.
+    cfg = tempfile.mktemp()
+    log = log_path(cfg)
+
+    with open(cfg, "w") as f:
+        f.write(
+            f"""
     [modules]
     log_syslog
     l2tp
@@ -14,7 +61,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     [core]
     log-error=/dev/stderr
     [log]
-    log-file=/dev/stdout
+    log-file={log}
     level=5
     [cli]
     tcp=127.0.0.1:{cli_port}
@@ -26,7 +73,12 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     secret={secret}
     {extra}
     """
-    )
+        )
+    # Matches config.make_tmp()'s own print -- this bypasses that function
+    # (see the comment above) but other tooling watching this suite's
+    # output still expects to see it.
+    print("make_tmp filename: " + cfg)
+
     started, thread, ctrl = accel_pppd_process.start(
         accel_pppd, ["-c" + cfg], accel_cmd, 5.0, cli_port=cli_port
     )

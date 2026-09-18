@@ -2,7 +2,7 @@ import time
 
 import pytest
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance, show_stat, tunnels_active
+from helpers import start_instance, show_stat, tunnels_active, read_log
 
 PEER_BIN = "/tmp/l2tp_switch_peer_test"
 
@@ -137,7 +137,10 @@ def test_downstream_pap_watcher_survives_teardown_racing_its_own_injected_send(
                 ],
             )
             rc, out, err = _finish(peer_thread, peer_ctrl, 15.0)
-            assert rc == 0, f"upstream peer harness failed (rc={rc}): {err}\n{out}"
+            assert rc == 0, (
+                f"upstream peer harness failed (rc={rc}): {err}\n{out}"
+                f"\n--- switch daemon log ---\n{read_log(s_cfg)}"
+            )
 
             # The invariant: the daemon is still alive and answering CLI
             # commands. A crash here (segfault under a plain build, an

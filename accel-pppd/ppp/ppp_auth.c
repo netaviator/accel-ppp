@@ -123,8 +123,31 @@ static int auth_send_conf_req(struct ppp_lcp_t *lcp, struct lcp_option_t *opt, u
 	struct auth_data_t *d;
 	int n;
 
-	if (list_empty(&auth_opt->auth_list) || conf_noauth)
+	if (list_empty(&auth_opt->auth_list) || conf_noauth) {
+		/* Temporary diagnostic (l2tp-switch downstream-PAP debugging,
+		 * see PR #7): this session's ConfReq never proposes CI_AUTH,
+		 * so auth_opt->auth stays NULL and auth_layer_start() takes
+		 * its no-auth-negotiated branch immediately -- completing
+		 * "authentication" before any injected PAP frame can arrive.
+		 * This line distinguishes the two possible causes directly
+		 * rather than guessing further: conf_noauth explicitly set,
+		 * vs. auth_handlers (registered via ppp_auth_register_handler(),
+		 * e.g. from auth_pap's own module init) never reaching this
+		 * session's per-LCP-option auth_list at all. Remove once
+		 * resolved. */
+		{
+			struct ppp_auth_handler_t *h;
+			int n = 0;
+			list_for_each_entry(h, &auth_handlers, entry)
+				n++;
+			log_ppp_warn("l2tp-switch-pap-debug: auth option empty"
+				     " (conf_noauth=%d, auth_handlers count=%d,"
+				     " auth_opt->auth_list empty=%d)\n",
+				     conf_noauth, n,
+				     list_empty(&auth_opt->auth_list));
+		}
 		return 0;
+	}
 
 	if (!auth_opt->auth || auth_opt->auth->state == LCP_OPT_NAK) {
 		list_for_each_entry(d, &auth_opt->auth_list, entry) {

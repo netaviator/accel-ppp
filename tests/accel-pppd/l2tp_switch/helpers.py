@@ -14,11 +14,31 @@ def log_path(cfg):
     return cfg + ".log"
 
 
+def err_log_path(cfg):
+    """The on-disk file start_instance() points [core] log-error= at.
+
+    Separate from log_path() on purpose: log-file= (accel-pppd/log.c) and
+    log-error= (accel-pppd/triton/triton.c's triton_log_error(), opened as
+    f_error in accel-pppd/triton/log.c) are two entirely independent
+    logging paths with no shared destination. triton_log_error() is what
+    the module loader (accel-pppd/triton/loader.c) uses for a failed
+    dlopen() -- e.g. a typo'd or missing module name in `[modules]` --
+    which read_log() alone would never show even though it's exactly the
+    kind of failure a test relying on a specific module (auth_pap, ...)
+    actually being loaded needs to see. It fflush()es on every write, so
+    (unlike the log-file=/dev/stdout capture this module replaced) this
+    was never a buffering problem -- just the wrong destination entirely.
+    """
+    return cfg + ".err"
+
+
 def read_log(cfg):
-    """Best-effort read of the daemon log for the instance started with
-    this config path. Returns "" (never raises) if the file doesn't exist
-    yet -- e.g. a caller diagnosing a start_instance() failure before the
-    daemon got far enough to open its own log file.
+    """Best-effort read of the daemon's combined log-file= and log-error=
+    output for the instance started with this config path (see
+    err_log_path()'s own doc comment for why both are needed). Returns ""
+    for a file that doesn't exist yet -- e.g. a caller diagnosing a
+    start_instance() failure before the daemon got far enough to open its
+    own log files -- never raises.
 
     log-file=/dev/stdout used to be captured by accel_pppd_process.py's own
     Popen(stdout=PIPE) instead, via `ctrl["out"]`/`ctrl["err"]`. In
@@ -34,11 +54,19 @@ def read_log(cfg):
     failure needs the daemon's own log should read this file instead of
     ctrl["out"]/ctrl["err"] from here on.
     """
-    try:
-        with open(log_path(cfg), "r", errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
+
+    def _read(path):
+        try:
+            with open(path, "r", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    log = _read(log_path(cfg))
+    err = _read(err_log_path(cfg))
+    if not err:
+        return log
+    return log + "\n--- log-error ---\n" + err
 
 
 def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra=""):
@@ -50,6 +78,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     # start_instance() itself) tracks the name and is responsible for it.
     cfg = tempfile.mktemp()
     log = log_path(cfg)
+    err_log = err_log_path(cfg)
 
     with open(cfg, "w") as f:
         f.write(
@@ -60,7 +89,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     l2tp
 
     [core]
-    log-error=/dev/stderr
+    log-error={err_log}
     [log]
     log-file={log}
     level=5

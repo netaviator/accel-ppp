@@ -725,7 +725,7 @@ static void render_prometheus(struct strbuf *sb)
 				"Currently bridged L2TP switch calls",
 				l2tp_switch_stat.active());
 		strbuf_appendf(sb, "# HELP accel_ppp_l2tp_switch_lns_bytes_total"
-				   " Bytes spliced to/from MK, aggregated across all targets\n");
+				   " Bytes spliced to/from the upstream LAC, aggregated across all targets\n");
 		strbuf_appendf(sb, "# TYPE accel_ppp_l2tp_switch_lns_bytes_total counter\n");
 		strbuf_appendf(sb, "accel_ppp_l2tp_switch_lns_bytes_total{direction=\"rx\"} %" PRIu64 "\n",
 			       l2tp_switch_stat.lns_rx_bytes());

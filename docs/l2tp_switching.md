@@ -16,11 +16,15 @@ match=<attr-name>,<mode>,<value>,<target-name>
 ```
 
 - `target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>]` — a downstream
-  LNS. Repeatable. `<mode>` is `persistent` or `on-demand` (default:
+  LNS. Repeatable. Fields are comma-separated with no escaping: none may be
+  empty, and `<name>` and `<secret>` cannot contain a comma. `<name>` is
+  limited to letters, digits, `_`, `-` and `.` (it is used verbatim as a
+  metrics label). A malformed `target=` or `match=` line is a fatal config
+  error. `<mode>` is `persistent` or `on-demand` (default:
   `on-demand`):
   - `on-demand` (default) — the outbound tunnel to this target opens only
     once a call actually needs it, and closes itself again after the
-    target has had no active calls for 20 seconds (a fresh call within
+    target has had no active calls for `idle-linger` seconds (20 by default; a fresh call within
     that window reuses the tunnel and cancels the pending close). Chosen
     as the default because many real downstream peers (e.g. Juniper
     JunOS, whose own tunnel `idle-timeout` defaults to 60 seconds) tear
@@ -29,7 +33,8 @@ match=<attr-name>,<mode>,<value>,<target-name>
     that window, rather than flapping forever against the peer's policy.
     A call placed while the tunnel is still connecting queues rather than
     failing immediately, and is only given up on (CDNing the upstream
-    call) if the connect hasn't completed within 10 seconds.
+    call) if the connect hasn't completed within `connect-timeout` seconds
+    (10 by default).
   - `persistent` — the original behavior: accel-ppp opens the tunnel
     eagerly at startup and keeps it open indefinitely with automatic
     reconnect, regardless of whether any call is currently using it. Use
@@ -37,6 +42,13 @@ match=<attr-name>,<mode>,<value>,<target-name>
     configured to tolerate, e.g. JunOS `idle-timeout 0`) an idle,
     session-less control tunnel, and avoiding tunnel-setup latency on a
     call's critical path matters more than the idle-tunnel cost above.
+- `idle-linger=<seconds>` — how long an `on-demand` target's tunnel stays
+  open after its last call ends (default `20`). Applies to every
+  `on-demand` target. Whole seconds, 1–3600.
+- `connect-timeout=<seconds>` — how long a call queued behind an
+  `on-demand` target's connect attempt waits before it is given up on and
+  CDNed (default `10`). Whole seconds, 1–3600. Keep it above the 5-second
+  reconnect cadence if calls should survive one failed connect attempt.
 - `match=<attr-name>,<mode>,<value>,<target-name>` — routes calls to one
   target based on the value of one L2TP AVP. Repeatable; several rules
   may point at the same target.
@@ -69,16 +81,22 @@ l2tp switch add <attr-name> <mode> <value> <target>  # add a match rule without 
 l2tp switch del <attr-name> <mode> <value>           # remove a match rule
 ```
 
-`target=` definitions are base-config only; changing a target's
-peer-addr/secret requires a restart, same as other `[l2tp]` settings.
+`target=` and `match=` lines are read once, at startup; a config reload
+(SIGHUP) does not re-read them. Changing a target's peer-addr/secret
+requires a restart, same as other `[l2tp]` settings; match rules can be
+changed at runtime with `l2tp switch add|del` above (those changes are not
+persisted to the config file).
+
+While an on-demand target's tunnel is still connecting, at most 64 calls
+are queued for it; further calls are refused (CDN to the upstream peer).
 
 ## Observability
 
 `l2tp switch show` lists, per target: whether its tunnel is up, its
 currently-bridged call count, and `bytes_in`/`bytes_out` (from that
 target's own point of view — `in` is bytes received from that
-target's downstream LNS, `out` is bytes sent to it), plus one line per
-active call with the same `bytes_in`/`bytes_out` split. All the byte
+target's downstream LNS, `out` is bytes sent to it), plus one indented line per
+active call, nested under its target, with the same `bytes_in`/`bytes_out` split. All the byte
 counters are running totals: they only increase, even as individual
 calls end, so a target's numbers reflect everything ever spliced to it,
 not just its currently-active calls.
@@ -114,7 +132,7 @@ The status word in `[...]` depends on the target's mode:
 
 `accel-cmd show stat` includes an `l2tp-switch:` block alongside the
 existing `l2tp:` one, with the aggregate (not per-target) `active:`,
-`lns_rx_bytes:`, and `lns_tx_bytes:` — the totals to/from MK
+`lns_rx_bytes:`, and `lns_tx_bytes:` — the totals to/from the upstream LAC
 across every target combined. In a healthy setup, `lns_rx_bytes`
 should track the sum of every target's `bytes_out`, and
 `lns_tx_bytes` the sum of every target's `bytes_in`; a persistent
@@ -126,7 +144,7 @@ also served natively over HTTP at `/metrics`, in both the default
 Prometheus format and `format=json`:
 
 - `accel_ppp_l2tp_switch_active` (gauge) — aggregate active calls.
-- `accel_ppp_l2tp_switch_lns_bytes_total{direction="rx"|"tx"}` (counter) — aggregate, to/from MK.
+- `accel_ppp_l2tp_switch_lns_bytes_total{direction="rx"|"tx"}` (counter) — aggregate, to/from the upstream LAC.
 - `accel_ppp_l2tp_switch_target_up{target="..."}` (gauge) — 1 if this
   target's tunnel is currently established (`STATE_ESTB`), for both
   modes, 0 otherwise. For an `on-demand` target this is 1 throughout its
@@ -143,7 +161,7 @@ Prometheus format and `format=json`:
 - `accel_ppp_l2tp_switch_target_active{target="..."}` (gauge) — per-target active calls.
 - `accel_ppp_l2tp_switch_target_bytes_total{target="...",direction="rx"|"tx"}` (counter) — per-target, to/from that target's own LNS.
 
-Deliberately not labeled by tunnel ID: MK's and each target's tunnel
+Deliberately not labeled by tunnel ID: the upstream LAC's and each target's tunnel
 IDs are renegotiated on every reconnect, which would make for
 ever-churning, useless label series — `target` (an operator-assigned,
 stable name) is the right dimension for per-flow visibility instead.
@@ -161,6 +179,47 @@ RADIUS accounting records — they never create a PPP session object at
 all. If a switched line needs to be billed or usage-tracked, use these
 counters or accounting on the downstream LNS itself.
 
+## Authentication
+
+A switched call's two legs never run a local PPP session — both real
+peers (the actual calling client, relayed via the upstream LAC, and the
+downstream target LNS) negotiate LCP with each other directly through the
+existing `splice(2)` byte pipe, with accel-ppp acting as a transparent
+pipe. This is why LCP works with no special handling.
+
+PAP alone needs help: some upstream LACs proxy authentication via this
+call's ICCN `Proxy-Authen-*` AVPs instead of ever putting a live PAP frame
+on the wire, and a downstream LNS that doesn't implement consuming those
+AVPs (most don't) never sees anything to authenticate against. To make a
+switched call work against an unmodified downstream LNS in that case, the
+switch passively watches the already-spliced stream (via `tee(2)`, which
+duplicates without consuming — the real splice is never disturbed) for an
+LCP `Configure-Ack` in both directions, then injects **one** synthesized
+PAP `Authenticate-Request` directly onto the downstream leg's socket,
+built from the `Proxy-Authen-Name`/`Proxy-Authen-Response` bytes already
+captured from the upstream ICCN, exactly as if the real client had sent
+it. The one `Ack`/`Nak` reply is picked off the same way: `Ack` lets the
+untouched splice continue; `Nak`, or no reply within 3 seconds, tears the
+call down.
+
+This is a relay, not an authentication decision: the credential bytes are
+never inspected or validated on this end, only relayed verbatim, and the
+downstream target's own `Ack`/`Nak` is the only verdict that matters.
+
+**PAP only.** The watcher injects only when the captured
+`Proxy-Authen-Type` is 3 (PPP PAP) or 1 (textual username/password) — or
+absent — and no `Proxy-Authen-Challenge` was sent. Any other type (e.g.
+2, PPP CHAP) or a challenge disconnects the call rather than relaying a
+CHAP response as a PAP password. CHAP client support is not implemented.
+Once the watcher has seen an LCP `Configure-Ack` in both directions it
+injects unconditionally. Production traffic this was built
+against always proxies auth via AVPs rather than relaying a live PAP/CHAP
+exchange, so this has not been exercised against an upstream LAC that
+does the latter; a duplicate PAP `Authenticate-Request` reaching a
+downstream LNS that already received a real one from the LAC is
+untested. If your upstream ever relays live auth instead of proxying it,
+verify this mechanism doesn't interfere before relying on it.
+
 ## Operational constraints
 
 - **MTU is not renegotiated.** The Proxy LCP AVPs forwarded to the
@@ -170,7 +229,7 @@ counters or accounting on the downstream LNS itself.
   MTU as the upstream path, or supports PMTUD end to end — a smaller
   downstream-path MTU will silently drop or fragment traffic with no
   diagnostic from this feature.
-- **Sequencing is mirrored, not chosen per leg.** If MK requires L2TP data
+- **Sequencing is mirrored, not chosen per leg.** If the upstream LAC requires L2TP data
   sequencing on a switched call, the same requirement is placed on the
   downstream call automatically; there is no way to configure the two legs
   independently.
@@ -187,7 +246,7 @@ counters or accounting on the downstream LNS itself.
   `net.core.rmem_max`/`wmem_max` default of ~208 KiB via
   `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`) specifically to absorb bursts well
   beyond ordinary call traffic. Measured on a real two-VM setup, one
-  switched call, one MK-side sender writing as fast as possible with no
+  switched call, one upstream-LAC-side sender writing as fast as possible with no
   pacing:
   - Bursts up to at least 2,000 back-to-back 1400-byte writes (2.8 MB) are
     relayed with **zero loss**, and the call stays up.

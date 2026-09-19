@@ -16,6 +16,14 @@ enum l2tp_switch_conn_mode {
 	L2TP_SWITCH_MODE_ON_DEMAND,
 };
 
+/* Lifetime: targets are created by l2tp_switch_conf_load() at startup and
+ * are never freed while the daemon runs (only switch_conf_clear(), at the
+ * next config load, before anything can hold one). Everything that keeps a
+ * `struct l2tp_switch_target_t *` -- match rules, sessions, the metrics
+ * scraper walking l2tp_switch_targets from its own thread -- relies on that
+ * instead of a reference count, and the list itself is never modified after
+ * load, so iterating it needs no lock. The mutable fields inside a target
+ * have their own rules, noted per field below. */
 struct l2tp_switch_target_t {
 	struct list_head entry;
 	char *name;
@@ -85,7 +93,7 @@ struct l2tp_switch_target_t {
 	 * being idle. */
 	struct triton_timer_t idle_timer;
 
-	/* Owned by l2tp.c (Task 7): live/cumulative stats for this target,
+	/* Owned by l2tp.c: live/cumulative stats for this target,
 	 * from this target's own point of view -- rx is bytes received FROM
 	 * this target's downstream LNS, tx is bytes sent TO it. Monotonic:
 	 * never reset, never decremented, so they stay valid Prometheus
@@ -96,6 +104,28 @@ struct l2tp_switch_target_t {
 };
 
 extern struct list_head l2tp_switch_targets;
+
+/* On-demand connection-mode timing, from the [l2tp-switch] `idle-linger=` and
+ * `connect-timeout=` options (seconds). Fixed after l2tp_switch_conf_load(),
+ * so the getters need no lock. */
+#define L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC 20
+#define L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC 10
+#define L2TP_SWITCH_MAX_TIMING_SEC 3600
+
+/* How long an on-demand target's tunnel stays up after its last call ends.
+ * Long enough that back-to-back calls reuse it instead of paying a fresh
+ * SCCRQ round trip each time (and instead of making accel-ppp itself the
+ * source of a connect/disconnect flap), short enough that accel-ppp closes
+ * the session-less tunnel on its own terms well before a downstream peer's
+ * own idle policy does it for us -- JunOS' default idle-timeout, the
+ * shortest one this feature is known to face, is 60s. */
+int l2tp_switch_conf_idle_linger_ms(void);
+/* How long a call placed against a cold on-demand target may wait for that
+ * target's tunnel to finish connecting before the call is given up on. Long
+ * enough to absorb a normal SCCRQ retransmission round or two against a
+ * briefly unresponsive peer, short enough that a caller facing a genuinely
+ * dead target gets a clear failure instead of a silent hang. */
+int l2tp_switch_conf_connect_timeout_ms(void);
 
 int l2tp_switch_conf_load(void);
 struct l2tp_switch_target_t *l2tp_switch_target_find(const char *name);

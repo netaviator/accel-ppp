@@ -996,7 +996,26 @@ is
 or
 .B on-demand
 (default: connect only when a call needs it, close again after 20s idle).
+Fields are comma-separated with no escaping: none may be empty, and
+.B name
+and
+.B secret
+cannot contain a comma.
+.B name
+may contain only letters, digits, '_', '-' and '.'. A malformed line is a
+fatal configuration error. Targets and match rules are read at startup only
+and are not re-read on configuration reload.
 See docs/l2tp_switching.md for the full rationale and lifecycle.
+.TP
+.BI "idle-linger=" seconds
+How long an on-demand target's tunnel stays open after its last call ends.
+Whole seconds, 1-3600. Default: 20.
+.TP
+.BI "connect-timeout=" seconds
+How long a call queued behind an on-demand target's connect attempt waits
+before it is given up on. Whole seconds, 1-3600. Default: 10. Keep it above
+the 5 second reconnect cadence if calls should survive one failed connect
+attempt.
 .TP
 .BI "match=" attr-name,mode,value,target-name
 Routes calls to one target based on the value of one L2TP AVP. Repeatable;

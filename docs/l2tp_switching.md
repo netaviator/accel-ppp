@@ -49,6 +49,10 @@ match=<attr-name>,<mode>,<value>,<target-name>
   `on-demand` target's connect attempt waits before it is given up on and
   CDNed (default `10`). Whole seconds, 1–3600. Keep it above the 5-second
   reconnect cadence if calls should survive one failed connect attempt.
+- `reconnect-interval=<seconds>` — delay between connection attempts to a
+  target whose tunnel failed to come up (or, for a `persistent` target,
+  dropped); default `5`, whole seconds 1–3600. Keep it below
+  `connect-timeout` if a queued call should get more than one attempt.
 - `match=<attr-name>,<mode>,<value>,<target-name>` — routes calls to one
   target based on the value of one L2TP AVP. Repeatable; several rules
   may point at the same target.

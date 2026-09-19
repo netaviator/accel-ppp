@@ -110,6 +110,7 @@ extern struct list_head l2tp_switch_targets;
  * so the getters need no lock. */
 #define L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC 20
 #define L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC 10
+#define L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC 5
 #define L2TP_SWITCH_MAX_TIMING_SEC 3600
 
 /* How long an on-demand target's tunnel stays up after its last call ends.
@@ -126,6 +127,10 @@ int l2tp_switch_conf_idle_linger_ms(void);
  * briefly unresponsive peer, short enough that a caller facing a genuinely
  * dead target gets a clear failure instead of a silent hang. */
 int l2tp_switch_conf_connect_timeout_ms(void);
+/* Delay between connection attempts to a target whose tunnel failed to come
+ * up (or, for a persistent target, dropped). Keep it below connect-timeout
+ * if a queued call should get more than one attempt. */
+int l2tp_switch_conf_reconnect_interval_ms(void);
 
 int l2tp_switch_conf_load(void);
 struct l2tp_switch_target_t *l2tp_switch_target_find(const char *name);

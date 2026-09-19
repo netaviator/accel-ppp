@@ -304,6 +304,7 @@ class TestTimingOptionsAccepted:
     [l2tp-switch]
     idle-linger=3
     connect-timeout=7
+    reconnect-interval=2
     target=acme,203.0.113.50,1701,targetsecret
     """
 
@@ -331,10 +332,13 @@ class TestTimingOptionsInvalidRejected:
             "idle-linger=",
             "connect-timeout=0",
             "connect-timeout=10s",
+            "reconnect-interval=0",
+            "reconnect-interval=x",
         ],
         ids=[
             "linger-zero", "linger-negative", "linger-text", "linger-fraction",
             "linger-too-big", "linger-empty", "connect-zero", "connect-suffix",
+            "reconnect-zero", "reconnect-text",
         ],
     )
     def l2tp_switch_config(self, request):

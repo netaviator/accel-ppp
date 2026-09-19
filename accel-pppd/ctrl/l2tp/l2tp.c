@@ -1517,7 +1517,7 @@ static int l2tp_switch_target_should_retry(struct l2tp_switch_target_t *target)
  * and let the callback retire the timer on its next tick. Every add/del of
  * these is additionally done under target->lock.
  *
- * Arms the shared 5s reconnect cadence, unless it is already armed.
+ * Arms the shared reconnect cadence (reconnect-interval=, 5s by default), unless it is already armed.
  *
  * The armed/not-armed check has to happen under target->lock, like every
  * other field on the target: this runs from any tunnel's context, while
@@ -2289,7 +2289,8 @@ static void l2tp_switch_target_connect(struct l2tp_switch_target_t *target)
 				 conf_hide_avps);
 	if (conn == NULL) {
 		log_error("l2tp-switch: target \"%s\": tunnel allocation"
-			  " failed, retrying in 5s\n", target->name);
+			  " failed, retrying in %ds\n", target->name,
+			  l2tp_switch_conf_reconnect_interval_ms() / 1000);
 		goto retry;
 	}
 
@@ -2325,7 +2326,8 @@ static void l2tp_switch_target_connect(struct l2tp_switch_target_t *target)
 
 	if (l2tp_tunnel_start(conn, l2tp_send_SCCRQ, &target->peer_addr) < 0) {
 		log_error("l2tp-switch: target \"%s\": starting tunnel"
-			  " failed, retrying in 5s\n", target->name);
+			  " failed, retrying in %ds\n", target->name,
+			  l2tp_switch_conf_reconnect_interval_ms() / 1000);
 		pthread_mutex_lock(&target->lock);
 		if (target->tunnel == conn) /* same identity guard as
 					     * l2tp_tunnel_free()'s hook: never
@@ -2371,7 +2373,8 @@ static void l2tp_switch_targets_connect(void)
 	list_for_each_entry(target, &l2tp_switch_targets, entry) {
 		target->reconnect_timer.expire =
 			l2tp_switch_target_reconnect_timer;
-		target->reconnect_timer.period = 5000;
+		target->reconnect_timer.period =
+			l2tp_switch_conf_reconnect_interval_ms();
 		if (target->mode == L2TP_SWITCH_MODE_PERSISTENT)
 			l2tp_switch_target_connect(target);
 	}

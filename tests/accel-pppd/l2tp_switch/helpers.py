@@ -205,9 +205,19 @@ def wait_for(predicate, timeout, interval=0.1):
     return value
 
 
-def switch_show(accel_cmd, cli_port):
-    """Output of `l2tp switch show` on the daemon listening on `cli_port`."""
-    return process.run([accel_cmd, "-p", str(cli_port), "l2tp switch show"])[1]
+def switch_show(accel_cmd, cli_port, check=True):
+    """Output of `l2tp switch show` on the daemon listening on `cli_port`.
+
+    With `check` (the default) a failing accel-cmd is an assertion failure
+    right here, with its stderr, rather than an empty output that a caller
+    would only notice as a missing expected string. Pass check=False where a
+    failure is expected and being polled through -- e.g. while a daemon that
+    is still starting does not accept CLI connections yet.
+    """
+    (exit_code, out, err) = process.run([accel_cmd, "-p", str(cli_port), "l2tp switch show"])
+    if check:
+        assert exit_code == 0, f"l2tp switch show failed on port {cli_port}: {err}"
+    return out
 
 
 def wait_up(accel_cmd, cli_port, timeout=10.0):
@@ -216,7 +226,7 @@ def wait_up(accel_cmd, cli_port, timeout=10.0):
     out = [""]
 
     def up():
-        out[0] = switch_show(accel_cmd, cli_port)
+        out[0] = switch_show(accel_cmd, cli_port, check=False)
         return "[up]" in out[0]
 
     wait_for(up, timeout)

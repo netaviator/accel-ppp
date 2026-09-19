@@ -32,18 +32,22 @@ from helpers import (
     wait_for_tunnels_active,
 )
 
+# The reconnect-interval= (seconds) written into every test here, in place of
+# the daemon's 5s default, so the retry cadence is short but still several
+# ticks per budget.
+RECONNECT_INTERVAL = 1
+
 # The connect-timeout= (seconds) written into the tests whose timing is tied
-# to the fixed 5s reconnect cadence or to a slow SCCRP; equals the daemon
-# default.
-CONNECT_TIMEOUT = 10.0
+# to a slow SCCRP or to the budget's own deadline (daemon default: 10).
+CONNECT_TIMEOUT = 6.0
 
 # A shorter connect-timeout= for the test where the budget merely bounds the
-# wait. Kept above the 5s reconnect cadence so a retry still lands inside it.
-SHORT_CONNECT_TIMEOUT = 6.0
+# wait. Kept above the reconnect cadence so a retry still lands inside it.
+SHORT_CONNECT_TIMEOUT = 3.0
 
 # The idle-linger= (seconds) written into the tests that wait for a tunnel to
 # close by itself (daemon default: 20).
-IDLE_LINGER = 4.0
+IDLE_LINGER = 2.0
 
 
 def _wait_for_show(accel_cmd, needle, timeout, cli_port):
@@ -98,15 +102,16 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
     [l2tp-switch]
     target=downstream,127.0.0.1,{d_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,downstream
+    reconnect-interval={RECONNECT_INTERVAL}
     """,
         )
         assert s_started
 
         try:
-            # Long enough to cover several of the 5s reconnect cadence's own
+            # Long enough to cover several of the reconnect cadence's own
             # windows: an eagerly-connecting target would be [up] well
             # within this.
-            time.sleep(6.0)
+            time.sleep(3 * RECONNECT_INTERVAL)
             out = switch_show(accel_cmd, s_cli)
             assert "[idle]" in out, f"on-demand target connected with no call:\n{out}"
             assert "placed: 0" in out, out
@@ -123,13 +128,13 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
                     # switch connects downstream and places the call, so
                     # this test measures the switch's own timing rather
                     # than racing the harness's exit.
-                    "--hold-seconds", "6",
+                    "--hold-seconds", "4",
                 ],
             )
 
-            up, up_after, out = _wait_for_show(accel_cmd, "[up]", 8.0, s_cli)
+            up, up_after, out = _wait_for_show(accel_cmd, "[up]", 5.0, s_cli)
             assert up, f"on-demand target never connected after a call arrived:\n{out}"
-            placed, placed_after, out = _wait_for_show(accel_cmd, "placed: 1", 8.0, s_cli)
+            placed, placed_after, out = _wait_for_show(accel_cmd, "placed: 1", 5.0, s_cli)
             assert placed, f"queued call was never placed downstream:\n{out}"
 
             rc, harness_out, err = finish_harness(peer_thread, peer_ctrl, 20.0)
@@ -137,7 +142,7 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
 
             # The connect is triggered by the call, so it must complete
             # promptly once one arrives -- not on some later reconnect tick.
-            assert up_after < 5.0, f"target took {up_after:.1f}s to connect after a call"
+            assert up_after < 3.0, f"target took {up_after:.1f}s to connect after a call"
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
             config.delete_tmp(s_cfg)
@@ -153,7 +158,7 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
     # mid-negotiation for a known window. The call that triggered the
     # connect has nowhere to go for that whole window -- it must wait for
     # it, not be rejected.
-    sccrp_delay = 3.0
+    sccrp_delay = 1.5
     s_cli, s_port, down_port = alloc_ports(3)
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
@@ -167,7 +172,8 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
     [l2tp-switch]
     target=slow,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,slow
-    connect-timeout=10
+    connect-timeout={int(CONNECT_TIMEOUT)}
+    reconnect-interval={RECONNECT_INTERVAL}
     """,
     )
     assert s_started
@@ -194,7 +200,7 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
                     "--calling-number", "472913",
                     # Outlives the stalled connect, so the queued call is
                     # still a live call when the tunnel finally comes up.
-                    "--hold-seconds", "10",
+                    "--hold-seconds", "4",
                 ],
             )
             call_started = time.monotonic()
@@ -209,7 +215,7 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
                 f" finished connecting:\n{out}"
             )
 
-            placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 8.0, s_cli)
+            placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 6.0, s_cli)
             placed_after = time.monotonic() - call_started
             assert placed, (
                 "queued call was never placed once the slow tunnel came up"
@@ -263,7 +269,8 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
     [l2tp-switch]
     target=dead,127.0.0.1,{dead_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,dead
-    connect-timeout=6
+    connect-timeout={int(SHORT_CONNECT_TIMEOUT)}
+    reconnect-interval={RECONNECT_INTERVAL}
     """,
     )
     assert s_started
@@ -277,13 +284,13 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
                 "--secret", "upstreamsecret",
                 "--calling-number", "472913",
                 "--wait-cdn",
-                # Comfortably past the configured 6s budget: the point
-                # is to observe *when* the CDN arrives, not to cap it.
-                "--cdn-timeout", "25",
+                # Comfortably past the configured budget: the point is to
+                # observe *when* the CDN arrives, not to cap it.
+                "--cdn-timeout", "12",
             ],
         )
 
-        rc, out, err = finish_harness(peer_thread, peer_ctrl, 40.0)
+        rc, out, err = finish_harness(peer_thread, peer_ctrl, 25.0)
         assert rc == 0, (
             "call against an unreachable on-demand target was never"
             f" disconnected (rc={rc}): {err}\n{out}"
@@ -304,7 +311,7 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
         # Tight on purpose: the timer is periodic, so a budget that is armed
         # but never re-armed to the current deadline fires at the *previous*
         # deadline, no-ops, and only gives up a whole period later. Anything
-        # past ~8.5s means the deadline and the timer have drifted apart.
+        # past ~5.5s means the deadline and the timer have drifted apart.
         assert waited < SHORT_CONNECT_TIMEOUT + 2.5, (
             f"call hung for {waited:.1f}s before being disconnected --"
             f" the {SHORT_CONNECT_TIMEOUT:.0f}s connect timeout is not bounding it"
@@ -313,10 +320,10 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
         # ...and the target itself is back at rest afterwards: no
         # half-open tunnel lingering from the abandoned connect, and no
         # reconnect cadence still running with nothing left to serve.
-        at_rest, _, out = _wait_for_show(accel_cmd, "[idle]", 20.0, s_cli)
+        at_rest, _, out = _wait_for_show(accel_cmd, "[idle]", 10.0, s_cli)
         assert at_rest, f"target left with a lingering tunnel:\n{out}"
 
-        time.sleep(6.0)  # longer than the 5s reconnect cadence
+        time.sleep(3 * RECONNECT_INTERVAL)  # several reconnect cadences
         out = switch_show(accel_cmd, s_cli)
         assert "[idle]" in out, (
             f"target kept retrying with no call left to serve:\n{out}"
@@ -333,14 +340,14 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     # the drain that closed the first budget deliberately does not cancel it
     # cross-context. A later call therefore re-arms an already-armed timer,
     # and must get its own full budget from that moment -- not whatever was
-    # left of the first call's, which would disconnect it early (here: 5s
-    # in, instead of 10s).
+    # left of the first call's, which would disconnect it early (here: about
+    # half the budget in, instead of all of it).
     #
     # Seconds to wait after the first tunnel is gone before making the
     # second call. Small enough that the whole first phase (the downstream's
     # own --hold-seconds included) plus this still lands comfortably inside
-    # the first budget's 10s, which is what leaves its timer armed.
-    gap = 2.0
+    # the first budget, which is what leaves its timer armed.
+    gap = 1.0
     s_cli, s_port, down_port = alloc_ports(3)
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
@@ -354,7 +361,8 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     [l2tp-switch]
     target=flaky,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,flaky
-    connect-timeout=10
+    connect-timeout={int(CONNECT_TIMEOUT)}
+    reconnect-interval={RECONNECT_INTERVAL}
     """,
     )
     assert s_started
@@ -392,7 +400,7 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
                 "--secret", "downstreamsecret",
                 "--rounds", "1",
                 "--send-stopccn",
-                "--hold-seconds", "3",
+                "--hold-seconds", "2",
             ],
         )
 
@@ -408,10 +416,10 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         finish_harness(first_thread, first_ctrl, 20.0)
         finish_harness(down_thread, down_ctrl, 20.0)
 
-        placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 10.0, s_cli)
+        placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 6.0, s_cli)
         assert placed, f"first call was never placed:\n{out}"
 
-        # Well inside the first budget's 10s, so its timer is still armed.
+        # Well inside the first budget, so its timer is still armed.
         time.sleep(gap)
 
         second_thread, second_ctrl = l2tp_peer_process.start(
@@ -422,10 +430,10 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
                 "--secret", "upstreamsecret",
                 "--calling-number", "472913",
                 "--wait-cdn",
-                "--cdn-timeout", "25",
+                "--cdn-timeout", "15",
             ],
         )
-        rc, out, err = finish_harness(second_thread, second_ctrl, 40.0)
+        rc, out, err = finish_harness(second_thread, second_ctrl, 25.0)
         assert rc == 0, f"second call was never disconnected (rc={rc}): {err}\n{out}"
 
         stamps = _timestamps(out)
@@ -433,8 +441,8 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         waited = stamps["recv_cdn"] - stamps["sent_iccn"]
 
         # Inheriting the first budget would land at whatever was left of it
-        # (~5s here, and less the longer this phase takes); its own budget
-        # always lands at ~10s, which is what the bound below pins down.
+        # (about half of it here, and less the longer this phase takes); its
+        # own budget always lands at the full CONNECT_TIMEOUT, which is what the bound below pins down.
         assert waited > CONNECT_TIMEOUT * 0.7, (
             f"second call was disconnected after {waited:.1f}s -- it"
             f" inherited what was left of the first call's budget instead of"
@@ -443,7 +451,7 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         # Same tight bound, and here it is the real assertion: leaving the
         # inherited timer armed at the first budget's deadline makes it fire
         # early, no-op on the deadline check, and only disconnect a full
-        # period later -- ~14s rather than ~10s.
+        # period later -- ~2x the budget rather than ~1x.
         assert waited < CONNECT_TIMEOUT + 2.5, (
             f"second call hung for {waited:.1f}s before being disconnected --"
             " its budget's timer is not armed to its own deadline"
@@ -457,7 +465,7 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
 @pytest.mark.skipif(
     platform.machine() in ("s390x",),
     reason="this test pins a sub-millisecond ordering race (see its own"
-    " docstring) against the daemon's fixed 10s connect-timeout constant by"
+    " docstring) against the daemon's configured connect-timeout by"
     " timing a peer response to land ~100ms before it; under full-system"
     " s390x QEMU emulation (coarse/jittery timers, heavy scheduling latency)"
     " that ordering has been observed to land the same way every run instead"
@@ -488,7 +496,7 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
     until the daemon exits -- and because the target looks free, the next
     call starts a *second* tunnel, so every recurrence adds another one.
 
-    The reproduction: a downstream that answers ~100ms before the 10s budget
+    The reproduction: a downstream that answers ~100ms before the 6s budget
     expires, but buries its SCCRP in a 400ms flood of junk datagrams
     (--sccrp-storm-ms). The flood keeps the switch's socket readable
     continuously, so the SCCRP is not processed until the flood ends, while
@@ -503,7 +511,7 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
     race falls out, no l2tp tunnel is still active a linger later. It fails
     only on the orphan, never on a run where the ordering did not happen.
     """
-    sccrp_delay = 9.9
+    sccrp_delay = CONNECT_TIMEOUT - 0.1
     storm = 0.4
     s_cli, s_port, down_port = alloc_ports(3)
 
@@ -518,8 +526,9 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
     [l2tp-switch]
     target=racy,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,racy
-    connect-timeout=10
-    idle-linger=4
+    connect-timeout={int(CONNECT_TIMEOUT)}
+    idle-linger={int(IDLE_LINGER)}
+    reconnect-interval={RECONNECT_INTERVAL}
     """,
     )
     assert s_started
@@ -538,7 +547,7 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
                 "--sccrp-delay-ms", str(int(sccrp_delay * 1000)),
                 "--sccrp-storm-ms", str(int(storm * 1000)),
                 "--rounds", "1",
-                "--hold-seconds", "50",
+                "--hold-seconds", "25",
             ],
         )
 
@@ -551,10 +560,10 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     "--wait-cdn",
-                    "--cdn-timeout", "25",
+                    "--cdn-timeout", "15",
                 ],
             )
-            rc, out, err = finish_harness(peer_thread, peer_ctrl, 40.0)
+            rc, out, err = finish_harness(peer_thread, peer_ctrl, 25.0)
             assert rc == 0, (
                 f"call against the slow target was never disconnected (rc={rc}):"
                 f" {err}\n{out}"

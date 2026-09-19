@@ -33,13 +33,15 @@ import re
 import time
 
 import pytest
-from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance, tunnels_active, wait_for_tunnels_active
+from common import config, accel_pppd_process, l2tp_peer_process
+from helpers import (
+    alloc_ports, start_instance, switch_show, tunnels_active,
+    wait_for, wait_for_tunnels_active,
+)
 
-PEER_BIN = "/tmp/l2tp_switch_peer_test"
-
-# The daemon's own L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS, in seconds.
-IDLE_LINGER = 20.0
+# Must match the `idle-linger=` written into the [l2tp-switch] configs below
+# (the daemon default is 20s; the tests shorten it to run fast).
+IDLE_LINGER = 4.0
 
 # Written through the established call before it is torn down. Its real job
 # here is the pause the harness takes around it (see that harness's own
@@ -48,22 +50,15 @@ IDLE_LINGER = 20.0
 DATA_PATTERN = "SWITCHOK"
 
 
-def _switch_show(accel_cmd, cli_port=2001):
-    (exit_code, out, err) = process.run([accel_cmd, "-p", str(cli_port), "l2tp switch show"])
-    assert exit_code == 0, f"l2tp switch show failed: {err}"
-    return out
+def _wait_show(accel_cmd, cli_port, needle, timeout):
+    """Poll `l2tp switch show` until `needle` appears. Returns (found, out)."""
+    out = [""]
 
+    def seen():
+        out[0] = switch_show(accel_cmd, cli_port)
+        return needle in out[0]
 
-def _wait_for(accel_cmd, needle, timeout, cli_port=2001):
-    """Poll `l2tp switch show` until `needle` appears. Returns (found, elapsed, out)."""
-    started = time.monotonic()
-    out = ""
-    while time.monotonic() - started < timeout:
-        out = _switch_show(accel_cmd, cli_port)
-        if needle in out:
-            return True, time.monotonic() - started, out
-        time.sleep(0.1)
-    return False, time.monotonic() - started, out
+    return bool(wait_for(seen, timeout)), out[0]
 
 
 def _events(out):
@@ -83,9 +78,9 @@ def _times(events, name):
     return [t for (event, t) in events if event == name]
 
 
-def _start_downstream(port, hold):
+def _start_downstream(peer_bin, port, hold):
     return l2tp_peer_process.start(
-        PEER_BIN,
+        peer_bin,
         [
             "--listen",
             "--peer-port", str(port),
@@ -96,7 +91,7 @@ def _start_downstream(port, hold):
     )
 
 
-def _place_and_end_one_call(accel_cmd, peer_port, expect_connected):
+def _place_and_end_one_call(peer_bin, accel_cmd, cli_port, peer_port, expect_connected):
     """Run one switched call to completion, then end it from the upstream side.
 
     Returns the moment the switch is first observed with no active call --
@@ -105,7 +100,7 @@ def _place_and_end_one_call(accel_cmd, peer_port, expect_connected):
     own ~60s timeouts, which says nothing about the window being measured.
     """
     thread, ctrl = l2tp_peer_process.start(
-        PEER_BIN,
+        peer_bin,
         [
             "--peer-addr", "127.0.0.1",
             "--peer-port", str(peer_port),
@@ -118,14 +113,14 @@ def _place_and_end_one_call(accel_cmd, peer_port, expect_connected):
     rc, out, err = l2tp_peer_process.wait(thread, ctrl, 30.0)
     assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{out}"
 
-    idle, _, show = _wait_for(accel_cmd, "active: 0", 15.0)
+    idle, show = _wait_show(accel_cmd, cli_port, "active: 0", 15.0)
     ended = time.monotonic()
     assert idle, f"call never ended:\n{show}"
     assert f"connected: {expect_connected}" in show, (
         "the call was never actually paired downstream, so nothing was ever"
         f" active to go idle:\n{show}"
     )
-    # "[idle]" here (Task 4) means "no active calls" -- it does not by
+    # "[idle]" here means "no active calls" -- it does not by
     # itself prove the tunnel is still open (that word is deliberately the
     # same one used once the tunnel is actually gone, see
     # docs/l2tp_switching.md's Observability section). The genuine "no
@@ -151,39 +146,41 @@ def _start_switch(accel_pppd, accel_cmd, cli_port, l2tp_port, downstream_port):
         extra=f"""
     [l2tp-switch]
     target=downstream,127.0.0.1,{downstream_port},downstreamsecret,on-demand
+    idle-linger=4
     match=Calling-Number,exact,472913,downstream
     """,
     )
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, accel_pppd):
-    down_thread, down_ctrl = _start_downstream(17110, 45)
+def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+    switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
+    down_thread, down_ctrl = _start_downstream(peer_bin, down_l2tp, 45)
 
     try:
         s_started, s_thread, s_ctrl, s_cfg = _start_switch(
-            accel_pppd, accel_cmd, 2001, 17111, 17110
+            accel_pppd, accel_cmd, switch_cli, switch_l2tp, down_l2tp
         )
         assert s_started
 
         try:
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, f"on-demand target connected with no call:\n{out}"
 
-            ended = _place_and_end_one_call(accel_cmd, 17111, 1)
+            ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 1)
 
             # Mid-window: comfortably past any "close it as soon as the last
             # call ends" behaviour, and comfortably short of the linger.
             # `l2tp switch show`'s own status word is "[idle]" either way
-            # here (Task 4 deliberately does not distinguish "idle but
+            # here (the CLI deliberately does not distinguish "idle but
             # still open" from "idle and closed" in that human-facing
             # summary -- see docs/l2tp_switching.md), so the actual
             # "still open" claim is checked via `show stat`'s tunnel count
             # instead, which is unaffected by that ambiguity.
             time.sleep(IDLE_LINGER * 0.6)
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd)
+            n = tunnels_active(accel_cmd, switch_cli)
             assert n == 1, (
                 f"tunnel closed {time.monotonic() - ended:.1f}s after the call"
                 f" ended, well inside the {IDLE_LINGER:.0f}s linger -- a"
@@ -191,7 +188,7 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
                 f" active={n}):\n{out}"
             )
 
-            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER)
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER, switch_cli)
             closed_after = time.monotonic() - ended
             assert closed, (
                 f"target's tunnel was still up {closed_after:.1f}s after its"
@@ -203,10 +200,10 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
                 f"tunnel closed after only {closed_after:.1f}s -- shorter than"
                 f" the {IDLE_LINGER:.0f}s window back-to-back calls rely on"
             )
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
         finally:
-            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)
     finally:
         rc, down_out, down_err = l2tp_peer_process.wait(down_thread, down_ctrl, 60.0)
@@ -235,47 +232,49 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel_pppd):
-    # Second call placed 15s after the first one ended: inside the first
+def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+    # Second call placed half a linger after the first one ended: inside the first
     # call's linger window, and late enough that the first linger's own
-    # deadline (end-of-call-1 + 20s) falls *after* the second call is over.
+    # deadline (end-of-call-1 + linger) falls *after* the second call is over.
     # An implementation that arms the teardown and then lets it fire blindly
-    # therefore closes the tunnel ~5s after the second call ends, instead of
+    # therefore closes the tunnel well before that call's own window ends, instead of
     # giving that call's own end a full window of its own.
-    gap = 15.0
+    gap = IDLE_LINGER * 0.5
 
-    down_thread, down_ctrl = _start_downstream(17112, 90)
+    switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
+    down_thread, down_ctrl = _start_downstream(peer_bin, down_l2tp, 90)
 
     try:
         s_started, s_thread, s_ctrl, s_cfg = _start_switch(
-            accel_pppd, accel_cmd, 2001, 17113, 17112
+            accel_pppd, accel_cmd, switch_cli, switch_l2tp, down_l2tp
         )
         assert s_started
 
         try:
-            first_ended = _place_and_end_one_call(accel_cmd, 17113, 1)
+            first_ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 1)
 
             time.sleep(gap)
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd)
+            n = tunnels_active(accel_cmd, switch_cli)
             assert n == 1, (
                 f"tunnel closed {time.monotonic() - first_ended:.1f}s after the"
                 f" first call, before the second one could reuse it (tunnels"
                 f" active={n}):\n{out}"
             )
 
-            second_ended = _place_and_end_one_call(accel_cmd, 17113, 2)
+            second_ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 2)
 
-            # Past the first call's own deadline (first_ended + 20s) by a
-            # clear margin: that timer must have been cancelled and re-armed
+            # Past the first call's own deadline (first_ended + linger) by a
+            # clear margin (midway between it and the second call's own
+            # deadline): that timer must have been cancelled and re-armed
             # by the second call, not left to close a tunnel whose idle
             # window started later.
-            stale_deadline_passed = first_ended + IDLE_LINGER + 3.0
+            stale_deadline_passed = (first_ended + second_ended) / 2 + IDLE_LINGER
             time.sleep(max(0.0, stale_deadline_passed - time.monotonic()))
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd)
+            n = tunnels_active(accel_cmd, switch_cli)
             assert n == 1, (
                 "tunnel closed on the *first* call's linger deadline"
                 f" ({time.monotonic() - second_ended:.1f}s after the second"
@@ -283,7 +282,7 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
                 f" active={n})"
             )
 
-            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER)
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER, switch_cli)
             closed_after = time.monotonic() - second_ended
             assert closed, (
                 f"tunnel still up {closed_after:.1f}s after the second call"
@@ -293,10 +292,10 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
                 f"tunnel closed {closed_after:.1f}s after the second call"
                 f" ended -- short of its own {IDLE_LINGER:.0f}s window"
             )
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
         finally:
-            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)
     finally:
         rc, down_out, down_err = l2tp_peer_process.wait(down_thread, down_ctrl, 60.0)

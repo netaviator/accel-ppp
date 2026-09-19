@@ -1,6 +1,8 @@
 import pytest
 from common import process
 
+pytestmark = pytest.mark.xdist_group("fixed-port")
+
 
 @pytest.mark.l2tp_switch
 class TestTargetModePersistentExplicit:
@@ -191,10 +193,10 @@ class TestSelfLoopTarget:
 
     @pytest.fixture()
     def accel_pppd_config(self, l2tp_switch_config):
-        # Overrides the module-level fixture (Task 1) to add an explicit
+        # Overrides the module-level fixture to add an explicit
         # [l2tp] bind= -- without one, l2tp_conf_get_bind_addr() returns
         # INADDR_ANY, which validate_no_self_loop() deliberately treats as
-        # "skip the check" (Task 1 Step 1), so this test would otherwise
+        # "skip the check", so this test would otherwise
         # never actually exercise the rejection it's testing for.
         return (
             """
@@ -224,4 +226,123 @@ class TestSelfLoopTarget:
         )
 
     def test_self_loop_target_rejected(self, accel_pppd_instance):
+        assert accel_pppd_instance is False
+
+
+@pytest.mark.l2tp_switch
+class TestMalformedTargetRejected:
+    """Every one of these used to be accepted with the fields silently
+    shifted or truncated (strtok_r collapses empty fields, ignores extra
+    ones, and strtol() was never told to check for trailing junk) -- each
+    must instead be a fatal config-load error."""
+
+    @pytest.fixture(
+        params=[
+            "acme,203.0.113.50,1701,,persistent",  # empty secret
+            "acme,203.0.113.50,1701,targetsecret,persistent,extra",  # extra field
+            "acme,203.0.113.50,1701abc,targetsecret",  # junk after the port
+            "acme,203.0.113.50,,targetsecret",  # empty port
+            "ac/me,203.0.113.50,1701,targetsecret",  # name outside [A-Za-z0-9_.-]
+            "acme,203.0.113.50,1701,targetsecret,",  # trailing empty mode
+        ],
+        ids=["empty-secret", "extra-field", "port-junk", "empty-port", "bad-name", "empty-mode"],
+    )
+    def l2tp_switch_config(self, request):
+        return f"""
+    [l2tp-switch]
+    target={request.param}
+    """
+
+    def test_switch_target_malformed_rejected(self, accel_pppd_instance):
+        assert accel_pppd_instance is False
+
+
+@pytest.mark.l2tp_switch
+class TestTargetNameWithDotsDashesAccepted:
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    target=lns-1.example_a,203.0.113.50,1701,targetsecret
+    """
+
+    def test_switch_target_name_charset_accepted(self, accel_pppd_instance, accel_cmd):
+        assert accel_pppd_instance
+
+        (exit, out, err) = process.run([accel_cmd, "l2tp switch show"])
+
+        assert exit == 0
+        assert "lns-1.example_a -> 203.0.113.50:1701" in out
+
+
+@pytest.mark.l2tp_switch
+class TestMalformedMatchRejected:
+    @pytest.fixture(
+        params=[
+            "Calling-Number,exact,,acme",  # empty value
+            "Calling-Number,exact,472913,acme,extra",  # extra field
+            "Calling-Number,exact,472913",  # missing target
+        ],
+        ids=["empty-value", "extra-field", "missing-target"],
+    )
+    def l2tp_switch_config(self, request):
+        return f"""
+    [l2tp-switch]
+    target=acme,203.0.113.50,1701,targetsecret
+    match={request.param}
+    """
+
+    def test_switch_match_malformed_rejected(self, accel_pppd_instance):
+        assert accel_pppd_instance is False
+
+
+@pytest.mark.l2tp_switch
+class TestTimingOptionsAccepted:
+    @pytest.fixture()
+    def l2tp_switch_config(self):
+        return """
+    [l2tp-switch]
+    idle-linger=3
+    connect-timeout=7
+    target=acme,203.0.113.50,1701,targetsecret
+    """
+
+    def test_switch_timing_options_accepted(self, accel_pppd_instance, accel_cmd):
+        assert accel_pppd_instance
+
+        (exit, out, err) = process.run([accel_cmd, "l2tp switch show"])
+
+        assert exit == 0
+        assert "acme -> 203.0.113.50:1701" in out
+
+
+@pytest.mark.l2tp_switch
+class TestTimingOptionsInvalidRejected:
+    """Not a whole number of seconds in 1..3600 -- a fatal config-load
+    error, like a malformed target=, not a silent fall-back to the default."""
+
+    @pytest.fixture(
+        params=[
+            "idle-linger=0",
+            "idle-linger=-5",
+            "idle-linger=abc",
+            "idle-linger=2.5",
+            "idle-linger=3601",
+            "idle-linger=",
+            "connect-timeout=0",
+            "connect-timeout=10s",
+        ],
+        ids=[
+            "linger-zero", "linger-negative", "linger-text", "linger-fraction",
+            "linger-too-big", "linger-empty", "connect-zero", "connect-suffix",
+        ],
+    )
+    def l2tp_switch_config(self, request):
+        return f"""
+    [l2tp-switch]
+    {request.param}
+    target=acme,203.0.113.50,1701,targetsecret
+    """
+
+    def test_switch_timing_invalid_rejected(self, accel_pppd_instance):
         assert accel_pppd_instance is False

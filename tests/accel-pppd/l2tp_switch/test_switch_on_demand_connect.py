@@ -23,49 +23,40 @@ import time
 
 import pytest
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import start_instance, wait_for_tunnels_active
+from helpers import (
+    alloc_ports,
+    finish_harness,
+    start_instance,
+    switch_show,
+    wait_for,
+    wait_for_tunnels_active,
+)
 
-PEER_BIN = "/tmp/l2tp_switch_peer_test"
-
-# The daemon's own L2TP_SWITCH_ON_DEMAND_CONNECT_TIMEOUT_MS, in seconds.
+# The connect-timeout= (seconds) written into the tests whose timing is tied
+# to the fixed 5s reconnect cadence or to a slow SCCRP; equals the daemon
+# default.
 CONNECT_TIMEOUT = 10.0
 
-# The daemon's own L2TP_SWITCH_ON_DEMAND_IDLE_LINGER_MS, in seconds.
-IDLE_LINGER = 20.0
+# A shorter connect-timeout= for the test where the budget merely bounds the
+# wait. Kept above the 5s reconnect cadence so a retry still lands inside it.
+SHORT_CONNECT_TIMEOUT = 6.0
+
+# The idle-linger= (seconds) written into the tests that wait for a tunnel to
+# close by itself (daemon default: 20).
+IDLE_LINGER = 4.0
 
 
-def _switch_show(accel_cmd, cli_port=2001):
-    (exit_code, out, err) = process.run([accel_cmd, "-p", str(cli_port), "l2tp switch show"])
-    assert exit_code == 0, f"l2tp switch show failed: {err}"
-    return out
-
-
-def _wait_for(accel_cmd, needle, timeout, cli_port=2001):
+def _wait_for_show(accel_cmd, needle, timeout, cli_port):
     """Poll `l2tp switch show` until `needle` appears. Returns (found, elapsed, out)."""
     started = time.monotonic()
-    out = ""
-    while time.monotonic() - started < timeout:
-        out = _switch_show(accel_cmd, cli_port)
-        if needle in out:
-            return True, time.monotonic() - started, out
-        time.sleep(0.1)
-    return False, time.monotonic() - started, out
+    out = [""]
 
+    def seen():
+        out[0] = switch_show(accel_cmd, cli_port)
+        return needle in out[0]
 
-def _finish(thread, ctrl, timeout):
-    """Join a harness process, killing it if it outlives `timeout`.
-
-    The --listen harness blocks forever waiting for an SCCRQ that a broken
-    on-demand implementation never sends; left alone it would keep its bound
-    UDP port and poison every later test in the same run.
-    """
-    rc, out, err = l2tp_peer_process.wait(thread, ctrl, timeout)
-    if rc is None:
-        ctrl["process"].kill()
-        thread.join(5.0)
-        rc = ctrl["process"].returncode
-        out, err = ctrl["out"], ctrl["err"]
-    return rc, out, err
+    found = bool(wait_for(seen, timeout))
+    return found, time.monotonic() - started, out[0]
 
 
 def _events(out):
@@ -85,12 +76,13 @@ def _timestamps(out):
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_cmd, accel_pppd):
+def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_cmd, accel_pppd, peer_bin):
     # A real downstream LNS that is up and reachable the whole time: the
     # only reason the target's tunnel isn't connected is the target's own
     # on-demand mode, not the peer being unavailable.
+    d_cli, d_port, s_cli, s_port = alloc_ports(4)
     d_started, d_thread, d_ctrl, d_cfg = start_instance(
-        accel_pppd, accel_cmd, 2101, "127.0.0.1", 17100, "downstreamsecret"
+        accel_pppd, accel_cmd, d_cli, "127.0.0.1", d_port, "downstreamsecret"
     )
     assert d_started
 
@@ -98,13 +90,13 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
         s_started, s_thread, s_ctrl, s_cfg = start_instance(
             accel_pppd,
             accel_cmd,
-            2001,
+            s_cli,
             "127.0.0.1",
-            17101,
+            s_port,
             "upstreamsecret",
-            extra="""
+            extra=f"""
     [l2tp-switch]
-    target=downstream,127.0.0.1,17100,downstreamsecret,on-demand
+    target=downstream,127.0.0.1,{d_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,downstream
     """,
         )
@@ -115,16 +107,16 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
             # windows: an eagerly-connecting target would be [up] well
             # within this.
             time.sleep(6.0)
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, s_cli)
             assert "[idle]" in out, f"on-demand target connected with no call:\n{out}"
             assert "placed: 0" in out, out
 
             # Now give it a reason to connect.
             peer_thread, peer_ctrl = l2tp_peer_process.start(
-                PEER_BIN,
+                peer_bin,
                 [
                     "--peer-addr", "127.0.0.1",
-                    "--peer-port", "17101",
+                    "--peer-port", str(s_port),
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     # Keep the upstream tunnel's socket open while the
@@ -135,55 +127,57 @@ def test_on_demand_target_stays_down_until_a_call_needs_it(pytestconfig, accel_c
                 ],
             )
 
-            up, up_after, out = _wait_for(accel_cmd, "[up]", 8.0)
+            up, up_after, out = _wait_for_show(accel_cmd, "[up]", 8.0, s_cli)
             assert up, f"on-demand target never connected after a call arrived:\n{out}"
-            placed, placed_after, out = _wait_for(accel_cmd, "placed: 1", 8.0)
+            placed, placed_after, out = _wait_for_show(accel_cmd, "placed: 1", 8.0, s_cli)
             assert placed, f"queued call was never placed downstream:\n{out}"
 
-            rc, harness_out, err = _finish(peer_thread, peer_ctrl, 20.0)
+            rc, harness_out, err = finish_harness(peer_thread, peer_ctrl, 20.0)
             assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{harness_out}"
 
             # The connect is triggered by the call, so it must complete
             # promptly once one arrives -- not on some later reconnect tick.
             assert up_after < 5.0, f"target took {up_after:.1f}s to connect after a call"
         finally:
-            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
             config.delete_tmp(s_cfg)
     finally:
-        accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=2101)
+        accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=d_cli)
         config.delete_tmp(d_cfg)
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cmd, accel_pppd):
+def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cmd, accel_pppd, peer_bin):
     # A deliberately slow downstream: --listen answers the switch's outbound
     # SCCRQ only after --sccrp-delay-ms, holding the on-demand connect in
     # mid-negotiation for a known window. The call that triggered the
     # connect has nowhere to go for that whole window -- it must wait for
     # it, not be rejected.
     sccrp_delay = 3.0
+    s_cli, s_port, down_port = alloc_ports(3)
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2001,
+        s_cli,
         "127.0.0.1",
-        17103,
+        s_port,
         "upstreamsecret",
-        extra="""
+        extra=f"""
     [l2tp-switch]
-    target=slow,127.0.0.1,17102,downstreamsecret,on-demand
+    target=slow,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,slow
+    connect-timeout=10
     """,
     )
     assert s_started
 
     try:
         down_thread, down_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--listen",
-                "--peer-port", "17102",
+                "--peer-port", str(down_port),
                 "--secret", "downstreamsecret",
                 "--sccrp-delay-ms", str(int(sccrp_delay * 1000)),
                 "--rounds", "1",
@@ -192,10 +186,10 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
 
         try:
             peer_thread, peer_ctrl = l2tp_peer_process.start(
-                PEER_BIN,
+                peer_bin,
                 [
                     "--peer-addr", "127.0.0.1",
-                    "--peer-port", "17103",
+                    "--peer-port", str(s_port),
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     # Outlives the stalled connect, so the queued call is
@@ -209,13 +203,13 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
             # downstream yet -- and, crucially, it has not been given up on
             # either (that is what the later "placed: 1" proves).
             time.sleep(sccrp_delay / 2)
-            out = _switch_show(accel_cmd)
+            out = switch_show(accel_cmd, s_cli)
             assert "placed: 0" in out, (
                 "call was placed (or dropped) before the target's tunnel"
                 f" finished connecting:\n{out}"
             )
 
-            placed, _, out = _wait_for(accel_cmd, "placed: 1", 8.0)
+            placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 8.0, s_cli)
             placed_after = time.monotonic() - call_started
             assert placed, (
                 "queued call was never placed once the slow tunnel came up"
@@ -227,10 +221,10 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
                 " elapsed -- the queue is not what held it"
             )
 
-            rc, harness_out, err = _finish(peer_thread, peer_ctrl, 25.0)
+            rc, harness_out, err = finish_harness(peer_thread, peer_ctrl, 25.0)
             assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{harness_out}"
         finally:
-            rc, down_out, down_err = _finish(down_thread, down_ctrl, 20.0)
+            rc, down_out, down_err = finish_harness(down_thread, down_ctrl, 20.0)
 
         events = _events(down_out)
         assert 0 in events.get("recv_sccrq", {}), (
@@ -247,47 +241,49 @@ def test_on_demand_call_queues_while_tunnel_is_connecting(pytestconfig, accel_cm
             f" {sccrp_delay:.1f}s -- the connect was never actually slow"
         )
     finally:
-        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
         config.delete_tmp(s_cfg)
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, accel_pppd):
-    # Nothing is listening on 17104, so the on-demand connect can never
+def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+    # Nothing is listening on dead_port, so the on-demand connect can never
     # succeed. The call must not hang forever waiting for it, and must not
     # be failed instantly either -- a transiently-unreachable target is
     # exactly what the queue-and-wait behaviour exists for.
+    s_cli, s_port, dead_port = alloc_ports(3)
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2001,
+        s_cli,
         "127.0.0.1",
-        17105,
+        s_port,
         "upstreamsecret",
-        extra="""
+        extra=f"""
     [l2tp-switch]
-    target=dead,127.0.0.1,17104,downstreamsecret,on-demand
+    target=dead,127.0.0.1,{dead_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,dead
+    connect-timeout=6
     """,
     )
     assert s_started
 
     try:
         peer_thread, peer_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--peer-addr", "127.0.0.1",
-                "--peer-port", "17105",
+                "--peer-port", str(s_port),
                 "--secret", "upstreamsecret",
                 "--calling-number", "472913",
                 "--wait-cdn",
-                # Comfortably past the daemon's own 10s budget: the point
+                # Comfortably past the configured 6s budget: the point
                 # is to observe *when* the CDN arrives, not to cap it.
                 "--cdn-timeout", "25",
             ],
         )
 
-        rc, out, err = _finish(peer_thread, peer_ctrl, 40.0)
+        rc, out, err = finish_harness(peer_thread, peer_ctrl, 40.0)
         assert rc == 0, (
             "call against an unreachable on-demand target was never"
             f" disconnected (rc={rc}): {err}\n{out}"
@@ -299,39 +295,39 @@ def test_on_demand_call_cdns_after_connect_timeout(pytestconfig, accel_cmd, acce
 
         # Not instant: today's pre-feature behaviour (fail as soon as
         # target->tunnel is NULL) would land here in milliseconds.
-        assert waited > CONNECT_TIMEOUT * 0.7, (
+        assert waited > SHORT_CONNECT_TIMEOUT * 0.7, (
             f"call was disconnected after only {waited:.1f}s -- it was never"
-            f" given the {CONNECT_TIMEOUT:.0f}s connect budget"
+            f" given the {SHORT_CONNECT_TIMEOUT:.0f}s connect budget"
         )
         # ...and bounded: the timer fires once, and the retry cadence does
         # not get to extend it indefinitely.
         # Tight on purpose: the timer is periodic, so a budget that is armed
         # but never re-armed to the current deadline fires at the *previous*
         # deadline, no-ops, and only gives up a whole period later. Anything
-        # past ~12.5s means the deadline and the timer have drifted apart.
-        assert waited < CONNECT_TIMEOUT + 2.5, (
+        # past ~8.5s means the deadline and the timer have drifted apart.
+        assert waited < SHORT_CONNECT_TIMEOUT + 2.5, (
             f"call hung for {waited:.1f}s before being disconnected --"
-            f" the {CONNECT_TIMEOUT:.0f}s connect timeout is not bounding it"
+            f" the {SHORT_CONNECT_TIMEOUT:.0f}s connect timeout is not bounding it"
         )
 
         # ...and the target itself is back at rest afterwards: no
         # half-open tunnel lingering from the abandoned connect, and no
         # reconnect cadence still running with nothing left to serve.
-        at_rest, _, out = _wait_for(accel_cmd, "[idle]", 20.0)
+        at_rest, _, out = _wait_for_show(accel_cmd, "[idle]", 20.0, s_cli)
         assert at_rest, f"target left with a lingering tunnel:\n{out}"
 
         time.sleep(6.0)  # longer than the 5s reconnect cadence
-        out = _switch_show(accel_cmd)
+        out = switch_show(accel_cmd, s_cli)
         assert "[idle]" in out, (
             f"target kept retrying with no call left to serve:\n{out}"
         )
     finally:
-        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
         config.delete_tmp(s_cfg)
 
 
 @pytest.mark.l2tp_switch
-def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel_cmd, accel_pppd):
+def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel_cmd, accel_pppd, peer_bin):
     # A target that connects, is used, and loses its tunnel again leaves the
     # connect-timeout timer behind: it is armed on the default context, and
     # the drain that closed the first budget deliberately does not cancel it
@@ -345,18 +341,20 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     # own --hold-seconds included) plus this still lands comfortably inside
     # the first budget's 10s, which is what leaves its timer armed.
     gap = 2.0
+    s_cli, s_port, down_port = alloc_ports(3)
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2001,
+        s_cli,
         "127.0.0.1",
-        17107,
+        s_port,
         "upstreamsecret",
-        extra="""
+        extra=f"""
     [l2tp-switch]
-    target=flaky,127.0.0.1,17106,downstreamsecret,on-demand
+    target=flaky,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,flaky
+    connect-timeout=10
     """,
     )
     assert s_started
@@ -387,10 +385,10 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         #   StopCCN above saw to that), so holding costs nothing but the
         #   wait.
         down_thread, down_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--listen",
-                "--peer-port", "17106",
+                "--peer-port", str(down_port),
                 "--secret", "downstreamsecret",
                 "--rounds", "1",
                 "--send-stopccn",
@@ -399,35 +397,35 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
         )
 
         first_thread, first_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--peer-addr", "127.0.0.1",
-                "--peer-port", "17107",
+                "--peer-port", str(s_port),
                 "--secret", "upstreamsecret",
                 "--calling-number", "472913",
             ],
         )
-        _finish(first_thread, first_ctrl, 20.0)
-        _finish(down_thread, down_ctrl, 20.0)
+        finish_harness(first_thread, first_ctrl, 20.0)
+        finish_harness(down_thread, down_ctrl, 20.0)
 
-        placed, _, out = _wait_for(accel_cmd, "placed: 1", 10.0)
+        placed, _, out = _wait_for_show(accel_cmd, "placed: 1", 10.0, s_cli)
         assert placed, f"first call was never placed:\n{out}"
 
         # Well inside the first budget's 10s, so its timer is still armed.
         time.sleep(gap)
 
         second_thread, second_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--peer-addr", "127.0.0.1",
-                "--peer-port", "17107",
+                "--peer-port", str(s_port),
                 "--secret", "upstreamsecret",
                 "--calling-number", "472913",
                 "--wait-cdn",
                 "--cdn-timeout", "25",
             ],
         )
-        rc, out, err = _finish(second_thread, second_ctrl, 40.0)
+        rc, out, err = finish_harness(second_thread, second_ctrl, 40.0)
         assert rc == 0, f"second call was never disconnected (rc={rc}): {err}\n{out}"
 
         stamps = _timestamps(out)
@@ -451,7 +449,7 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
             " its budget's timer is not armed to its own deadline"
         )
     finally:
-        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
         config.delete_tmp(s_cfg)
 
 
@@ -468,7 +466,7 @@ def test_on_demand_second_call_gets_a_full_budget_of_its_own(pytestconfig, accel
     " architectures, where the timing this test relies on actually holds.",
 )
 def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
-    pytestconfig, accel_cmd, accel_pppd
+    pytestconfig, accel_cmd, accel_pppd, peer_bin
 ):
     """A tunnel that establishes in the same instant its budget expires must
     still end up with something that will close it.
@@ -507,18 +505,21 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
     """
     sccrp_delay = 9.9
     storm = 0.4
+    s_cli, s_port, down_port = alloc_ports(3)
 
     s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2001,
+        s_cli,
         "127.0.0.1",
-        17111,
+        s_port,
         "upstreamsecret",
-        extra="""
+        extra=f"""
     [l2tp-switch]
-    target=racy,127.0.0.1,17110,downstreamsecret,on-demand
+    target=racy,127.0.0.1,{down_port},downstreamsecret,on-demand
     match=Calling-Number,exact,472913,racy
+    connect-timeout=10
+    idle-linger=4
     """,
     )
     assert s_started
@@ -529,10 +530,10 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
         # switch would notice the peer was gone, which is not what this
         # test is about.
         down_thread, down_ctrl = l2tp_peer_process.start(
-            PEER_BIN,
+            peer_bin,
             [
                 "--listen",
-                "--peer-port", "17110",
+                "--peer-port", str(down_port),
                 "--secret", "downstreamsecret",
                 "--sccrp-delay-ms", str(int(sccrp_delay * 1000)),
                 "--sccrp-storm-ms", str(int(storm * 1000)),
@@ -543,17 +544,17 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
 
         try:
             peer_thread, peer_ctrl = l2tp_peer_process.start(
-                PEER_BIN,
+                peer_bin,
                 [
                     "--peer-addr", "127.0.0.1",
-                    "--peer-port", "17111",
+                    "--peer-port", str(s_port),
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     "--wait-cdn",
                     "--cdn-timeout", "25",
                 ],
             )
-            rc, out, err = _finish(peer_thread, peer_ctrl, 40.0)
+            rc, out, err = finish_harness(peer_thread, peer_ctrl, 40.0)
             assert rc == 0, (
                 f"call against the slow target was never disconnected (rc={rc}):"
                 f" {err}\n{out}"
@@ -579,7 +580,7 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
             # abort tore down is gone in milliseconds; a tunnel that was
             # re-claimed closes itself one idle linger later.
             settled, after, count = wait_for_tunnels_active(
-                accel_cmd, 0, IDLE_LINGER + 12.0
+                accel_cmd, 0, IDLE_LINGER + 12.0, cli_port=s_cli
             )
             assert settled, (
                 f"{count} l2tp tunnel(s) still active {after:.0f}s after the"
@@ -592,7 +593,7 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
             # exited on the switch's StopCCN by now, and on a run where the
             # tunnel never came up it is stuck waiting for an SCCCN that will
             # never arrive, with nothing left to wait for it to say.
-            rc, down_out, down_err = _finish(down_thread, down_ctrl, 5.0)
+            rc, down_out, down_err = finish_harness(down_thread, down_ctrl, 5.0)
 
         events = _events(down_out)
         if 0 in events.get("established", {}):
@@ -611,5 +612,5 @@ def test_on_demand_tunnel_that_beats_the_deadline_is_never_orphaned(
                 " establish-vs-abort ordering"
             )
     finally:
-        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=s_cli)
         config.delete_tmp(s_cfg)

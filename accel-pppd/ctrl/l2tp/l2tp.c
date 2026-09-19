@@ -4350,6 +4350,7 @@ struct l2tp_switch_link_t {
 #define L2TP_SWITCH_EAGAIN_MAX_WAITS 50 /* 5s of a full destination send path */
 
 static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link);
+static void l2tp_switch_link_peer_gone(struct l2tp_switch_link_t *link);
 
 /* l2tp-switch: live-PAP injection watcher for a switched call's downstream
  * leg (see docs/l2tp_switching.md). A switched call never runs a local PPP
@@ -4389,11 +4390,6 @@ static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link);
  * via triton_context_call() when observed from the upstream side
  * (from_upstream=1). */
 
-#define L2TP_SWITCH_PAP_TIMEOUT_MS 3000 /* strictly less than the ~5s a real
-	downstream LNS has been observed to wait for PAP before giving up on
-	its own -- so our own timeout produces an attributable log line
-	instead of racing its CDN */
-
 struct l2tp_switch_pap_watcher_t {
 	pthread_mutex_t lock;
 	struct l2tp_sess_t *downstream; /* owning session; also gives us
@@ -4405,6 +4401,14 @@ struct l2tp_switch_pap_watcher_t {
 	unsigned int seen_confack_from_upstream:1;
 	unsigned int seen_confack_from_downstream:1;
 	unsigned int request_sent:1;
+	unsigned int logged_conf_req:1; /* the target's first LCP Configure-Request
+		has been logged (see l2tp_switch_pap_log_lcp()) */
+	unsigned int acked_auth_unknown:1; /* the last upstream Configure-Ack was
+		longer than the bytes inspected and showed no auth option */
+	uint16_t acked_auth; /* authentication protocol (PPP protocol number) in
+		the target's Configure-Request as acknowledged by the upstream
+		peer -- i.e. what the target actually asked its peer to
+		authenticate with; 0 if it asked for none */
 	int resolved; /* success, failure, or freed -- observe() becomes a
 			 * no-op once set. Written under ->lock but also read
 			 * lock-free by l2tp_switch_link_read()'s fast path, so
@@ -4455,7 +4459,12 @@ struct l2tp_switch_lcp_hdr {
 
 #define L2TP_SWITCH_PPP_LCP 0xc021
 #define L2TP_SWITCH_PPP_PAP 0xc023
+#define L2TP_SWITCH_PPP_CHAP 0xc223
+#define L2TP_SWITCH_LCP_CONFREQ 1
 #define L2TP_SWITCH_LCP_CONFACK 2
+#define L2TP_SWITCH_LCP_TERMREQ 5
+#define L2TP_SWITCH_LCP_PROTREJ 8
+#define L2TP_SWITCH_LCP_OPT_AUTH 3 /* Authentication-Protocol */
 
 static void l2tp_switch_pap_timeout(struct triton_timer_t *t);
 
@@ -4714,7 +4723,7 @@ static void l2tp_switch_pap_send_request(void *data)
 		    "l2tp-switch: injected live PAP request on downstream leg\n");
 
 	w->timeout_timer.expire = l2tp_switch_pap_timeout;
-	w->timeout_timer.period = L2TP_SWITCH_PAP_TIMEOUT_MS;
+	w->timeout_timer.period = l2tp_switch_conf_pap_timeout_ms();
 	if (triton_timer_add(&downstream->paren_conn->ctx, &w->timeout_timer, 0) < 0)
 		log_session(log_warn, downstream,
 			    "l2tp-switch: failed to arm live PAP reply timeout"
@@ -4725,7 +4734,7 @@ out:
 		before reaching this function -- see the doc comment above */
 }
 
-/* Fires L2TP_SWITCH_PAP_TIMEOUT_MS after the injected request went out with
+/* Fires pap-timeout after the injected request went out with
  * no Ack/Nak seen. Timer is only ever armed on downstream->paren_conn->ctx,
  * so this always runs there too. */
 static void l2tp_switch_pap_timeout(struct triton_timer_t *t)
@@ -4747,8 +4756,101 @@ static void l2tp_switch_pap_timeout(struct triton_timer_t *t)
 	log_session(log_error, w->downstream,
 		    "l2tp-switch: downstream never answered our injected live"
 		    " PAP request within %ims, disconnecting call\n",
-		    L2TP_SWITCH_PAP_TIMEOUT_MS);
+		    l2tp_switch_conf_pap_timeout_ms());
 	l2tp_session_disconnect_push(w->downstream, 2, 6);
+}
+
+/* Finds the Authentication-Protocol option (RFC 1661 6.x, type 3) in an LCP
+ * Configure-Request or Configure-Ack held in `buf` (the peek copy: possibly
+ * only the first bytes of the frame). Returns 1 and sets *proto (PPP protocol
+ * number, e.g. 0xc023 PAP, 0xc223 CHAP) and *algo (CHAP algorithm byte, else
+ * 0) if found. Returns 0 if not, with *truncated set when the frame was longer
+ * than the bytes held, i.e. the option may simply not have been seen. */
+static int l2tp_switch_lcp_find_auth(const uint8_t *buf, size_t len,
+				     uint16_t *proto, uint8_t *algo,
+				     int *truncated)
+{
+	const struct l2tp_switch_lcp_hdr *lcp = (const struct l2tp_switch_lcp_hdr *)buf;
+	size_t end = sizeof(lcp->proto) + ntohs(lcp->len);
+	size_t o = sizeof(*lcp);
+
+	*truncated = end > len;
+	if (*truncated)
+		end = len;
+
+	while (o + 2 <= end) {
+		size_t olen = buf[o + 1];
+
+		if (olen < 2 || o + olen > end)
+			break;
+		if (buf[o] == L2TP_SWITCH_LCP_OPT_AUTH && olen >= 4) {
+			*proto = (buf[o + 2] << 8) | buf[o + 3];
+			*algo = olen > 4 ? buf[o + 4] : 0;
+			return 1;
+		}
+		o += olen;
+	}
+
+	return 0;
+}
+
+/* Logs what the DOWNSTREAM target's own LCP traffic says about authentication,
+ * which is what decides whether an injected PAP request can be answered at
+ * all: its first Configure-Request (does it ask for an authentication
+ * protocol, and which?), and any Protocol-Reject or Terminate-Request. Only
+ * called for frames fed by the downstream leg, on its own context. `buf`
+ * holds at most the first bytes of the frame (the peek copy). */
+static void l2tp_switch_pap_log_lcp(struct l2tp_switch_pap_watcher_t *w,
+				    const uint8_t *buf, size_t len)
+{
+	const struct l2tp_switch_lcp_hdr *lcp = (const struct l2tp_switch_lcp_hdr *)buf;
+	size_t end = sizeof(lcp->proto) + ntohs(lcp->len);
+	size_t o = sizeof(*lcp);
+	uint16_t proto;
+	uint8_t algo;
+	int truncated;
+
+	if (end > len)
+		end = len;
+
+	switch (lcp->code) {
+	case L2TP_SWITCH_LCP_CONFREQ:
+		if (l2tp_switch_lcp_find_auth(buf, len, &proto, &algo, &truncated)) {
+			if (proto == L2TP_SWITCH_PPP_PAP)
+				log_session(log_info1, w->downstream,
+					    "l2tp-switch: downstream LCP"
+					    " Configure-Request asks for PAP\n");
+			else if (proto == L2TP_SWITCH_PPP_CHAP)
+				log_session(log_info1, w->downstream,
+					    "l2tp-switch: downstream LCP"
+					    " Configure-Request asks for CHAP"
+					    " (algorithm 0x%02x)\n", algo);
+			else
+				log_session(log_info1, w->downstream,
+					    "l2tp-switch: downstream LCP"
+					    " Configure-Request asks for"
+					    " authentication protocol 0x%04x\n",
+					    proto);
+			break;
+		}
+		log_session(log_info1, w->downstream,
+			    "l2tp-switch: downstream LCP Configure-Request has"
+			    " no authentication-protocol option%s\n",
+			    truncated ? " in the bytes inspected" : "");
+		break;
+	case L2TP_SWITCH_LCP_PROTREJ:
+		if (o + 2 <= end)
+			log_session(log_warn, w->downstream,
+				    "l2tp-switch: downstream rejected PPP"
+				    " protocol 0x%04x (LCP Protocol-Reject)\n",
+				    (buf[o] << 8) | buf[o + 1]);
+		break;
+	case L2TP_SWITCH_LCP_TERMREQ:
+		log_session(log_warn, w->downstream,
+			    "l2tp-switch: downstream sent an LCP"
+			    " Terminate-Request\n");
+		break;
+	}
 }
 
 /* Called from l2tp_switch_link_read() with a tee()'d, read-only peek copy of
@@ -4762,6 +4864,9 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 	int trigger_send = 0;
 	int resolved_now = 0;
 	int is_nak = 0;
+	int log_lcp = 0;
+	int skip_injection = 0;
+	uint16_t skip_auth = 0;
 
 	if (len < 4)
 		return; /* shorter than any control-frame header we care about */
@@ -4772,19 +4877,67 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 		return;
 	}
 
+	if (!from_upstream && len >= sizeof(struct l2tp_switch_lcp_hdr)) {
+		const struct l2tp_switch_lcp_hdr *d = (const struct l2tp_switch_lcp_hdr *)buf;
+
+		if (d->proto == htons(L2TP_SWITCH_PPP_LCP)) {
+			if (d->code == L2TP_SWITCH_LCP_CONFREQ) {
+				if (!w->logged_conf_req) {
+					w->logged_conf_req = 1;
+					log_lcp = 1;
+				}
+			} else if (d->code == L2TP_SWITCH_LCP_PROTREJ ||
+				   d->code == L2TP_SWITCH_LCP_TERMREQ) {
+				log_lcp = 1;
+			}
+		}
+	}
+
 	if (!w->request_sent) {
 		const struct l2tp_switch_lcp_hdr *lcp = (const struct l2tp_switch_lcp_hdr *)buf;
 
 		if (lcp->proto == htons(L2TP_SWITCH_PPP_LCP) &&
 		    lcp->code == L2TP_SWITCH_LCP_CONFACK) {
-			if (from_upstream)
+			if (from_upstream) {
+				/* The upstream peer acknowledging the target's
+				 * Configure-Request echoes its options exactly,
+				 * so this is what the target asked to
+				 * authenticate its peer with. */
+				uint16_t proto;
+				uint8_t algo;
+				int truncated;
+
+				if (l2tp_switch_lcp_find_auth(buf, len, &proto,
+							      &algo, &truncated)) {
+					w->acked_auth = proto;
+					w->acked_auth_unknown = 0;
+				} else {
+					w->acked_auth = 0;
+					w->acked_auth_unknown = truncated;
+				}
 				w->seen_confack_from_upstream = 1;
-			else
+			} else {
 				w->seen_confack_from_downstream = 1;
+			}
 
 			if (w->seen_confack_from_upstream && w->seen_confack_from_downstream) {
 				w->request_sent = 1;
-				trigger_send = 1;
+				if (w->acked_auth == L2TP_SWITCH_PPP_PAP ||
+				    w->acked_auth_unknown) {
+					trigger_send = 1;
+				} else {
+					/* The target does not authenticate with
+					 * PAP (CHAP, EAP, or nothing at all): an
+					 * injected PAP request would never be
+					 * answered, and the timeout would kill a
+					 * call that authenticates fine on its own
+					 * -- the upstream peer answers the
+					 * target's own challenge live. Leave the
+					 * call alone. */
+					__atomic_store_n(&w->resolved, 1, __ATOMIC_RELAXED);
+					skip_injection = 1;
+					skip_auth = w->acked_auth;
+				}
 			}
 		}
 	} else if (!from_upstream) {
@@ -4806,6 +4959,23 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 		}
 	}
 	pthread_mutex_unlock(&w->lock);
+
+	if (log_lcp)
+		l2tp_switch_pap_log_lcp(w, buf, len);
+
+	if (skip_injection) {
+		if (skip_auth)
+			log_session(log_info1, w->downstream,
+				    "l2tp-switch: downstream authenticates with"
+				    " protocol 0x%04x, not PAP -- no PAP request"
+				    " injected, authentication is left to the"
+				    " upstream peer\n", skip_auth);
+		else
+			log_session(log_info1, w->downstream,
+				    "l2tp-switch: downstream does not ask for"
+				    " authentication -- no PAP request"
+				    " injected\n");
+	}
 
 	if (trigger_send) {
 		/* One hold per call to l2tp_switch_pap_send_request(), taken
@@ -4894,8 +5064,9 @@ static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link)
 {
 	struct l2tp_switch_pap_watcher_t *w =
 		l2tp_switch_pap_watcher_get(link->downstream_sess);
-	uint8_t peek[16]; /* only the first few bytes of one control frame's
-			     header ever matter */
+	uint8_t peek[64]; /* enough for an LCP Configure-Request's common
+			     options (l2tp_switch_pap_log_lcp()); the watcher
+			     itself only needs the first 6 bytes */
 	ssize_t teed, got;
 
 	if (!w)
@@ -4916,11 +5087,10 @@ static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link)
 
 /* Waits up to `timeout_ms` for the destination leg's socket to become
  * writable. Returns poll()'s result. */
-static int l2tp_switch_link_wait_writable(struct l2tp_switch_link_t *link,
-					  int timeout_ms)
+static int l2tp_switch_link_wait_writable(int fd, int timeout_ms)
 {
 	struct pollfd pfd = {
-		.fd = link->dst->ppp.fd,
+		.fd = fd,
 		.events = POLLOUT,
 	};
 
@@ -4936,8 +5106,17 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 	int eagain_waits = 0;
 
 	while (n > 0) {
-		ssize_t w = splice(link->pipe_rd, NULL, link->dst->ppp.fd, NULL,
-				   n, SPLICE_F_MOVE);
+		/* The destination leg tears down on the OTHER tunnel's context
+		 * and sets its fd to -1 (l2tp_switch_link_free()) without
+		 * synchronizing with this one: read it once per lap, and treat
+		 * "gone" as the peer closing rather than as a splice failure. */
+		int dst_fd = __atomic_load_n(&link->dst->ppp.fd, __ATOMIC_RELAXED);
+		ssize_t w;
+
+		if (dst_fd < 0)
+			goto peer_gone;
+
+		w = splice(link->pipe_rd, NULL, dst_fd, NULL, n, SPLICE_F_MOVE);
 
 		if (w >= 0) {
 			enomem_retries = 0;
@@ -4957,7 +5136,7 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 			 * indefinitely full destination would stall every
 			 * other session and the control channel (HELLOs, acks)
 			 * of that tunnel with it. */
-			int pres = l2tp_switch_link_wait_writable(link,
+			int pres = l2tp_switch_link_wait_writable(dst_fd,
 						L2TP_SWITCH_EAGAIN_POLL_MS);
 
 			if (pres < 0 && errno != EINTR) {
@@ -4989,9 +5168,14 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 			 * timeout instead of waiting indefinitely for an event
 			 * that may already be (mis)reported as ready. */
 			enomem_retries++;
-			l2tp_switch_link_wait_writable(link, 50);
+			l2tp_switch_link_wait_writable(dst_fd, 50);
 			continue;
 		}
+
+		if (errno == EBADF &&
+		    (__atomic_load_n(&link->dst->ppp.fd, __ATOMIC_RELAXED) < 0 ||
+		     link->dst->state1 == STATE_CLOSE))
+			goto peer_gone; /* closed between the read above and now */
 
 		log_session(log_error, link->src,
 			    "l2tp-switch: splice(out) failed: %s\n",
@@ -5000,6 +5184,10 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 	}
 
 	return 0;
+
+peer_gone:
+	l2tp_switch_link_peer_gone(link);
+	return -1;
 
 fail:
 	l2tp_switch_link_fail(link);
@@ -5075,7 +5263,7 @@ static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 		 * alone, __session_destroy() finds a stale fd number still
 		 * >= 0 and close()s it a second time, potentially closing
 		 * an unrelated fd some other thread opened in the meantime. */
-		link->src->ppp.fd = -1;
+		__atomic_store_n(&link->src->ppp.fd, -1, __ATOMIC_RELAXED);
 	}
 	close(link->pipe_rd);
 	close(link->pipe_wr);
@@ -5128,12 +5316,13 @@ static void l2tp_switch_teardown_peer(void *data)
 			     * context switch into here -- see the caller */
 }
 
-static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link)
+/* Tears down `link` and disconnects its source session. Shared by
+ * l2tp_switch_link_fail() (a real splice failure, logged as an error) and
+ * l2tp_switch_link_peer_gone() (the other leg is already going away). */
+static void l2tp_switch_link_teardown(struct l2tp_switch_link_t *link)
 {
 	struct l2tp_sess_t *src = link->src;
 
-	log_session(log_error, src, "l2tp-switch: splice failed,"
-		    " disconnecting session\n");
 	l2tp_switch_link_free(link); /* src->switch_link = NULL happens inside */
 	if (src->state1 != STATE_CLOSE)
 		/* _push(), not the plain disconnect: this callback runs in
@@ -5150,6 +5339,23 @@ static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link)
 		 * which is what actually tears down the peer (see that hook
 		 * for the other half of this). */
 		l2tp_session_disconnect_push(src, 2, 6);
+}
+
+static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link)
+{
+	log_session(log_error, link->src, "l2tp-switch: splice failed,"
+		    " disconnecting session\n");
+	l2tp_switch_link_teardown(link);
+}
+
+/* The destination leg is already closing (its socket is gone, or it is
+ * STATE_CLOSE): the call is ending anyway, so this is not an error -- but the
+ * source leg still has to be brought down with it. */
+static void l2tp_switch_link_peer_gone(struct l2tp_switch_link_t *link)
+{
+	log_session(log_info2, link->src, "l2tp-switch: the other leg of this"
+		    " call is already closing, disconnecting session\n");
+	l2tp_switch_link_teardown(link);
 }
 
 static int l2tp_switch_link_create(struct l2tp_sess_t *src,

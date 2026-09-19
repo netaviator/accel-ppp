@@ -28,6 +28,7 @@ def test_pap_reply_timeout_disconnects_call(pytestconfig, accel_cmd, accel_pppd,
         "upstreamsecret",
         extra=f"""
     [l2tp-switch]
+    pap-timeout=2
     target=mute,127.0.0.1,{down_l2tp},downstreamsecret,persistent
     match=Calling-Number,exact,472913,mute
     """,
@@ -35,7 +36,7 @@ def test_pap_reply_timeout_disconnects_call(pytestconfig, accel_cmd, accel_pppd,
     assert s_started
 
     try:
-        # --minimal-lcp without --expect-pap-*: real LCP, then the harness
+        # --minimal-lcp --lcp-auth pap without --expect-pap-*: real LCP, then the harness
         # drops its data socket and never answers PAP.
         down_thread, down_ctrl = l2tp_peer_process.start(
             peer_bin,
@@ -46,6 +47,7 @@ def test_pap_reply_timeout_disconnects_call(pytestconfig, accel_cmd, accel_pppd,
                 "--rounds", "1",
                 "--hold-seconds", "12",
                 "--minimal-lcp",
+                "--lcp-auth", "pap",
             ],
         )
         try:
@@ -73,6 +75,14 @@ def test_pap_reply_timeout_disconnects_call(pytestconfig, accel_cmd, accel_pppd,
                     break
                 time.sleep(0.2)
             assert "never answered our injected live PAP request" in log, log
+            # pap-timeout=2 is what bounded the wait, not the 3s default
+            assert "within 2000ms" in log, log
+            # The watcher logs what the target's own LCP said about
+            # authentication: what tells an operator why it injected.
+            assert "Configure-Request asks for PAP" in log, log
+            # Tearing the downstream leg down while the upstream leg is still
+            # splicing into it must not surface as a splice error.
+            assert "Bad file descriptor" not in log, log
 
             out = ""
 
@@ -90,6 +100,100 @@ def test_pap_reply_timeout_disconnects_call(pytestconfig, accel_cmd, accel_pppd,
     finally:
         accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
         config.delete_tmp(s_cfg)
+
+
+def _run_no_injection_case(accel_cmd, accel_pppd, peer_bin, down_extra, expect_log):
+    """Downstream target whose acked LCP Configure-Request does not ask for
+    PAP: the watcher must inject nothing, arm no timeout, and leave the call
+    alone -- it used to inject unconditionally and killed healthy CHAP calls.
+    """
+    switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
+    s_started, s_thread, s_ctrl, s_cfg = start_instance(
+        accel_pppd,
+        accel_cmd,
+        switch_cli,
+        "127.0.0.1",
+        switch_l2tp,
+        "upstreamsecret",
+        extra=f"""
+    [l2tp-switch]
+    pap-timeout=2
+    target=quiet,127.0.0.1,{down_l2tp},downstreamsecret,persistent
+    match=Calling-Number,exact,472913,quiet
+    """,
+    )
+    assert s_started
+
+    try:
+        down_thread, down_ctrl = l2tp_peer_process.start(
+            peer_bin,
+            [
+                "--listen",
+                "--peer-port", str(down_l2tp),
+                "--secret", "downstreamsecret",
+                "--rounds", "1",
+                "--hold-seconds", "10",
+                "--minimal-lcp",
+            ] + down_extra,
+        )
+        try:
+            assert "[up]" in wait_up(accel_cmd, switch_cli)
+
+            peer_thread, peer_ctrl = l2tp_peer_process.start(
+                peer_bin,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", str(switch_l2tp),
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "472913",
+                    "--proxy-username", "someone",
+                    "--proxy-password", "somepw",
+                    "--minimal-lcp",
+                    "--hold-seconds", "12",
+                ],
+            )
+            try:
+                deadline = time.monotonic() + 10.0
+                log = ""
+                while time.monotonic() < deadline:
+                    log = read_log(s_cfg)
+                    if expect_log in log:
+                        break
+                    time.sleep(0.2)
+                assert expect_log in log, log
+
+                # Outlast pap-timeout (2s) with margin: had a request been
+                # injected, the call would be torn down by now.
+                time.sleep(4.5)
+                log = read_log(s_cfg)
+                assert "injected live PAP request" not in log, log
+                assert "never answered our injected live PAP request" not in log, log
+                out = switch_show(accel_cmd, switch_cli)
+                assert "  active: 1" in out, out
+            finally:
+                finish_harness(peer_thread, peer_ctrl, 15.0)
+        finally:
+            finish_harness(down_thread, down_ctrl, 15.0)
+    finally:
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
+        config.delete_tmp(s_cfg)
+
+
+@pytest.mark.l2tp_switch
+def test_no_pap_injected_when_target_asks_for_chap(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+    """A target that negotiated CHAP must not get a PAP request injected,
+    and the call must survive."""
+    _run_no_injection_case(accel_cmd, accel_pppd, peer_bin,
+                           ["--lcp-auth", "chap"],
+                           "not PAP -- no PAP request injected")
+
+
+@pytest.mark.l2tp_switch
+def test_no_pap_injected_when_target_asks_for_no_auth(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+    """A target that asks for no authentication at all must not get a PAP
+    request injected, and the call must survive."""
+    _run_no_injection_case(accel_cmd, accel_pppd, peer_bin, [],
+                           "does not ask for authentication -- no PAP request injected")
 
 
 @pytest.mark.l2tp_switch

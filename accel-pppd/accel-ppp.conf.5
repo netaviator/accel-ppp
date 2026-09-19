@@ -1021,6 +1021,11 @@ attempt.
 Delay between connection attempts to a target whose tunnel failed to come
 up (or, for a persistent target, dropped). Whole seconds, 1-3600. Default: 5.
 .TP
+.BI "pap-timeout=" seconds
+How long the live-PAP watcher waits for the downstream target's Ack/Nak to
+the PAP request it injected before it disconnects the call. Whole seconds,
+1-3600. Default: 3.
+.TP
 .BI "match=" attr-name,mode,value,target-name
 Routes calls to one target based on the value of one L2TP AVP. Repeatable;
 several rules may point at the same target.

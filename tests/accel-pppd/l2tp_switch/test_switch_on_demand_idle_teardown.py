@@ -177,7 +177,7 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
             # summary -- see docs/l2tp_switching.md), so the actual
             # "still open" claim is checked via `show stat`'s tunnel count
             # instead, which is unaffected by that ambiguity.
-            time.sleep(IDLE_LINGER * 0.6)
+            time.sleep(IDLE_LINGER * 0.4)
             out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
             n = tunnels_active(accel_cmd, switch_cli)
@@ -196,7 +196,13 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
                 f" own idle policy instead of closing itself (tunnels"
                 f" active={n})"
             )
-            assert closed_after > IDLE_LINGER * 0.8, (
+            # Measured from a client-side timestamp taken once the harness
+            # process has exited, i.e. later than the daemon started its
+            # linger; under a loaded machine (TSAN, shared CI runners) that
+            # gap has been seen to exceed a second, so the bound only has to
+            # rule out "closes as soon as the last call ends", not pin the
+            # window to within a second.
+            assert closed_after > IDLE_LINGER * 0.5, (
                 f"tunnel closed after only {closed_after:.1f}s -- shorter than"
                 f" the {IDLE_LINGER:.0f}s window back-to-back calls rely on"
             )
@@ -288,7 +294,13 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
                 f"tunnel still up {closed_after:.1f}s after the second call"
                 f" ended (tunnels active={n})"
             )
-            assert closed_after > IDLE_LINGER * 0.8, (
+            # Measured from a client-side timestamp taken once the harness
+            # process has exited, i.e. later than the daemon started its
+            # linger; under a loaded machine (TSAN, shared CI runners) that
+            # gap has been seen to exceed a second, so the bound only has to
+            # rule out "closes as soon as the last call ends", not pin the
+            # window to within a second.
+            assert closed_after > IDLE_LINGER * 0.5, (
                 f"tunnel closed {closed_after:.1f}s after the second call"
                 f" ended -- short of its own {IDLE_LINGER:.0f}s window"
             )

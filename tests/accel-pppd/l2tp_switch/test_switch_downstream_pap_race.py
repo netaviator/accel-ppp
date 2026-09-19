@@ -94,6 +94,7 @@ def test_downstream_pap_watcher_survives_teardown_racing_its_own_injected_send(
             "--rounds", "1",
             "--hold-seconds", "10",
             "--minimal-lcp",
+            "--lcp-auth", "pap",
             "--cdn-after-lcp-ms", "50",
         ],
     )

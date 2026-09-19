@@ -21,6 +21,10 @@ jobs:
             sanitizer: "undefined"
             env_name: "UBSAN_OPTIONS"
             env_value: "print_stacktrace=1"
+          - distro: "ubuntu-latest"
+            sanitizer: "thread"
+            env_name: "TSAN_OPTIONS"
+            env_value: "halt_on_error=1:second_deadlock_stack=1:report_thread_leaks=0:suppressions=${{ github.workspace }}/tests/tsan.supp"
 
     runs-on: ${{ matrix.distro }}
     steps:
@@ -86,7 +90,7 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || echo ::warning::l2tp_ppp_module_unavailable_the_l2tp_switch_tests_will_fail) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq

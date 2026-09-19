@@ -31,7 +31,7 @@ def _build_peer_test(sanitize, out_path):
         str(_PEER_TEST_SRC_DIR),
         "-o",
         str(out_path),
-        str(_PEER_TEST_SRC_DIR / "l2tp_switch_peer_test.c"),
+        *sorted(str(p) for p in _PEER_TEST_SRC_DIR.glob("l2tp_switch_peer_*.c")),
         str(_PEER_TEST_SRC_DIR / "packet.c"),
         "-lcrypto",
     ]

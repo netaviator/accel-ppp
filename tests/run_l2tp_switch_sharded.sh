@@ -8,6 +8,9 @@
 # test requirements present (e.g. `docker commit` of a working build
 # container). Every container has its own network namespace, so the shards
 # never compete for ports; the repository is mounted read-write at /src.
+# TSAN_OPTIONS / ASAN_OPTIONS / UBSAN_OPTIONS from the calling environment are
+# forwarded, for images built with a sanitizer (suppressions live at
+# /src/tests/tsan.supp inside the container).
 # Re-create the image after rebuilding: shards run the binary baked into it,
 # not the working tree's.
 set -eu
@@ -39,7 +42,8 @@ PY
 pids=""
 for shard in "$work"/shard*; do
     name=$(basename "$shard")
-    docker run --rm --privileged -v "$repo":/src "$image" sh -c \
+    docker run --rm --privileged -v "$repo":/src \
+        -e TSAN_OPTIONS -e ASAN_OPTIONS -e UBSAN_OPTIONS "$image" sh -c \
         "cd /src/tests && python3 -m pytest -q -p no:cacheprovider -m l2tp_switch $(cat "$shard")" \
         >"$work/$name.log" 2>&1 &
     pids="$pids $! $name"

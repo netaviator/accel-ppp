@@ -262,7 +262,7 @@ def test_switch_metrics_target_up_tracks_on_demand_lifecycle(pytestconfig, accel
                 time.sleep(0.1)
             assert active_zero, f"call never ended:\n{body}"
 
-            time.sleep(IDLE_LINGER * 0.6)
+            time.sleep(IDLE_LINGER * 0.4)
             status, body = _metrics_request(metrics_port)
             assert status == 200
             assert 'accel_ppp_l2tp_switch_target_active{target="downstream"} 0' in body, body

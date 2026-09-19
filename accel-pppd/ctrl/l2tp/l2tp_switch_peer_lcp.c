@@ -185,9 +185,13 @@ struct minimal_lcp_hdr {
 } __attribute__((packed));
 
 #define MINIMAL_PPP_LCP 0xc021
+#define MINIMAL_PPP_PAP 0xc023
+#define MINIMAL_PPP_CHAP 0xc223
 #define MINIMAL_LCP_CONFREQ 1
 #define MINIMAL_LCP_CONFACK 2
 #define MINIMAL_LCP_RETRANSMIT_SECONDS 1
+#define MINIMAL_LCP_OPT_AUTH 3
+#define MINIMAL_CHAP_ALG_MD5 0x05
 
 /* Plays real, minimal LCP directly over the bearer socket -- no pppd, no
  * /etc/ppp/pap-secrets dependency (unlike run_real_ppp() above), and
@@ -224,6 +228,9 @@ int run_minimal_lcp(int data_fd, int timeout_seconds)
 	 * back a Configure-Ack whose Length field no longer matches what was
 	 * actually sent. */
 	uint8_t buf[1500];
+	uint8_t our_frame[sizeof(struct minimal_lcp_hdr) + 8]; /* our request
+		as sent: header plus at most one (<= 5 byte) auth option */
+	size_t our_frame_len;
 	struct minimal_lcp_hdr our_req; /* a stack copy, not an alias into
 		`buf` -- `buf` gets overwritten by every read() in the loop
 		below, so the code this once pointed at "our own request's id"
@@ -257,7 +264,31 @@ int run_minimal_lcp(int data_fd, int timeout_seconds)
 	 * drops anything that claims more than it got, so getting this wrong
 	 * means this Configure-Request is never acked by a real LNS. */
 	our_req.len = htons(sizeof(our_req) - sizeof(our_req.proto));
-	if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+	memcpy(our_frame, &our_req, sizeof(our_req));
+	our_frame_len = sizeof(our_req);
+
+	/* --lcp-auth: append an Authentication-Protocol option (RFC 1661
+	 * 6.2 / RFC 1334, RFC 1994) to our own request, and grow the LCP
+	 * Length field to cover it (still not counting the PPP Protocol
+	 * field). The id, and so every ack comparison below, is unchanged. */
+	if (lcp_auth != LCP_AUTH_NONE) {
+		uint8_t *opt = our_frame + our_frame_len;
+		uint16_t proto = htons(lcp_auth == LCP_AUTH_PAP ?
+				       MINIMAL_PPP_PAP : MINIMAL_PPP_CHAP);
+
+		opt[0] = MINIMAL_LCP_OPT_AUTH;
+		memcpy(opt + 2, &proto, sizeof(proto));
+		opt[1] = 4;
+		if (lcp_auth == LCP_AUTH_CHAP) {
+			opt[4] = MINIMAL_CHAP_ALG_MD5;
+			opt[1] = 5;
+		}
+		our_frame_len += opt[1];
+		our_req.len = htons(our_frame_len - sizeof(our_req.proto));
+		memcpy(our_frame, &our_req, sizeof(our_req));
+	}
+
+	if (write(data_fd, our_frame, our_frame_len) < 0) {
 		fprintf(stderr, "run_minimal_lcp: initial Configure-Request"
 			" write failed: %s\n", strerror(errno));
 		return -1;
@@ -291,7 +322,7 @@ int run_minimal_lcp(int data_fd, int timeout_seconds)
 
 		if (poll(&pfd, 1, (int)(poll_for * 1000)) <= 0) {
 			if (!our_req_acked && time(NULL) >= next_retransmit) {
-				if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+				if (write(data_fd, our_frame, our_frame_len) < 0) {
 					fprintf(stderr, "run_minimal_lcp:"
 						" retransmitting Configure-Request"
 						" failed: %s\n", strerror(errno));
@@ -353,7 +384,6 @@ struct minimal_pap_hdr {
 	uint16_t len;
 } __attribute__((packed));
 
-#define MINIMAL_PPP_PAP 0xc023
 #define MINIMAL_PAP_REQ 1
 #define MINIMAL_PAP_ACK 2
 #define MINIMAL_PAP_NAK 3

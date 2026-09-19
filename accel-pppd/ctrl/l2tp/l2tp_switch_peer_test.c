@@ -161,6 +161,7 @@ int send_stopccn;
 int wait_cdn;
 int real_ppp;
 int minimal_lcp;
+int lcp_auth; /* LCP_AUTH_*; see l2tp_switch_peer_test.h */
 int hold_seconds;
 int listen_mode;
 int listen_rounds = 1;
@@ -312,6 +313,7 @@ int main(int argc, char **argv)
 		{"second-call", required_argument, 0, 'S'},
 		{"real-ppp", no_argument, 0, 'R'},
 		{"minimal-lcp", no_argument, 0, 'm'},
+		{"lcp-auth", required_argument, 0, 'A'},
 		{"hold-seconds", required_argument, 0, 'H'},
 		{"listen", no_argument, 0, 'L'},
 		{"rounds", required_argument, 0, 'N'},
@@ -337,7 +339,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:E:P:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:E:P:A:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -378,6 +380,16 @@ int main(int argc, char **argv)
 			break;
 		case 'm':
 			minimal_lcp = 1;
+			break;
+		case 'A':
+			if (!strcmp(optarg, "pap"))
+				lcp_auth = LCP_AUTH_PAP;
+			else if (!strcmp(optarg, "chap"))
+				lcp_auth = LCP_AUTH_CHAP;
+			else if (!strcmp(optarg, "none"))
+				lcp_auth = LCP_AUTH_NONE;
+			else
+				return die("invalid --lcp-auth (pap|chap|none)");
 			break;
 		case 'H':
 			hold_seconds = atoi(optarg);
@@ -422,7 +434,8 @@ int main(int argc, char **argv)
 				   " [--data-pattern D] [--send-stopccn]"
 				   " [--wait-cdn [--cdn-timeout S]]"
 				   " [--second-call C]"
-				   " [--real-ppp | --minimal-lcp] [--hold-seconds N]"
+				   " [--real-ppp | --minimal-lcp [--lcp-auth pap|chap|none]]"
+				   " [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
 				   " [--sccrp-storm-ms M] [--hold-seconds N]"
 				   " [--minimal-lcp [--cdn-after-lcp-ms M |"
@@ -432,6 +445,9 @@ int main(int argc, char **argv)
 
 	if (cdn_after_lcp_ms > 0 && !(listen_mode && minimal_lcp))
 		return die("--cdn-after-lcp-ms requires --listen and --minimal-lcp");
+
+	if (lcp_auth != LCP_AUTH_NONE && !minimal_lcp)
+		return die("--lcp-auth requires --minimal-lcp");
 
 	if (!!expect_pap_name != !!expect_pap_password)
 		return die("--expect-pap-name and --expect-pap-password must be"

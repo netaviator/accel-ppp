@@ -53,6 +53,12 @@ match=<attr-name>,<mode>,<value>,<target-name>
   target whose tunnel failed to come up (or, for a `persistent` target,
   dropped); default `5`, whole seconds 1–3600. Keep it below
   `connect-timeout` if a queued call should get more than one attempt.
+- `pap-timeout=<seconds>` — how long the live-PAP watcher (see
+  Authentication below) waits for the downstream target's Ack/Nak to the
+  request it injected before disconnecting the call; default `3`, whole
+  seconds 1–3600. Raise it for a target whose authentication backend is slow
+  to answer, but keep it below the roughly 5 seconds a downstream LNS may
+  wait for PAP before giving up itself.
 - `match=<attr-name>,<mode>,<value>,<target-name>` — routes calls to one
   target based on the value of one L2TP AVP. Repeatable; several rules
   may point at the same target.
@@ -193,18 +199,34 @@ pipe. This is why LCP works with no special handling.
 
 PAP alone needs help: some upstream LACs proxy authentication via this
 call's ICCN `Proxy-Authen-*` AVPs instead of ever putting a live PAP frame
-on the wire, and a downstream LNS that doesn't implement consuming those
-AVPs (most don't) never sees anything to authenticate against. To make a
-switched call work against an unmodified downstream LNS in that case, the
-switch passively watches the already-spliced stream (via `tee(2)`, which
-duplicates without consuming — the real splice is never disturbed) for an
-LCP `Configure-Ack` in both directions, then injects **one** synthesized
-PAP `Authenticate-Request` directly onto the downstream leg's socket,
-built from the `Proxy-Authen-Name`/`Proxy-Authen-Response` bytes already
-captured from the upstream ICCN, exactly as if the real client had sent
-it. The one `Ack`/`Nak` reply is picked off the same way: `Ack` lets the
-untouched splice continue; `Nak`, or no reply within 3 seconds, tears the
-call down.
+on the wire, and a downstream LNS that asks for PAP but doesn't implement
+consuming those AVPs (most don't) never sees anything to authenticate
+against. To make a switched call work against an unmodified downstream LNS
+in that case, the switch passively watches the already-spliced stream (via
+`tee(2)`, which duplicates without consuming — the real splice is never
+disturbed) for an LCP `Configure-Ack` in both directions. The upstream
+peer's `Configure-Ack` of the target's `Configure-Request` echoes the
+target's options exactly, so it shows what the target asked to
+authenticate with. **Only if that is PAP** does the switch inject **one**
+synthesized PAP `Authenticate-Request` directly onto the downstream leg's
+socket, built from the `Proxy-Authen-Name`/`Proxy-Authen-Response` bytes
+already captured from the upstream ICCN, exactly as if the real client had
+sent it. The one `Ack`/`Nak` reply is picked off the same way: `Ack` lets
+the untouched splice continue; `Nak`, or no reply within `pap-timeout`
+seconds (3 by default), tears the call down.
+
+**Targets that don't ask for PAP are left alone.** If the acknowledged
+`Configure-Request` asks for CHAP (or EAP, or any other protocol), or asks
+for no authentication at all, nothing is injected, no timeout is armed and
+the call is never torn down by the watcher: the upstream peer answers the
+target's own challenge live, and an injected PAP request would only go
+unanswered. (An earlier version injected unconditionally, and its timeout
+disconnected a working CHAP-authenticated call in production.) The
+decision is logged at info level: `downstream authenticates with protocol
+0x.... , not PAP -- no PAP request injected` or `downstream does not ask
+for authentication -- no PAP request injected`. If the `Configure-Ack` is
+too long to inspect and shows no authentication option, the watcher falls
+back to injecting.
 
 This is a relay, not an authentication decision: the credential bytes are
 never inspected or validated on this end, only relayed verbatim, and the
@@ -215,14 +237,21 @@ downstream target's own `Ack`/`Nak` is the only verdict that matters.
 absent — and no `Proxy-Authen-Challenge` was sent. Any other type (e.g.
 2, PPP CHAP) or a challenge disconnects the call rather than relaying a
 CHAP response as a PAP password. CHAP client support is not implemented.
-Once the watcher has seen an LCP `Configure-Ack` in both directions it
-injects unconditionally. Production traffic this was built
-against always proxies auth via AVPs rather than relaying a live PAP/CHAP
-exchange, so this has not been exercised against an upstream LAC that
-does the latter; a duplicate PAP `Authenticate-Request` reaching a
-downstream LNS that already received a real one from the LAC is
-untested. If your upstream ever relays live auth instead of proxying it,
-verify this mechanism doesn't interfere before relying on it.
+A duplicate PAP `Authenticate-Request` reaching a downstream LNS that
+already received a real one from the LAC is untested; if your upstream
+relays live PAP instead of proxying it, verify this mechanism doesn't
+interfere before relying on it.
+
+**Diagnosing a silent target.** When the target asked for PAP but the
+call is torn down with `downstream never answered our injected live PAP
+request`, its authentication backend is probably slower than
+`pap-timeout` — raise it, keeping it below the roughly 5 seconds a
+downstream LNS may wait for PAP itself. The watcher also logs (at info
+level, once per call for the Configure-Request) what the target's own LCP
+says: `downstream LCP Configure-Request asks for PAP` / `asks for CHAP` /
+`asks for authentication protocol 0x....` / `has no authentication-protocol
+option`, and, as warnings, `downstream rejected PPP protocol 0x....` (LCP
+Protocol-Reject) and `downstream sent an LCP Terminate-Request`.
 
 ## Operational constraints
 

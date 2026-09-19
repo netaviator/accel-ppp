@@ -111,6 +111,7 @@ extern struct list_head l2tp_switch_targets;
 #define L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC 20
 #define L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC 10
 #define L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC 5
+#define L2TP_SWITCH_DEFAULT_PAP_TIMEOUT_SEC 3
 #define L2TP_SWITCH_MAX_TIMING_SEC 3600
 
 /* How long an on-demand target's tunnel stays up after its last call ends.
@@ -131,6 +132,13 @@ int l2tp_switch_conf_connect_timeout_ms(void);
  * up (or, for a persistent target, dropped). Keep it below connect-timeout
  * if a queued call should get more than one attempt. */
 int l2tp_switch_conf_reconnect_interval_ms(void);
+/* How long the live-PAP watcher waits for the downstream target's Ack/Nak to
+ * the request it injected before it gives up and disconnects the call. Keep
+ * it below the ~5s a downstream LNS has been observed to wait for PAP itself
+ * (so our timeout produces an attributable log line instead of racing its
+ * CDN), but long enough for a target whose authentication backend (RADIUS)
+ * is slow to answer. */
+int l2tp_switch_conf_pap_timeout_ms(void);
 
 int l2tp_switch_conf_load(void);
 struct l2tp_switch_target_t *l2tp_switch_target_find(const char *name);

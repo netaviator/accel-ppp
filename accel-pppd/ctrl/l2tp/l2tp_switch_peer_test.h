@@ -44,6 +44,10 @@ extern int send_stopccn;
 extern int wait_cdn;
 extern int real_ppp;
 extern int minimal_lcp;
+/* --lcp-auth: which Authentication-Protocol option run_minimal_lcp() puts
+ * in its own Configure-Request (default none: a bare, option-less request). */
+enum { LCP_AUTH_NONE, LCP_AUTH_PAP, LCP_AUTH_CHAP };
+extern int lcp_auth;
 extern int hold_seconds;
 extern int listen_mode;
 extern int listen_rounds;

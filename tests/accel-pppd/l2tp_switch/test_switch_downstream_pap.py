@@ -3,6 +3,28 @@ import time
 from common import process, config, accel_pppd_process, l2tp_peer_process
 from helpers import start_instance, read_log
 
+PEER_BIN = "/tmp/l2tp_switch_peer_test"
+
+
+def _finish(thread, ctrl, timeout):
+    """Join a harness process, killing it if it outlives `timeout`.
+
+    Mirrors test_switch_downstream_pap_race.py's own helper of the same
+    name exactly: a --listen instance blocks on its bound UDP port until
+    --hold-seconds is up regardless of what happened to the call it
+    served, and left alone past this test's own patience it would poison
+    every later test in the same run that needs that port. Safe to call
+    more than once on the same (thread, ctrl) -- joining an already-
+    finished thread just returns immediately with the same stored output.
+    """
+    rc, out, err = l2tp_peer_process.wait(thread, ctrl, timeout)
+    if rc is None:
+        ctrl["process"].kill()
+        thread.join(5.0)
+        rc = ctrl["process"].returncode
+        out, err = ctrl["out"], ctrl["err"]
+    return rc, out, err
+
 
 @pytest.mark.l2tp_switch
 def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, accel_cmd, accel_pppd):
@@ -10,10 +32,21 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
     injects one synthesized PAP Authenticate-Request on the downstream leg,
     built from the Proxy-Authen-Name/Response AVPs already captured off the
     upstream ICCN, once it has observed a real LCP Configure-Ack in both
-    directions. The downstream target here is a second, real, unmodified
-    accel-pppd instance -- proving the injected frame is well-formed and
-    actually authenticates against genuine PAP handling, not just that the
-    switch believes it sent something.
+    directions.
+
+    The downstream target is the peer test harness itself, in --listen +
+    --minimal-lcp + --expect-pap-name/--expect-pap-password mode: it does
+    real LCP, then decodes the injected PAP request byte-for-byte and
+    checks it against the credentials expected here, rather than handing
+    the frame to a second real accel-pppd instance's own auth stack just to
+    get a yes/no back. This is deliberately simpler than an earlier version
+    of this test that used a second real accel-pppd as the downstream: that
+    dragged in a second daemon's entire auth_pap/any-login configuration as
+    a dependency just to prove this watcher sent the right bytes, and BOTH
+    of these things -- the watcher, and the test infrastructure needed to
+    observe it -- are much easier to get right when they aren't tangled
+    together. See wait_for_pap_request() in l2tp_switch_peer_test.c for the
+    interception itself.
 
     The upstream side must use --minimal-lcp (not the default --data-pattern,
     which never negotiates real LCP at all, and not --real-ppp, which
@@ -22,32 +55,14 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
     section) so the watcher's "CONFACK both ways" condition is actually
     satisfied the same way production traffic satisfies it.
     """
-    d_started, d_thread, d_ctrl, d_cfg = start_instance(
+    s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2101,
+        2001,
         "127.0.0.1",
-        17070,
-        "downstreamsecret",
+        17071,
+        "upstreamsecret",
         extra="""
-    [modules]
-    auth_pap
-
-    [auth]
-    any-login=1
-    """,
-    )
-    assert d_started
-
-    try:
-        s_started, s_thread, s_ctrl, s_cfg = start_instance(
-            accel_pppd,
-            accel_cmd,
-            2001,
-            "127.0.0.1",
-            17071,
-            "upstreamsecret",
-            extra="""
     [l2tp-switch]
     # Pinned to persistent: this test's own subject is the live-PAP watcher,
     # not connection mode -- see test_switch_avp_forward.py for the same
@@ -55,8 +70,23 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
     target=downstream,127.0.0.1,17070,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
+    )
+    assert s_started
+
+    try:
+        down_thread, down_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--listen",
+                "--peer-port", "17070",
+                "--secret", "downstreamsecret",
+                "--rounds", "1",
+                "--hold-seconds", "10",
+                "--minimal-lcp",
+                "--expect-pap-name", "injected-user",
+                "--expect-pap-password", "injected-pass",
+            ],
         )
-        assert s_started
 
         try:
             for _ in range(50):
@@ -67,7 +97,7 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
             assert "[up]" in out
 
             peer_thread, peer_ctrl = l2tp_peer_process.start(
-                "/tmp/l2tp_switch_peer_test",
+                PEER_BIN,
                 [
                     "--peer-addr", "127.0.0.1",
                     "--peer-port", "17071",
@@ -76,88 +106,71 @@ def test_switch_downstream_pap_injection_authenticates_real_lns(pytestconfig, ac
                     "--proxy-username", "injected-user",
                     "--proxy-password", "injected-pass",
                     "--minimal-lcp",
-                    # long enough to cover LCP settling, the watcher's
-                    # injected request, and this test's own polling below.
+                    # long enough to cover LCP settling and the watcher's
+                    # injected request.
                     "--hold-seconds", "8",
                 ],
             )
-
-            # The proof: the DOWNSTREAM instance's own session state, not
-            # just the switch's "placed" counter -- that only shows the
-            # switch attempted to place the call, not that authentication
-            # (the actual thing this feature adds) succeeded.
-            active = False
-            out = ""
-            for _ in range(80):
-                (exit, out, err) = process.run(
-                    [accel_cmd, "-p", "2101", "show sessions", "state"]
-                )
-                assert exit == 0
-                if "active" in out:
-                    active = True
-                    break
-                time.sleep(0.1)
-            assert active, (
-                "downstream accel-pppd never reached an active session --"
-                " the injected PAP request was never sent, malformed, or"
-                f" rejected:\n{out}"
-                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
-                f"\n--- downstream log ---\n{read_log(d_cfg)}"
-            )
-
             rc, harness_out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
             assert rc == 0, (
                 f"upstream harness failed (rc={rc}): {err}\n{harness_out}"
-                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
-                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
+            )
+
+            down_rc, down_out, down_err = _finish(down_thread, down_ctrl, 15.0)
+            assert "event=pap_received" in down_out and "result=ack" in down_out, (
+                "downstream harness never confirmed the injected PAP"
+                " request -- it was never sent, malformed, or the"
+                f" credentials didn't match:\n{down_out}\n{down_err}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
             )
         finally:
-            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
-            config.delete_tmp(s_cfg)
+            _finish(down_thread, down_ctrl, 15.0)
     finally:
-        accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=2101)
-        config.delete_tmp(d_cfg)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2001)
+        config.delete_tmp(s_cfg)
 
 
 @pytest.mark.l2tp_switch
 def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd, accel_pppd):
-    """When the downstream target NAKs the injected PAP request (here: a
-    real accel-pppd with auth_pap loaded but no any-login/matching secret,
-    so it rejects every credential), the watcher must tear down both legs
-    cleanly rather than leaving an orphaned pairing or hanging until some
-    unrelated outer timeout -- see l2tp_switch_pap_send_request()'s NAK path
-    in l2tp.c, which calls l2tp_session_disconnect_push() the same way every
-    other switch-teardown path in this codebase does.
+    """When the downstream target NAKs the injected PAP request (here: the
+    peer harness in --listen + --expect-pap-name mode, given credentials
+    that don't match what the upstream side actually sends), the watcher
+    must tear down both legs cleanly rather than leaving an orphaned
+    pairing or hanging until some unrelated outer timeout -- see
+    l2tp_switch_pap_send_request()'s NAK path in l2tp.c, which calls
+    l2tp_session_disconnect_push() the same way every other switch-teardown
+    path in this codebase does.
     """
-    d_started, d_thread, d_ctrl, d_cfg = start_instance(
+    s_started, s_thread, s_ctrl, s_cfg = start_instance(
         accel_pppd,
         accel_cmd,
-        2102,
+        2002,
         "127.0.0.1",
-        17072,
-        "downstreamsecret",
+        17073,
+        "upstreamsecret",
         extra="""
-    [modules]
-    auth_pap
-    """,
-    )
-    assert d_started
-
-    try:
-        s_started, s_thread, s_ctrl, s_cfg = start_instance(
-            accel_pppd,
-            accel_cmd,
-            2002,
-            "127.0.0.1",
-            17073,
-            "upstreamsecret",
-            extra="""
     [l2tp-switch]
     target=downstream,127.0.0.1,17072,downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
+    )
+    assert s_started
+
+    try:
+        down_thread, down_ctrl = l2tp_peer_process.start(
+            PEER_BIN,
+            [
+                "--listen",
+                "--peer-port", "17072",
+                "--secret", "downstreamsecret",
+                "--rounds", "1",
+                "--hold-seconds", "10",
+                "--minimal-lcp",
+                "--expect-pap-name", "correct-user",
+                "--expect-pap-password", "correct-pass",
+            ],
         )
-        assert s_started
 
         try:
             for _ in range(50):
@@ -168,7 +181,7 @@ def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd,
             assert "[up]" in out
 
             peer_thread, peer_ctrl = l2tp_peer_process.start(
-                "/tmp/l2tp_switch_peer_test",
+                PEER_BIN,
                 [
                     "--peer-addr", "127.0.0.1",
                     "--peer-port", "17073",
@@ -188,8 +201,14 @@ def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd,
             rc, harness_out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
             assert rc == 0, (
                 f"upstream harness never saw a CDN (rc={rc}): {err}\n{harness_out}"
-                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
-                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
+            )
+
+            down_rc, down_out, down_err = _finish(down_thread, down_ctrl, 15.0)
+            assert "event=pap_received" in down_out and "result=nak" in down_out, (
+                "downstream harness never NAKed the mismatched credentials"
+                f" it was given:\n{down_out}\n{down_err}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
             )
 
             active = None
@@ -203,12 +222,10 @@ def test_switch_downstream_pap_nak_tears_down_both_legs(pytestconfig, accel_cmd,
                 time.sleep(0.1)
             assert active == 0, (
                 f"switch pairing left active after NAK:\n{out}"
-                f"\n--- switch (upstream) log ---\n{read_log(s_cfg)}"
-                f"\n--- downstream log ---\n{read_log(d_cfg)}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
             )
         finally:
-            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2002)
-            config.delete_tmp(s_cfg)
+            _finish(down_thread, down_ctrl, 15.0)
     finally:
-        accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=2102)
-        config.delete_tmp(d_cfg)
+        accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=2002)
+        config.delete_tmp(s_cfg)

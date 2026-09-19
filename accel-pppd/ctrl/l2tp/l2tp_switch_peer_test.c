@@ -1,5 +1,5 @@
 /*
- * Standalone MK-simulator L2TP LAC peer for integration testing.
+ * Standalone upstream-LAC-simulator L2TP LAC peer for integration testing.
  *
  * Not part of the cmake build. Compile and run with:
  *   gcc -O1 -g -Wall -fno-strict-aliasing -D_GNU_SOURCE \
@@ -198,6 +198,7 @@ static const char *data_pattern;
 static int send_stopccn;
 static int wait_cdn;
 static int real_ppp;
+static int minimal_lcp;
 static int hold_seconds;
 static int listen_mode;
 static int listen_rounds = 1;
@@ -238,6 +239,36 @@ static int sccrp_storm_ms;
  * caller; the on-demand connect-timeout test needs a budget longer than the
  * daemon's own 10s connect timeout to observe the CDN that follows it. */
 static int cdn_timeout = 5;
+/* --listen + --minimal-lcp only: after this call's own minimal LCP settles
+ * (both directions CONFACKed -- see run_minimal_lcp()), wait this many ms
+ * then send a CDN for it over the control channel, instead of just holding
+ * the tunnel per --hold-seconds like every other --listen mode does.
+ *
+ * This is the lever for forcing l2tp.c's live-PAP watcher's cross-context
+ * race deterministically instead of relying on rare natural timing: the
+ * watcher's cross-leg trigger (both directions' CONFACK seen) fires a
+ * triton_context_call() into the downstream leg's own tunnel context to
+ * send the injected PAP request -- a call that sits *queued* on that
+ * context until its next context-calls pass. A CDN arriving on that same
+ * downstream leg's control channel is instead handled directly from an md
+ * handler already running on that context (l2tp_conn_read() -> ... ->
+ * l2tp_session_free()), and -- per sccrp_storm_ms's own comment above on
+ * this exact ordering rule -- md handlers run before context calls on every
+ * pass, regardless of which was scheduled first. So a CDN timed to land
+ * once the trigger has *just* been queued, but before that context next
+ * processes its queued calls, reliably wins the race and frees the
+ * watcher out from under its own already-queued send -- a use-after-free
+ * if l2tp_switch_pap_send_request() has no liveness check on the watcher
+ * it dereferences (see test_switch_downstream_pap_race.py). */
+static int cdn_after_lcp_ms;
+/* --listen + --minimal-lcp only: after this call's own minimal LCP settles,
+ * wait for the switch's injected PAP Authenticate-Request and answer it
+ * directly -- see wait_for_pap_request()'s own comment. Both must be set
+ * together or not at all (enforced at option-parsing time below); NULL
+ * (the default) skips this step entirely, same as omitting
+ * --cdn-after-lcp-ms skips that one. */
+static const char *expect_pap_name;
+static const char *expect_pap_password;
 static const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -406,6 +437,303 @@ static int run_real_ppp(int data_fd)
 	return 0;
 }
 
+/* Mirrors l2tp.c's own field-for-field mirror of struct lcp_hdr_t (see
+ * l2tp_switch_pap_watcher_t's comment block, accel-pppd/ctrl/l2tp/l2tp.c) --
+ * this harness is a standalone translation unit and cannot #include l2tp.c's
+ * private definitions, so it is a deliberate copy, not a divergence. */
+struct minimal_lcp_hdr {
+	uint16_t proto;
+	uint8_t code;
+	uint8_t id;
+	uint16_t len;
+} __attribute__((packed));
+
+#define MINIMAL_PPP_LCP 0xc021
+#define MINIMAL_LCP_CONFREQ 1
+#define MINIMAL_LCP_CONFACK 2
+#define MINIMAL_LCP_RETRANSMIT_SECONDS 1
+
+/* Plays real, minimal LCP directly over the bearer socket -- no pppd, no
+ * /etc/ppp/pap-secrets dependency (unlike run_real_ppp() above), and
+ * deliberately never sends or answers PAP: this harness's --minimal-lcp mode
+ * exists specifically to reproduce production's actual upstream behaviour
+ * (the real calling client negotiates real LCP with the far end through the
+ * switch's splice, but the upstream LAC proxies authentication via this
+ * call's ICCN AVPs instead of ever putting a live PAP frame on the wire --
+ * see l2tp_switch_pap_watcher_t's own comment in l2tp.c). --real-ppp's full
+ * pppd instead negotiates *and* sends genuine live PAP, which is a different,
+ * untested scenario (a downstream target receiving two PAP requests -- see
+ * docs/l2tp_switching.md's "Authentication" section) -- do not conflate the
+ * two when picking a mode for a new test.
+ *
+ * Any Configure-Request the peer sends is ACKed unconditionally, echoing its
+ * options back verbatim: this harness has no LCP requirements of its own to
+ * negotiate, so there is nothing to legitimately NAK or REJ, and a real
+ * accel-ppp downstream's default options (MRU, magic-number, possibly an
+ * auth-protocol request) are all things a real client would routinely just
+ * accept anyway. Returns once both directions have been seen (our own
+ * request ACKed, and at least one of the peer's ACKed by us) or the deadline
+ * passes -- either way, `data_fd` is left open and untouched for the caller
+ * (unlike run_real_ppp(), which takes ownership of it): the existing
+ * --hold-seconds sleep after this function returns is what keeps the
+ * process, and so this socket, alive long enough for a test to observe
+ * whatever the switch's live-PAP watcher does with the LCP this function
+ * just opened. */
+static int run_minimal_lcp(int data_fd, int timeout_seconds)
+{
+	/* Generously over any realistic LCP frame a default accel-ppp
+	 * Configure-Request carries (MRU + magic-number + maybe an
+	 * auth-protocol option is well under 32 bytes); sized to a PPP MTU so
+	 * a read() here can never silently truncate a real frame and echo
+	 * back a Configure-Ack whose Length field no longer matches what was
+	 * actually sent. */
+	uint8_t buf[1500];
+	struct minimal_lcp_hdr our_req; /* a stack copy, not an alias into
+		`buf` -- `buf` gets overwritten by every read() in the loop
+		below, so the code this once pointed at "our own request's id"
+		would silently start comparing against whatever was just read
+		instead if this were a pointer into the same buffer */
+	time_t deadline = time(NULL) + timeout_seconds;
+	/* RFC 1661 3.2/4.6: a real LCP implementation always retransmits an
+	 * unacknowledged Configure-Request on a timer (its own default is
+	 * 3s) rather than sending it exactly once -- not just a nicety here.
+	 * This data socket's peer-side splice/watcher wiring on the switch
+	 * (l2tp_switch_finish_upstream(), scheduled off the *downstream*
+	 * leg's own ICRP, which is a further round-trip after this function
+	 * is already sending) is set up asynchronously, so there is a real
+	 * window early on where this function's very first write() can
+	 * reach a socket nothing is relaying from yet and be silently
+	 * dropped. One-shot send + no retransmission turns that single lost
+	 * packet into permanent silence for the rest of `timeout_seconds`,
+	 * exactly matching a CONFREQ that a real, spec-following peer would
+	 * have simply seen retransmitted a moment later. */
+	time_t next_retransmit;
+	int our_req_acked = 0, acked_a_peer_req = 0;
+
+	our_req.proto = htons(MINIMAL_PPP_LCP);
+	our_req.code = MINIMAL_LCP_CONFREQ;
+	our_req.id = 1;
+	/* RFC 1661: the LCP Length field covers Code+Identifier+Length+Data,
+	 * not the preceding 2-byte PPP Protocol field -- sizeof(our_req)
+	 * includes that field, so it overstates this zero-option request's
+	 * real length by 2. A real accel-ppp peer's lcp_recv() checks the
+	 * claimed length against the bytes actually received and silently
+	 * drops anything that claims more than it got, so getting this wrong
+	 * means this Configure-Request is never acked by a real LNS. */
+	our_req.len = htons(sizeof(our_req) - sizeof(our_req.proto));
+	if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+		fprintf(stderr, "run_minimal_lcp: initial Configure-Request"
+			" write failed: %s\n", strerror(errno));
+		return -1;
+	}
+	next_retransmit = time(NULL) + MINIMAL_LCP_RETRANSMIT_SECONDS;
+
+	while (!(our_req_acked && acked_a_peer_req)) {
+		struct pollfd pfd = { .fd = data_fd, .events = POLLIN };
+		time_t now = time(NULL);
+		time_t remaining = deadline - now;
+		time_t poll_for;
+		ssize_t n;
+
+		if (remaining <= 0) {
+			fprintf(stderr, "run_minimal_lcp: timed out waiting"
+				" for LCP to open both ways (our_req_acked=%d"
+				" acked_a_peer_req=%d)\n", our_req_acked,
+				acked_a_peer_req);
+			return -1;
+		}
+
+		/* Never wait past the next scheduled retransmit, whether or
+		 * not it's actually still needed by then -- rechecked below,
+		 * same as the overall deadline is rechecked on every lap
+		 * regardless of why poll() returned. */
+		poll_for = our_req_acked ? remaining : next_retransmit - now;
+		if (poll_for < 0)
+			poll_for = 0;
+		if (poll_for > remaining)
+			poll_for = remaining;
+
+		if (poll(&pfd, 1, (int)(poll_for * 1000)) <= 0) {
+			if (!our_req_acked && time(NULL) >= next_retransmit) {
+				if (write(data_fd, &our_req, sizeof(our_req)) < 0) {
+					fprintf(stderr, "run_minimal_lcp:"
+						" retransmitting Configure-Request"
+						" failed: %s\n", strerror(errno));
+					return -1;
+				}
+				next_retransmit = time(NULL) + MINIMAL_LCP_RETRANSMIT_SECONDS;
+			}
+			continue; /* timeout or EINTR -- loop re-checks deadline */
+		}
+
+		n = read(data_fd, buf, sizeof(buf));
+		if (n < 0) {
+			fprintf(stderr, "run_minimal_lcp: read failed: %s\n",
+				strerror(errno));
+			return -1;
+		}
+		if (n == 0) {
+			fprintf(stderr, "run_minimal_lcp: peer closed the"
+				" data socket\n");
+			return -1;
+		}
+		if (n < (ssize_t)sizeof(struct minimal_lcp_hdr))
+			continue; /* too short to be a control frame we care about */
+
+		{
+			struct minimal_lcp_hdr *hdr = (struct minimal_lcp_hdr *)buf;
+
+			if (hdr->proto != htons(MINIMAL_PPP_LCP))
+				continue; /* not LCP (e.g. the watcher's injected
+					     PAP, or downstream's reply to it --
+					     this harness deliberately never
+					     touches either) */
+
+			if (hdr->code == MINIMAL_LCP_CONFREQ) {
+				hdr->code = MINIMAL_LCP_CONFACK;
+				if (write(data_fd, buf, (size_t)n) < 0) {
+					fprintf(stderr, "run_minimal_lcp: Configure-Ack"
+						" write failed: %s\n", strerror(errno));
+					return -1;
+				}
+				acked_a_peer_req = 1;
+			} else if (hdr->code == MINIMAL_LCP_CONFACK &&
+				  hdr->id == our_req.id) {
+				our_req_acked = 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/* Mirrors l2tp.c's l2tp_switch_pap_hdr (RFC 1334 2.1/2.2 Authenticate-
+ * Request/Ack/Nak) -- same layout as struct minimal_lcp_hdr above, kept as
+ * its own named type so call sites read as what they are. */
+struct minimal_pap_hdr {
+	uint16_t proto;
+	uint8_t code;
+	uint8_t id;
+	uint16_t len;
+} __attribute__((packed));
+
+#define MINIMAL_PPP_PAP 0xc023
+#define MINIMAL_PAP_REQ 1
+#define MINIMAL_PAP_ACK 2
+#define MINIMAL_PAP_NAK 3
+
+/* --listen + --minimal-lcp + --expect-pap-name only: waits, on the same
+ * data socket run_minimal_lcp() just settled LCP on, for the one PAP
+ * Authenticate-Request the switch's live-PAP watcher injects
+ * (l2tp_switch_pap_send_request() in l2tp.c), decodes its Peer-ID/Password,
+ * and replies with an Ack if both match --expect-pap-name/
+ * --expect-pap-password exactly, a Nak otherwise -- this harness deciding
+ * the outcome itself, the same way it already builds/parses every other
+ * frame in this file, rather than handing the frame to a second real
+ * accel-pppd instance's own auth stack just to get a yes/no back. Prints
+ * one event=pap_received line with the outcome either way, so a test can
+ * assert on it directly. Returns 0 once answered (whatever the outcome),
+ * -1 on timeout/error/malformed frame. */
+static double now_monotonic(void);
+
+static int wait_for_pap_request(int data_fd, const char *expect_name,
+				const char *expect_password,
+				int timeout_seconds, int round)
+{
+	uint8_t buf[256]; /* matches l2tp.c's own l2tp_switch_pap_send_request()
+		buf[256] -- Proxy-Authen-Name/Response are bounded well under
+		this on the sending side, so a genuine frame from that watcher
+		can never overrun it. */
+	time_t deadline = time(NULL) + timeout_seconds;
+
+	while (1) {
+		struct pollfd pfd = { .fd = data_fd, .events = POLLIN };
+		time_t remaining = deadline - time(NULL);
+		ssize_t n;
+
+		if (remaining <= 0) {
+			fprintf(stderr, "wait_for_pap_request: timed out"
+				" waiting for a PAP request\n");
+			return -1;
+		}
+
+		if (poll(&pfd, 1, (int)(remaining * 1000)) <= 0)
+			continue; /* timeout or EINTR -- loop re-checks deadline */
+
+		n = read(data_fd, buf, sizeof(buf));
+		if (n < 0) {
+			fprintf(stderr, "wait_for_pap_request: read failed:"
+				" %s\n", strerror(errno));
+			return -1;
+		}
+		if (n == 0) {
+			fprintf(stderr, "wait_for_pap_request: peer closed"
+				" the data socket\n");
+			return -1;
+		}
+		if (n < (ssize_t)sizeof(struct minimal_pap_hdr))
+			continue; /* too short to be a control frame we care about */
+
+		{
+			struct minimal_pap_hdr *hdr = (struct minimal_pap_hdr *)buf;
+			uint8_t *p = buf + sizeof(*hdr);
+			uint8_t *end = buf + n;
+			uint8_t name_len, pass_len;
+			char name[256], pass[256];
+			int matched;
+			struct minimal_pap_hdr reply;
+
+			if (hdr->proto != htons(MINIMAL_PPP_PAP) ||
+			    hdr->code != MINIMAL_PAP_REQ)
+				continue; /* not it yet -- e.g. trailing LCP
+					     chatter still in flight */
+
+			if (p >= end || p + 1 + *p > end) {
+				fprintf(stderr, "wait_for_pap_request: malformed"
+					" PAP request (Peer-ID overruns the"
+					" frame)\n");
+				return -1;
+			}
+			name_len = *p++;
+			memcpy(name, p, name_len);
+			name[name_len] = 0;
+			p += name_len;
+
+			if (p >= end || p + 1 + *p > end) {
+				fprintf(stderr, "wait_for_pap_request: malformed"
+					" PAP request (Password overruns the"
+					" frame)\n");
+				return -1;
+			}
+			pass_len = *p++;
+			memcpy(pass, p, pass_len);
+			pass[pass_len] = 0;
+
+			matched = expect_name && expect_password &&
+				  !strcmp(name, expect_name) &&
+				  !strcmp(pass, expect_password);
+
+			reply.proto = htons(MINIMAL_PPP_PAP);
+			reply.code = matched ? MINIMAL_PAP_ACK : MINIMAL_PAP_NAK;
+			reply.id = hdr->id;
+			reply.len = htons(sizeof(reply) - sizeof(reply.proto));
+
+			if (write(data_fd, &reply, sizeof(reply)) < 0) {
+				fprintf(stderr, "wait_for_pap_request: sending"
+					" PAP reply failed: %s\n", strerror(errno));
+				return -1;
+			}
+
+			printf("event=pap_received round=%d name=%s result=%s"
+			       " t=%.6f\n", round, name,
+			       matched ? "ack" : "nak", now_monotonic());
+			fflush(stdout);
+
+			return 0;
+		}
+	}
+}
+
 static int send_and_recv(int fd, struct l2tp_packet_t *pack,
 			 struct l2tp_packet_t **reply)
 {
@@ -571,7 +899,7 @@ static int send_sccrp_storm(int fd, const struct sockaddr_in *their_addr,
 }
 
 /*
- * Plays the *downstream target's* role instead of the usual upstream/MK
+ * Plays the *downstream target's* role instead of the usual upstream
  * one: binds --peer-port (any source address, since the switch's own
  * outbound tunnel socket uses an ephemeral local port) and, for each of
  * --rounds tunnels, completes SCCRQ -> SCCRP -> SCCCN and then, if
@@ -611,15 +939,148 @@ static int send_sccrp_storm(int fd, const struct sockaddr_in *their_addr,
  * code, which is what tells a voluntary idle teardown (1, "general request
  * to clear the control connection") from an error-driven one.
  */
+/* --listen + --minimal-lcp only, called once this call's ICCN arrives: opens
+ * the session-level pppol2tp data socket for it (mirroring the caller
+ * role's own setup further down in this file -- same tunnel-registration-
+ * before-session-connect two-step, same reasoning, just LNS-mode=1 here
+ * since this harness is playing the downstream target rather than the
+ * calling client's LAC), runs real minimal LCP over it, and -- if
+ * --cdn-after-lcp-ms was given -- sends this call's CDN after the
+ * requested delay. See cdn_after_lcp_ms's own comment for why that delay
+ * is the deterministic race lever, not just a convenience. Always closes
+ * the data socket before returning; the CDN, when sent, goes out over the
+ * control channel `fd`, not this one. */
+static int serve_minimal_lcp_and_cdn(int fd, const struct sockaddr_in *their_addr,
+				     uint16_t my_tid, uint16_t their_tid,
+				     uint16_t our_sid, uint16_t their_sid,
+				     uint16_t *my_ns, uint16_t *peer_next_nr,
+				     int round)
+{
+	struct sockaddr_pppol2tp pppox_addr;
+	int data_fd, reg_fd, lns_mode = 1;
+
+	/* The kernel's L2TP transmit path needs the tunnel's UDP socket
+	 * connect()ed to the peer (the client role does the same before
+	 * registering, see main(); so does the real daemon's
+	 * l2tp_tunnel_alloc()). This listening socket is only bound, so
+	 * without this every frame written to the data socket below -- our
+	 * own Configure-Request, our Ack of the peer's -- is silently never
+	 * emitted, and LCP can never open. */
+	if (connect(fd, (const struct sockaddr *)their_addr, sizeof(*their_addr)) < 0)
+		return die("connect(fd) to the calling peer failed");
+
+	reg_fd = socket(AF_PPPOX, SOCK_DGRAM, PX_PROTO_OL2TP);
+	if (reg_fd < 0)
+		return die("tunnel registration socket() failed");
+
+	memset(&pppox_addr, 0, sizeof(pppox_addr));
+	pppox_addr.sa_family = AF_PPPOX;
+	pppox_addr.sa_protocol = PX_PROTO_OL2TP;
+	pppox_addr.pppol2tp.fd = fd;
+	pppox_addr.pppol2tp.addr = *their_addr;
+	pppox_addr.pppol2tp.s_tunnel = my_tid;
+	pppox_addr.pppol2tp.d_tunnel = their_tid;
+	/* s_session/d_session left at 0: tunnel-level registration only. */
+
+	if (connect(reg_fd, (struct sockaddr *)&pppox_addr, sizeof(pppox_addr)) < 0) {
+		close(reg_fd);
+		return die("tunnel registration connect() failed");
+	}
+	close(reg_fd);
+
+	data_fd = socket(AF_PPPOX, SOCK_DGRAM, PX_PROTO_OL2TP);
+	if (data_fd < 0)
+		return die("data socket() failed");
+
+	memset(&pppox_addr, 0, sizeof(pppox_addr));
+	pppox_addr.sa_family = AF_PPPOX;
+	pppox_addr.sa_protocol = PX_PROTO_OL2TP;
+	pppox_addr.pppol2tp.fd = fd;
+	pppox_addr.pppol2tp.addr = *their_addr;
+	pppox_addr.pppol2tp.s_tunnel = my_tid;
+	pppox_addr.pppol2tp.d_tunnel = their_tid;
+	pppox_addr.pppol2tp.s_session = our_sid;
+	pppox_addr.pppol2tp.d_session = their_sid;
+
+	if (connect(data_fd, (struct sockaddr *)&pppox_addr, sizeof(pppox_addr)) < 0) {
+		close(data_fd);
+		return die("data socket connect() failed");
+	}
+
+	if (setsockopt(data_fd, SOL_PPPOL2TP, PPPOL2TP_SO_LNSMODE,
+		      &lns_mode, sizeof(lns_mode)) < 0) {
+		close(data_fd);
+		return die("data socket setsockopt(LNSMODE) failed");
+	}
+
+	if (run_minimal_lcp(data_fd, 5) != 0) {
+		close(data_fd);
+		return -1;
+	}
+
+	printf("event=downstream_lcp_settled round=%d t=%.6f\n",
+	       round, now_monotonic());
+	fflush(stdout);
+
+	if (expect_pap_name &&
+	    wait_for_pap_request(data_fd, expect_pap_name, expect_pap_password,
+				 5, round) != 0) {
+		close(data_fd);
+		return -1;
+	}
+
+	if (cdn_after_lcp_ms > 0) {
+		struct l2tp_packet_t *pack;
+		struct l2tp_avp_result_code res = { htons(1), htons(0) };
+
+		usleep((useconds_t)cdn_after_lcp_ms * 1000);
+
+		pack = l2tp_packet_alloc(2, Message_Type_Call_Disconnect_Notify,
+					 their_addr, 0, secret, strlen(secret));
+		if (!pack) {
+			close(data_fd);
+			return die("CDN alloc failed");
+		}
+		/* RFC 2661 5.1: Assigned-Session-ID here is the *sender's*
+		 * own id for this call -- ours -- while the header sid is
+		 * always the recipient's, same convention the ICRP above
+		 * already follows for their_sid/our_sid. */
+		l2tp_packet_add_int16(pack, Assigned_Session_ID, our_sid, 1);
+		l2tp_packet_add_octets(pack, Result_Code, (uint8_t *)&res,
+				       sizeof(res), 1);
+		pack->hdr.tid = htons(their_tid);
+		pack->hdr.sid = htons(their_sid);
+		pack->hdr.Ns = htons((*my_ns)++);
+		pack->hdr.Nr = htons(*peer_next_nr);
+		if (l2tp_packet_send(fd, pack) < 0) {
+			l2tp_packet_free(pack);
+			close(data_fd);
+			return die("CDN send failed");
+		}
+		l2tp_packet_free(pack);
+
+		printf("event=sent_cdn round=%d t=%.6f\n", round, now_monotonic());
+		fflush(stdout);
+	}
+
+	close(data_fd);
+	return 0;
+}
+
 static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr,
-				    uint16_t their_tid, uint16_t *my_ns,
-				    uint16_t *peer_next_nr, int round)
+				    uint16_t my_tid, uint16_t their_tid,
+				    uint16_t *my_ns, uint16_t *peer_next_nr,
+				    int round)
 {
 	double until = now_monotonic() + hold_seconds;
 	/* Short enough that the loop notices --hold-seconds running out
 	 * promptly on a silent tunnel, which is most of its life. */
 	struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
 	uint16_t next_sid = (uint16_t)(200 + round * 10);
+	/* Set from the ICRQ branch below, read back once its matching ICCN
+	 * arrives -- the loop-local `their_sid`/`next_sid` of that earlier
+	 * iteration are both gone by then. */
+	uint16_t call_our_sid = 0, call_their_sid = 0;
 
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
 		return die("setsockopt(SO_RCVTIMEO) failed");
@@ -655,6 +1116,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 				if (attr->attr &&
 				    attr->attr->id == Assigned_Session_ID)
 					their_sid = (uint16_t)attr->val.int16;
+			call_their_sid = their_sid;
 			printf("event=recv_icrq round=%d t=%.6f\n",
 			       round, now_monotonic());
 		} else if (type == Message_Type_Incoming_Call_Connected) {
@@ -698,6 +1160,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			if (l2tp_packet_send(fd, rsp) < 0)
 				return die("ICRP send failed");
 			l2tp_packet_free(rsp);
+			call_our_sid = next_sid;
 			next_sid++;
 		} else {
 			/* A bare ZLB ack. It takes no slot of its own in the
@@ -716,6 +1179,20 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			if (l2tp_packet_send(fd, rsp) < 0)
 				return die("ZLB send failed");
 			l2tp_packet_free(rsp);
+		}
+
+		/* Deliberately after the ZLB ack just above, not before: a real
+		 * peer's own ICCN handling would also finish acking the control
+		 * message before doing anything else with the newly-connected
+		 * call. */
+		if (type == Message_Type_Incoming_Call_Connected && minimal_lcp) {
+			if (serve_minimal_lcp_and_cdn(fd, their_addr, my_tid, their_tid,
+						      call_our_sid, call_their_sid,
+						      my_ns, peer_next_nr, round) < 0)
+				return 1;
+			if (cdn_after_lcp_ms > 0)
+				break; /* the race this round exists to force is
+					  already over; nothing more to serve */
 		}
 
 		if (stop)
@@ -777,8 +1254,8 @@ static int run_listen_mode(int rounds)
 				their_tid = (uint16_t)attr->val.int16;
 			/* RFC 2661 5.1.1 mutual tunnel auth: the SCCRQ's own
 			 * Challenge (present whenever the switch has a
-			 * [l2tp] secret=, which every fixture in this plan
-			 * does) must be answered by a Challenge-Response in
+			 * [l2tp] secret=, which every fixture in this test
+			 * suite does) must be answered by a Challenge-Response in
 			 * *this* SCCRP -- not in some later message -- or
 			 * the switch rejects the SCCRP outright and never
 			 * proceeds to SCCCN. Copied out before req is freed
@@ -907,7 +1384,7 @@ static int run_listen_mode(int rounds)
 		 * behaviour: establish (or establish-then-StopCCN) and move
 		 * straight on to the next round, saying nothing further. */
 		if (hold_seconds > 0 &&
-		    serve_established_tunnel(fd, &their_addr, their_tid,
+		    serve_established_tunnel(fd, &their_addr, my_tid, their_tid,
 					     &my_ns, &peer_next_nr, round) < 0)
 			return 1;
 	}
@@ -939,12 +1416,16 @@ int main(int argc, char **argv)
 		{"wait-cdn", no_argument, 0, 'W'},
 		{"second-call", required_argument, 0, 'S'},
 		{"real-ppp", no_argument, 0, 'R'},
+		{"minimal-lcp", no_argument, 0, 'm'},
 		{"hold-seconds", required_argument, 0, 'H'},
 		{"listen", no_argument, 0, 'L'},
 		{"rounds", required_argument, 0, 'N'},
 		{"sccrp-delay-ms", required_argument, 0, 'D'},
 		{"sccrp-storm-ms", required_argument, 0, 'M'},
 		{"cdn-timeout", required_argument, 0, 'T'},
+		{"cdn-after-lcp-ms", required_argument, 0, 'C'},
+		{"expect-pap-name", required_argument, 0, 'E'},
+		{"expect-pap-password", required_argument, 0, 'P'},
 		{0, 0, 0, 0},
 	};
 
@@ -961,7 +1442,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RH:LN:D:M:T:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:E:P:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -1000,6 +1481,9 @@ int main(int argc, char **argv)
 		case 'R':
 			real_ppp = 1;
 			break;
+		case 'm':
+			minimal_lcp = 1;
+			break;
 		case 'H':
 			hold_seconds = atoi(optarg);
 			break;
@@ -1024,6 +1508,17 @@ int main(int argc, char **argv)
 			if (cdn_timeout <= 0)
 				return die("invalid --cdn-timeout");
 			break;
+		case 'C':
+			cdn_after_lcp_ms = atoi(optarg);
+			if (cdn_after_lcp_ms < 0)
+				return die("invalid --cdn-after-lcp-ms");
+			break;
+		case 'E':
+			expect_pap_name = optarg;
+			break;
+		case 'P':
+			expect_pap_password = optarg;
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -1032,11 +1527,25 @@ int main(int argc, char **argv)
 				   " [--data-pattern D] [--send-stopccn]"
 				   " [--wait-cdn [--cdn-timeout S]]"
 				   " [--second-call C]"
-				   " [--real-ppp] [--hold-seconds N]"
+				   " [--real-ppp | --minimal-lcp] [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
-				   " [--sccrp-storm-ms M] [--hold-seconds N]]");
+				   " [--sccrp-storm-ms M] [--hold-seconds N]"
+				   " [--minimal-lcp [--cdn-after-lcp-ms M |"
+				   " --expect-pap-name U --expect-pap-password W]]]");
 		}
 	}
+
+	if (cdn_after_lcp_ms > 0 && !(listen_mode && minimal_lcp))
+		return die("--cdn-after-lcp-ms requires --listen and --minimal-lcp");
+
+	if (!!expect_pap_name != !!expect_pap_password)
+		return die("--expect-pap-name and --expect-pap-password must be"
+			   " given together");
+	if (expect_pap_name && !(listen_mode && minimal_lcp))
+		return die("--expect-pap-name requires --listen and --minimal-lcp");
+	if (expect_pap_name && cdn_after_lcp_ms > 0)
+		return die("--expect-pap-name and --cdn-after-lcp-ms are"
+			   " mutually exclusive");
 
 	if (listen_mode)
 		return run_listen_mode(listen_rounds);
@@ -1086,7 +1595,7 @@ int main(int argc, char **argv)
 
 	/* Tunnel-auth Challenge (RFC 2661 5.1.1): present in SCCRP whenever
 	 * the peer has a [l2tp] secret= configured, which every fixture in
-	 * this plan does. */
+	 * this test suite does. */
 	{
 		struct l2tp_attr_t *attr;
 		uint8_t *chall = NULL;
@@ -1174,10 +1683,10 @@ int main(int argc, char **argv)
 	l2tp_packet_add_int32(pack, Framing_Type, 3, 1);
 	if (proxy_username) {
 		/* Proxy-Authen-Type is int16 per dict/dictionary.rfc2661 (id 29),
-		 * not an octet string -- 2 = PPP_PAP is sufficient here since this
-		 * harness only needs to prove the AVP survives the switch intact,
-		 * not exercise real PAP semantics. */
-		l2tp_packet_add_int16(pack, Proxy_Authen_Type, 2, 1);
+		 * not an octet string. RFC 2661 4.4.2: 1 = textual, 2 = PPP
+		 * CHAP, 3 = PPP PAP -- the switch's live-PAP injection refuses
+		 * anything but 1/3, so this must be 3. */
+		l2tp_packet_add_int16(pack, Proxy_Authen_Type, 3, 1);
 		l2tp_packet_add_string(pack, Proxy_Authen_Name, proxy_username, 1);
 		if (proxy_password)
 			l2tp_packet_add_string(pack, Proxy_Authen_Response,
@@ -1207,11 +1716,14 @@ int main(int argc, char **argv)
 	if (real_ppp && (!proxy_username || !proxy_password))
 		return die("--real-ppp requires --proxy-username and --proxy-password");
 
-	if (data_pattern || real_ppp) {
+	if (real_ppp && minimal_lcp)
+		return die("--real-ppp and --minimal-lcp are mutually exclusive");
+
+	if (data_pattern || real_ppp || minimal_lcp) {
 		struct sockaddr_pppol2tp pppox_addr;
 		int data_fd, reg_fd, lns_mode = 0;
 
-		/* Sending our own ICCN only completes *our* (MK's) side of the
+		/* Sending our own ICCN only completes *our* (the upstream LAC's) side of the
 		 * handshake -- on a real switch, ICCN triggers placing the
 		 * downstream call asynchronously (its own ICRQ/ICRP/ICCN round
 		 * trip), and only once *that* finishes does the switch open
@@ -1233,10 +1745,10 @@ int main(int argc, char **argv)
 		 * kernel's L2TP subsystem via a throwaway pppol2tp connect
 		 * with session IDs left at 0 (l2tp_tunnel_connect(), l2tp.c
 		 * ~2071) as soon as its own SCCRQ/SCCRP/SCCCN handshake
-		 * completes -- confirmed on real hardware (Step 0 above) to
+		 * completes -- confirmed on real hardware to
 		 * be a hard prerequisite for any *session*-level pppol2tp
 		 * connect() on that tunnel, which otherwise fails ENOENT.
-		 * This harness plays the MK/LAC side of the upstream tunnel,
+		 * This harness plays the LAC side of the upstream tunnel,
 		 * so it must do the same registration itself before the real
 		 * session-level connect below -- nothing else on this
 		 * process's side ever does it, unlike the daemon, which
@@ -1288,6 +1800,14 @@ int main(int argc, char **argv)
 			 * inherited by the pppd child and closed by the
 			 * parent right after fork(). */
 			if (run_real_ppp(data_fd) != 0)
+				return 1;
+		} else if (minimal_lcp) {
+			/* run_minimal_lcp() leaves data_fd open -- it is held
+			 * alive by the existing --hold-seconds sleep below,
+			 * same as the plain data_pattern branch's socket stays
+			 * registered via `fd` (the control channel) rather
+			 * than this one. */
+			if (run_minimal_lcp(data_fd, 5) != 0)
 				return 1;
 		} else {
 			ssize_t n = write(data_fd, data_pattern, strlen(data_pattern));

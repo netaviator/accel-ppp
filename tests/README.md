@@ -101,3 +101,19 @@ If you want to re-run tests 'from scratch', you may want to remove coverage data
 sudo gcovr -d # build report and delete
 sudo gcovr -d # check that data is deleted (any coverage = 0%)
 ```
+## Running the L2TP switch tests in parallel
+
+The `l2tp_switch` tests start their own daemons on free ports (never hardcoded
+ones), so several copies can share a machine. Tests that use the shared
+fixture daemon (fixed CLI port 2001) are tagged `xdist_group("fixed-port")`
+so `pytest -n auto --dist loadgroup` keeps them on one worker.
+
+To shard the whole directory across containers instead (each container has
+its own network namespace), build accel-ppp inside a Linux container,
+`docker commit` it, and run:
+
+```bash
+tests/run_l2tp_switch_sharded.sh <image> [shards]
+```
+
+Re-create the image after every rebuild: shards run the binary baked into it.

@@ -1,6 +1,8 @@
 import pytest
 from common import process
 
+pytestmark = pytest.mark.xdist_group("fixed-port")
+
 
 @pytest.mark.l2tp_switch
 def test_l2tp_switch_add_unknown_target(accel_pppd_instance, accel_cmd):

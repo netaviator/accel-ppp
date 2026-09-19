@@ -427,8 +427,8 @@ static void test_roundtrip(int hide_avps)
 /*
  * The l2tp-switch feature's Proxy LCP AVP round-trips through the same
  * encoder/parser as everything else here -- regression coverage for the
- * type confusion bug this feature hit for real (docs/superpowers/plans/
- * 2026-09-07-l2tp-switching.md, Task 6's fix commit): Last-Sent-LCP is an
+ * type confusion bug this feature hit for real (fixed in the commit that
+ * added ICCN proxy-AVP capture): Last-Sent-LCP is an
  * octet string, not an int, so l2tp_switch_capture_avp() must read
  * attr->val.octets for it, not attr->val.uint16.
  */

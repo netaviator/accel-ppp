@@ -1,0 +1,21 @@
+# ThreadSanitizer suppressions for the CI "thread" leg (run-tests-asan-ubsan.yml).
+#
+# Every entry is a race that already exists in accel-ppp's own logging and
+# triton core (log messages allocated on one worker thread and freed on the
+# logging thread through the unsynchronized mempool counters, contexts and
+# timers handed between worker threads, ...). They fire on any log_*() call,
+# independent of the l2tp-switch code, and with halt_on_error=1 the first
+# one would abort the daemon and fail the leg. Suppressed by function so a
+# race whose racing access is in *new* code (l2tp.c, l2tp_switch_conf.c)
+# still fails the run.
+race:mempool_alloc
+race:mempool_free
+race:unpack_msg
+race:general_log
+race:triton_thread
+race:triton_context_unregister
+race:triton_queue_ctx
+race:md_thread
+race:timer_thread
+race:triton_timer_del
+race:ap_shutdown_soft

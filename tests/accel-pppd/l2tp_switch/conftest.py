@@ -11,10 +11,9 @@ import pytest
 # fresh checkout (CI included) fails every one of those tests with no
 # indication beyond "no such file or directory" buried in a Popen traceback.
 _PEER_TEST_SRC_DIR = Path(__file__).resolve().parents[3] / "accel-pppd" / "ctrl" / "l2tp"
-_PEER_TEST_BIN = Path("/tmp/l2tp_switch_peer_test")
 
 
-def _build_peer_test(sanitize):
+def _build_peer_test(sanitize, out_path):
     cmd = [
         "gcc",
         "-O1",
@@ -31,8 +30,8 @@ def _build_peer_test(sanitize):
         "-I",
         str(_PEER_TEST_SRC_DIR),
         "-o",
-        str(_PEER_TEST_BIN),
-        str(_PEER_TEST_SRC_DIR / "l2tp_switch_peer_test.c"),
+        str(out_path),
+        *sorted(str(p) for p in _PEER_TEST_SRC_DIR.glob("l2tp_switch_peer_*.c")),
         str(_PEER_TEST_SRC_DIR / "packet.c"),
         "-lcrypto",
     ]
@@ -40,17 +39,22 @@ def _build_peer_test(sanitize):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def l2tp_switch_peer_test_binary():
+def l2tp_switch_peer_test_binary(tmp_path_factory):
     # ASAN/UBSAN are a safety net where available, not a requirement for
     # these tests to run at all -- confirmed the hard way on an Alpine/musl
     # i586 CI runner that has gcc but no libasan/libubsan runtime at all
     # ("cannot find -lasan"). Try sanitized first (this is how every test
     # in this file was actually developed and debugged); fall back to a
     # plain build only if that specific combination fails.
-    result = _build_peer_test(sanitize=True)
+    # Built into a per-session temp dir (per xdist worker, too) rather than
+    # a fixed /tmp path: a fixed path is a predictable-name hazard when the
+    # suite runs as root, and breaks under parallel runs where one worker
+    # rebuilds the binary while another executes it.
+    out_path = tmp_path_factory.mktemp("l2tp_switch_peer") / "l2tp_switch_peer_test"
+    result = _build_peer_test(sanitize=True, out_path=out_path)
     if result.returncode != 0:
         sanitized_error = result.stdout + result.stderr
-        result = _build_peer_test(sanitize=False)
+        result = _build_peer_test(sanitize=False, out_path=out_path)
         if result.returncode != 0:
             pytest.fail(
                 "failed to build l2tp_switch_peer_test (needed by every "
@@ -61,7 +65,21 @@ def l2tp_switch_peer_test_binary():
                 + result.stdout
                 + result.stderr
             )
-    return _PEER_TEST_BIN
+    return str(out_path)
+
+
+@pytest.fixture(scope="session")
+def peer_bin(l2tp_switch_peer_test_binary):
+    """Path of the built l2tp_switch_peer_test harness binary."""
+    return l2tp_switch_peer_test_binary
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "xdist_group(name): tests sharing a name run on one xdist worker"
+        " (used for tests that need the fixed-port shared daemon fixture)",
+    )
 
 
 @pytest.fixture()

@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <ctype.h>
 #include <arpa/inet.h>
 
 #include "log.h"
@@ -25,6 +27,12 @@ struct l2tp_switch_rule_t {
 
 struct list_head l2tp_switch_targets = { &l2tp_switch_targets, &l2tp_switch_targets };
 static LIST_HEAD(l2tp_switch_rules);
+/* Guards l2tp_switch_rules: `l2tp switch add|del` mutates it from the CLI
+ * thread while l2tp_switch_match() reads it from tunnel contexts on every
+ * ICRQ/ICCN. Targets are never freed after init (only by switch_conf_clear()
+ * at config load), so a rule's ->target stays valid once copied out under
+ * the read lock. */
+static pthread_rwlock_t l2tp_switch_rules_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static void free_target(struct l2tp_switch_target_t *t)
 {
@@ -45,8 +53,47 @@ static void free_rule(struct l2tp_switch_rule_t *r)
 	_free(r);
 }
 
+static int conf_idle_linger_sec = L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC;
+static int conf_connect_timeout_sec = L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC;
+static int conf_reconnect_interval_sec = L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC;
+
+int l2tp_switch_conf_idle_linger_ms(void)
+{
+	return conf_idle_linger_sec * 1000;
+}
+
+int l2tp_switch_conf_connect_timeout_ms(void)
+{
+	return conf_connect_timeout_sec * 1000;
+}
+
+int l2tp_switch_conf_reconnect_interval_ms(void)
+{
+	return conf_reconnect_interval_sec * 1000;
+}
+
+/* Parses a whole number of seconds in [1, L2TP_SWITCH_MAX_TIMING_SEC]. */
+static int parse_timing_sec(const char *name, const char *val, int *out)
+{
+	char *endp;
+	long n = strtol(val, &endp, 10);
+
+	if (*val == '\0' || *endp || n < 1 || n > L2TP_SWITCH_MAX_TIMING_SEC) {
+		log_error("l2tp-switch: invalid %s=\"%s\", expected a whole"
+			  " number of seconds between 1 and %d\n", name, val,
+			  L2TP_SWITCH_MAX_TIMING_SEC);
+		return -1;
+	}
+	*out = (int)n;
+	return 0;
+}
+
 static void switch_conf_clear(void)
 {
+	conf_idle_linger_sec = L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC;
+	conf_connect_timeout_sec = L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC;
+	conf_reconnect_interval_sec = L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC;
+
 	struct l2tp_switch_rule_t *r;
 	struct l2tp_switch_target_t *t;
 
@@ -119,12 +166,17 @@ struct l2tp_switch_target_t *l2tp_switch_match(const struct l2tp_dict_attr_t *at
 					       const uint8_t *val, int len)
 {
 	struct l2tp_switch_rule_t *r;
+	struct l2tp_switch_target_t *target = NULL;
 
+	pthread_rwlock_rdlock(&l2tp_switch_rules_lock);
 	list_for_each_entry(r, &l2tp_switch_rules, entry)
-		if (r->attr == attr && rule_matches_value(r, val, len))
-			return r->target;
+		if (r->attr == attr && rule_matches_value(r, val, len)) {
+			target = r->target;
+			break;
+		}
+	pthread_rwlock_unlock(&l2tp_switch_rules_lock);
 
-	return NULL;
+	return target;
 }
 
 static int parse_mode(const char *s, enum l2tp_switch_match_mode *mode)
@@ -173,7 +225,7 @@ int l2tp_switch_rule_add(const char *attr_name, const char *mode_name,
 	struct l2tp_switch_target_t *target = l2tp_switch_target_find(target_name);
 	const struct l2tp_dict_attr_t *attr;
 	enum l2tp_switch_match_mode mode;
-	struct l2tp_switch_rule_t *r, candidate;
+	struct l2tp_switch_rule_t *r, *existing, candidate;
 
 	if (!target) {
 		log_error("l2tp-switch: unknown target \"%s\"\n", target_name);
@@ -195,17 +247,6 @@ int l2tp_switch_rule_add(const char *attr_name, const char *mode_name,
 	candidate.val = (uint8_t *)val;
 	candidate.len = len;
 
-	list_for_each_entry(r, &l2tp_switch_rules, entry) {
-		if (r->attr != attr)
-			continue;
-		if (rules_overlap(r, &candidate)) {
-			log_error("l2tp-switch: match rule for \"%s\""
-				  " overlaps with an existing rule for the"
-				  " same attribute (ambiguous)\n", attr_name);
-			return -1;
-		}
-	}
-
 	r = _malloc(sizeof(*r));
 	if (!r)
 		return -1;
@@ -221,7 +262,21 @@ int l2tp_switch_rule_add(const char *attr_name, const char *mode_name,
 	r->len = len;
 	r->target = target;
 
+	pthread_rwlock_wrlock(&l2tp_switch_rules_lock);
+	list_for_each_entry(existing, &l2tp_switch_rules, entry) {
+		if (existing->attr != attr)
+			continue;
+		if (rules_overlap(existing, &candidate)) {
+			pthread_rwlock_unlock(&l2tp_switch_rules_lock);
+			log_error("l2tp-switch: match rule for \"%s\""
+				  " overlaps with an existing rule for the"
+				  " same attribute (ambiguous)\n", attr_name);
+			free_rule(r);
+			return -1;
+		}
+	}
 	list_add_tail(&r->entry, &l2tp_switch_rules);
+	pthread_rwlock_unlock(&l2tp_switch_rules_lock);
 
 	return 0;
 }
@@ -242,36 +297,93 @@ int l2tp_switch_rule_del(const char *attr_name, const char *mode_name,
 		return -1;
 	}
 
+	pthread_rwlock_wrlock(&l2tp_switch_rules_lock);
 	r = rule_find_exact(attr, mode, val, len);
+	if (r)
+		list_del(&r->entry);
+	pthread_rwlock_unlock(&l2tp_switch_rules_lock);
 	if (!r)
 		return -1;
 
-	list_del(&r->entry);
 	free_rule(r);
 
 	return 0;
+}
+
+/* Splits `str` in place on ',' into at most `max` fields, keeping empty ones
+ * (strtok_r() would collapse them and silently shift every later field one
+ * slot left -- an empty secret would turn the mode into the secret).
+ * Returns the number of fields found, or -1 if there are more than `max`
+ * (trailing garbage must be rejected, not ignored). */
+static int split_fields(char *str, char **fields, int max)
+{
+	int n = 0;
+
+	for (;;) {
+		char *comma;
+
+		if (n == max)
+			return -1;
+		fields[n++] = str;
+		comma = strchr(str, ',');
+		if (!comma)
+			return n;
+		*comma = '\0';
+		str = comma + 1;
+	}
+}
+
+static int all_non_empty(char **fields, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (!fields[i][0])
+			return 0;
+	return 1;
+}
+
+/* Target names end up verbatim in Prometheus labels and JSON keys
+ * (extra/metrics.c), so only characters that need no escaping there. */
+static int valid_target_name(const char *name)
+{
+	for (; *name; name++)
+		if (!isalnum((unsigned char)*name) && *name != '_' &&
+		    *name != '-' && *name != '.')
+			return 0;
+	return 1;
 }
 
 static int parse_target(const char *val)
 {
 	/* target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>] */
 	struct l2tp_switch_target_t *t;
-	char *copy, *name, *addr, *port, *secret, *mode_str, *save = NULL;
+	char *copy, *f[5], *name, *addr, *port, *secret, *mode_str, *endp;
+	int nf;
 	long p;
 
 	copy = _strdup(val);
 	if (!copy)
 		return -1;
 
-	name = strtok_r(copy, ",", &save);
-	addr = strtok_r(NULL, ",", &save);
-	port = strtok_r(NULL, ",", &save);
-	secret = strtok_r(NULL, ",", &save);
-	mode_str = strtok_r(NULL, ",", &save); /* optional; NULL if omitted */
-
-	if (!name || !addr || !port || !secret) {
+	nf = split_fields(copy, f, 5);
+	if (nf < 4 || !all_non_empty(f, nf)) {
 		log_error("l2tp-switch: malformed target= \"%s\","
-			  " expected name,peer-addr,peer-port,secret\n", val);
+			  " expected name,peer-addr,peer-port,secret[,mode]"
+			  " with no empty fields (secrets and names cannot"
+			  " contain ',')\n", val);
+		goto err;
+	}
+	name = f[0];
+	addr = f[1];
+	port = f[2];
+	secret = f[3];
+	mode_str = nf == 5 ? f[4] : NULL; /* optional */
+
+	if (!valid_target_name(name)) {
+		log_error("l2tp-switch: invalid target name \"%s\", only"
+			  " letters, digits, '_', '-' and '.' are allowed\n",
+			  name);
 		goto err;
 	}
 
@@ -280,8 +392,8 @@ static int parse_target(const char *val)
 		goto err;
 	}
 
-	p = strtol(port, NULL, 10);
-	if (p <= 0 || p > UINT16_MAX) {
+	p = strtol(port, &endp, 10);
+	if (*endp || p <= 0 || p > UINT16_MAX) {
 		log_error("l2tp-switch: invalid peer-port in target=\"%s\"\n", val);
 		goto err;
 	}
@@ -309,9 +421,7 @@ static int parse_target(const char *val)
 		goto err;
 	}
 
-	/* Default: on-demand -- see this plan's Global Constraints for why
-	 * this is safe to default immediately rather than stage behind a
-	 * later flip (L2TP switching is still unreleased). */
+	/* Default: on-demand. */
 	if (!mode_str || !strcmp(mode_str, "on-demand")) {
 		t->mode = L2TP_SWITCH_MODE_ON_DEMAND;
 	} else if (!strcmp(mode_str, "persistent")) {
@@ -336,34 +446,28 @@ err:
 static int parse_match(const char *val)
 {
 	/* match=<attr-name>,<mode>,<value>,<target-name> */
-	char *copy, *attr_name, *mode_name, *value, *target_name, *save = NULL;
+	char *copy, *f[4];
 	int ret;
 
 	copy = _strdup(val);
 	if (!copy)
 		return -1;
 
-	attr_name = strtok_r(copy, ",", &save);
-	mode_name = strtok_r(NULL, ",", &save);
-	value = strtok_r(NULL, ",", &save);
-	target_name = strtok_r(NULL, ",", &save);
-
-	if (!attr_name || !mode_name || !value || !target_name) {
+	if (split_fields(copy, f, 4) != 4 || !all_non_empty(f, 4)) {
 		log_error("l2tp-switch: malformed match= \"%s\", expected"
-			  " attr-name,mode,value,target-name\n", val);
+			  " attr-name,mode,value,target-name with no empty"
+			  " fields (the value cannot contain ',')\n", val);
 		_free(copy);
 		return -1;
 	}
-
-	ret = l2tp_switch_rule_add(attr_name, mode_name,
-				   (const uint8_t *)value, strlen(value),
-				   target_name);
+	ret = l2tp_switch_rule_add(f[0], f[1], (const uint8_t *)f[2],
+				   strlen(f[2]), f[3]);
 	_free(copy);
 	return ret;
 }
 
-extern in_addr_t l2tp_conf_get_bind_addr(void); /* added to l2tp.c, Task 1 Step 3 */
-extern uint16_t l2tp_conf_get_bind_port(void); /* added to l2tp.c, Task 5 */
+extern in_addr_t l2tp_conf_get_bind_addr(void); /* defined in l2tp.c */
+extern uint16_t l2tp_conf_get_bind_port(void); /* defined in l2tp.c */
 
 static int validate_no_self_loop(void)
 {
@@ -415,6 +519,18 @@ int l2tp_switch_conf_load(void)
 	list_for_each_entry(opt, &s->items, entry) {
 		if (!strcmp(opt->name, "match") && opt->val)
 			if (parse_match(opt->val) < 0)
+				return -1;
+		if (!strcmp(opt->name, "idle-linger") && opt->val)
+			if (parse_timing_sec(opt->name, opt->val,
+					     &conf_idle_linger_sec) < 0)
+				return -1;
+		if (!strcmp(opt->name, "reconnect-interval") && opt->val)
+			if (parse_timing_sec(opt->name, opt->val,
+					     &conf_reconnect_interval_sec) < 0)
+				return -1;
+		if (!strcmp(opt->name, "connect-timeout") && opt->val)
+			if (parse_timing_sec(opt->name, opt->val,
+					     &conf_connect_timeout_sec) < 0)
 				return -1;
 	}
 

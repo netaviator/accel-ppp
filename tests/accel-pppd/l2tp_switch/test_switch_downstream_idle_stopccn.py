@@ -2,10 +2,15 @@ import re
 
 import pytest
 from common import config, accel_pppd_process, l2tp_peer_process
+from helpers import alloc_ports
+
+# reconnect-interval= (seconds) written into the switch config, in place of the
+# daemon's 5s default; the reconnect gap is asserted against it.
+RECONNECT_INTERVAL = 1
 
 
 @pytest.mark.l2tp_switch
-def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd, accel_pppd):
+def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd, accel_pppd, peer_bin):
     # A real downstream peer can tear down accel-ppp's persistent,
     # session-less switch-target tunnel on its own idle-tunnel policy (e.g.
     # JunOS's [edit services l2tp tunnel] idle-timeout, 60s default, firing
@@ -13,7 +18,7 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
     # StopCCN, not a socket failure. accel-ppp's own reconnect must be fast
     # regardless of what idle-timeout value a given customer's peer uses;
     # it cannot rely on every peer tolerating an indefinitely idle tunnel.
-    downstream_port = 17090
+    switch_cli, switch_l2tp, downstream_port = alloc_ports(3)
 
     switch_config = config.make_tmp(
         f"""
@@ -27,19 +32,20 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
     log-file=/dev/stdout
     level=5
     [cli]
-    tcp=127.0.0.1:2001
+    tcp=127.0.0.1:{switch_cli}
     [l2tp]
+    port={switch_l2tp}
     secret=upstreamsecret
     [l2tp-switch]
     # Pinned to persistent: this test's own subject is persistent mode's
     # own reconnect-after-idle-StopCCN timing -- it needs the target's
     # tunnel to come up eagerly, with no call, in the first place. See
-    # docs/superpowers/plans/2026-09-16-l2tp-switch-connection-mode.md.
     target=downstream,127.0.0.1,{downstream_port},downstreamsecret,persistent
+    reconnect-interval={RECONNECT_INTERVAL}
     """
     )
     switch_started, switch_thread, switch_ctrl = accel_pppd_process.start(
-        accel_pppd, ["-c" + switch_config], accel_cmd, 5.0
+        accel_pppd, ["-c" + switch_config], accel_cmd, 5.0, cli_port=switch_cli
     )
     assert switch_started
 
@@ -48,10 +54,10 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
         # tunnel, then immediately sends an unprompted, session-less StopCCN
         # (result=1, error=6) -- see l2tp_switch_peer_test.c's --listen mode
         # for why this plays the acceptor role instead of the usual
-        # upstream/MK one. Two rounds: the first tunnel, and the reconnect
+        # upstream one. Two rounds: the first tunnel, and the reconnect
         # that must follow it.
         peer_thread, peer_ctrl = l2tp_peer_process.start(
-            "/tmp/l2tp_switch_peer_test",
+            peer_bin,
             [
                 "--listen",
                 "--peer-port", str(downstream_port),
@@ -62,10 +68,10 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
         )
 
         # Generous ceiling: today's (buggy) reconnect gap is ~36s; the fix
-        # brings it down to the switch's own ~5s reconnect_timer cadence
-        # (see l2tp.c's l2tp_switch_targets_connect()). 50s comfortably
+        # brings it down to the switch's own reconnect_timer cadence (here
+        # RECONNECT_INTERVAL; see l2tp.c's l2tp_switch_targets_connect()). 30s comfortably
         # covers the harness's own two-round run either way.
-        rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 50.0)
+        rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 30.0)
         assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{out}"
 
         events = {}
@@ -79,16 +85,16 @@ def test_downstream_idle_stopccn_triggers_fast_reconnect(pytestconfig, accel_cmd
 
         # l2tp_tunnel_finwait() used to wait out a full worst-case
         # retransmit cycle (~31s) before even freeing the tunnel, on top of
-        # the switch's own ~5s reconnect_timer cadence -- ~36s total, and
+        # the switch's own reconnect_timer cadence -- ~31s + the cadence, and
         # exactly what production logs showed for a real downstream peer's
         # idle-timeout. The fix removes that unnecessary wait: there is
         # nothing left to retransmit on this path (the send queue was
         # already cleared, and our own ack already went out), leaving just
-        # the intentional ~5s reconnect_timer cadence from Task 3.
-        assert reconnect_gap < 10.0, (
+        # the intentional reconnect_timer cadence (RECONNECT_INTERVAL).
+        assert reconnect_gap < 5.0, (
             f"reconnect took {reconnect_gap:.1f}s after an idle, "
-            f"session-less StopCCN -- expected well under 10s\n{out}"
+            f"session-less StopCCN -- expected well under 5s\n{out}"
         )
     finally:
-        accel_pppd_process.end(switch_thread, switch_ctrl, accel_cmd, 10.0)
+        accel_pppd_process.end(switch_thread, switch_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
         config.delete_tmp(switch_config)

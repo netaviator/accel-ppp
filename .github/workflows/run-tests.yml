@@ -175,7 +175,7 @@ jobs:
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 user@localhost "cd accel-ppp &&
-          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko &&
+          (sudo modprobe l2tp_ppp || echo ::warning::l2tp_ppp_module_unavailable_the_l2tp_switch_tests_will_fail) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko &&
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
@@ -323,7 +323,7 @@ jobs:
         if: ${{ always() }}
         run: >
           ssh -i ssh-key -p2222 alpine@localhost "cd accel-ppp &&
-          (doas modprobe l2tp_ppp || true) && doas modprobe pppox && doas insmod build/drivers/ppposeq/driver/ppposeq.ko &&
+          (doas modprobe l2tp_ppp || echo ::warning::l2tp_ppp_module_unavailable_the_l2tp_switch_tests_will_fail) && doas modprobe pppox && doas insmod build/drivers/ppposeq/driver/ppposeq.ko &&
           lsmod | grep ppposeq"
 
       - name: Run tests (all)
@@ -396,7 +396,7 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || echo ::warning::l2tp_ppp_module_unavailable_the_l2tp_switch_tests_will_fail) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq
@@ -465,7 +465,7 @@ jobs:
         run: |
           sudo insmod build/drivers/vlan_mon/driver/vlan_mon.ko
           sudo insmod build/drivers/ipoe/driver/ipoe.ko
-          (sudo modprobe l2tp_ppp || true) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
+          (sudo modprobe l2tp_ppp || echo ::warning::l2tp_ppp_module_unavailable_the_l2tp_switch_tests_will_fail) && sudo modprobe pppox && sudo insmod build/drivers/ppposeq/driver/ppposeq.ko
           lsmod | grep ipoe
           lsmod | grep vlan_mon
           lsmod | grep ppposeq

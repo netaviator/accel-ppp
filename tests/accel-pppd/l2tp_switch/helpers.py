@@ -87,7 +87,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     log_file
     log_syslog
     l2tp
-
+    {extra}
     [core]
     log-error={err_log}
     [log]
@@ -104,7 +104,6 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     secret={secret}
     [ppp]
     verbose=1
-    {extra}
     """
         )
     # Matches config.make_tmp()'s own print -- this bypasses that function

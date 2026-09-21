@@ -248,6 +248,11 @@ def test_rule_churn_while_calls_are_matched(pytestconfig, accel_cmd, accel_pppd,
                     if dele[0] != 0:
                         failures.append(("del", value, dele))
                     i += 1
+                    # Yield: back-to-back accel-cmd spawns would otherwise
+                    # starve the daemon and the harness on a slow runner,
+                    # and the race under test (CLI thread vs. tunnel
+                    # context) does not need the CLI saturated.
+                    stop.wait(0.05)
 
             churner = threading.Thread(target=churn)
             churner.start()
@@ -263,15 +268,24 @@ def test_rule_churn_while_calls_are_matched(pytestconfig, accel_cmd, accel_pppd,
                             "--calling-number", "472913",
                         ],
                     )
-                    rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
+                    rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 60.0)
                     assert rc == 0, err
             finally:
                 stop.set()
-                churner.join(30.0)
+                churner.join(120.0)
 
             assert not failures, failures[:3]
             assert "uptime" in show_stat(accel_cmd, switch_cli)
-            assert f"matched: {calls}" in switch_show(accel_cmd, switch_cli)
+            # Matching is counted as each ICRQ is handled; on a slow runner
+            # the last one can land after the harness has returned.
+            out = ""
+
+            def all_matched():
+                nonlocal out
+                out = switch_show(accel_cmd, switch_cli)
+                return f"matched: {calls}" in out
+
+            assert wait_for(all_matched, 10.0), out
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)
@@ -328,17 +342,26 @@ def test_rapid_call_churn_leaves_no_pairing(pytestconfig, accel_cmd, accel_pppd,
                         "--calling-number", "472913",
                         "--proxy-username", "churn",
                         "--proxy-password", "churnpw",
+                        # The call is ended on the wire, not by the harness
+                        # merely exiting: the daemon would otherwise only
+                        # learn of the end from an ICMP unreachable, which
+                        # is unreliable on slow/emulated runners. StopCCN
+                        # right after the ICCN still puts the upstream
+                        # teardown next to the downstream leg's setup.
+                        "--send-stopccn",
                     ],
                 )
-                rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
+                rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 90.0)
                 assert rc == 0, err
 
             out = ""
-            for _ in range(100):
+
+            def drained():
+                nonlocal out
                 out = switch_show(accel_cmd, switch_cli)
-                if "  active: 0" in out:
-                    break
-                time.sleep(0.1)
+                return "  active: 0" in out and f"matched: {calls}" in out
+
+            wait_for(drained, 10.0)  # x WAIT_FACTOR: ~60s of patience
             assert "  active: 0" in out, out
             assert f"matched: {calls}" in out, out
             assert "uptime" in show_stat(accel_cmd, switch_cli)

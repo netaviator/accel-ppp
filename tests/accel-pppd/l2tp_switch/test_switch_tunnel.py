@@ -151,7 +151,7 @@ def test_switch_tunnel_on_demand_stays_down_with_no_calls(pytestconfig, accel_cm
                 out = switch_show(accel_cmd, switch_cli)
                 return f"downstream -> 127.0.0.1:{down_l2tp} [up]" in out
 
-            assert not wait_for(target_up, 5.0)
+            assert not wait_for(target_up, 5.0, scale=False)
             assert f"downstream -> 127.0.0.1:{down_l2tp} [idle]" in out
         finally:
             accel_pppd_process.end(

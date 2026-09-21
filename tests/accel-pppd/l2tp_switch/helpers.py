@@ -71,7 +71,7 @@ def read_log(cfg):
     return log + "\n--- log-error ---\n" + err
 
 
-def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra=""):
+def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra="", thread_count=None):
     # cfg's own path has to be known before the config text (which
     # references log_path(cfg)) can be written, so it's reserved directly
     # rather than through config.make_tmp(), which only returns a name
@@ -82,6 +82,11 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     os.close(fd)
     log = log_path(cfg)
     err_log = err_log_path(cfg)
+    # triton runs one worker thread per online CPU by default, so the 1-vCPU
+    # QEMU legs of the CI matrix run the daemon single-threaded; a developer
+    # machine never does. L2TP_TEST_THREAD_COUNT=1 reproduces that here.
+    threads = thread_count or os.environ.get("L2TP_TEST_THREAD_COUNT")
+    thread_line = f"thread-count={threads}" if threads else ""
 
     with open(cfg, "w") as f:
         f.write(
@@ -93,6 +98,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     {extra}
     [core]
     log-error={err_log}
+    {thread_line}
     [log]
     log-file={log}
     level=5
@@ -194,10 +200,26 @@ def alloc_ports(n):
     return ports
 
 
-def wait_for(predicate, timeout, interval=0.1):
+# Positive waits ("wait until the daemon reaches state X") only ever give up
+# on failure, so their timeout is a patience bound, not part of what a test
+# asserts -- and it has to cover slow runners: on the emulated CI legs (QEMU
+# x86_32/s390x, TSAN, loaded shared runners) one accel-cmd round trip alone
+# can take a large fraction of a second and a call's placement several
+# seconds. An earlier version of these tests looped `range(50)` with a short
+# sleep, which on a slow runner waited far longer than its 5 seconds; keep
+# that patience. Override with L2TP_TEST_TIMEOUT_FACTOR.
+WAIT_FACTOR = float(os.environ.get("L2TP_TEST_TIMEOUT_FACTOR", "6"))
+
+
+def wait_for(predicate, timeout, interval=0.1, scale=True):
     """Polls `predicate()` until it returns a truthy value or `timeout`
-    seconds pass. Returns the last value it returned."""
-    deadline = time.monotonic() + timeout
+    seconds (times WAIT_FACTOR, unless `scale` is False) pass. Returns the
+    last value it returned.
+
+    Pass scale=False only for a *negative* check, where the full timeout is
+    spent on purpose to show that a condition does NOT come true.
+    """
+    deadline = time.monotonic() + (timeout * WAIT_FACTOR if scale else timeout)
     value = predicate()
     while not value and time.monotonic() < deadline:
         time.sleep(interval)

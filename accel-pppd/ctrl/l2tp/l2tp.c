@@ -4353,6 +4353,8 @@ struct l2tp_switch_link_t {
 		downstream leg, set once at create time so
 		l2tp_switch_link_read() can reach switch_pap_watcher without
 		re-deriving it from from_upstream on every read */
+	int ack_pending; /* the frame just peeked was an upstream LCP Configure-Ack
+		the PAP watcher wants to be told has been forwarded */
 	int peek_pipe_rd, peek_pipe_wr; /* small side pipe tee() duplicates a
 		peek copy of in-flight frames into, for the live-PAP watcher;
 		always created alongside pipe_rd/pipe_wr and closed the same
@@ -4417,6 +4419,11 @@ struct l2tp_switch_pap_watcher_t {
 	unsigned int request_sent:1;
 	unsigned int logged_conf_req:1; /* the target's first LCP Configure-Request
 		has been logged (see l2tp_switch_pap_log_lcp()) */
+	unsigned int upstream_ack_pending:1; /* an upstream Configure-Ack has been
+		seen but not yet written to the downstream socket */
+	unsigned int upstream_ack_delivered:1; /* ... and now it has been: the
+		downstream can reach LCP Opened, so a PAP request will not be
+		discarded as arriving before it */
 	unsigned int acked_auth_unknown:1; /* the last upstream Configure-Ack was
 		longer than the bytes inspected and showed no auth option */
 	uint16_t acked_auth; /* authentication protocol (PPP protocol number) in
@@ -4872,23 +4879,131 @@ static void l2tp_switch_pap_log_lcp(struct l2tp_switch_pap_watcher_t *w,
  * once the watcher has already resolved (success, failure, or freed). See
  * the big comment above this section for the concurrency rules this
  * function and its helpers above follow. */
-static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int from_upstream,
-				    const uint8_t *buf, size_t len)
+/* Decides, once both LCP Configure-Acks have been seen and the upstream one
+ * has been written to the downstream socket, whether a PAP request is to be
+ * injected. Called with w->lock held. Returns 1 to inject, 0 otherwise (with
+ * *skip set when the decision is "the target does not authenticate with
+ * PAP"). */
+static int l2tp_switch_pap_decide_locked(struct l2tp_switch_pap_watcher_t *w,
+					 int *skip, uint16_t *skip_auth)
+{
+	w->request_sent = 1;
+	if (w->acked_auth == L2TP_SWITCH_PPP_PAP || w->acked_auth_unknown)
+		return 1;
+
+	/* The target does not authenticate with PAP (CHAP, EAP, or nothing at
+	 * all): an injected PAP request would never be answered, and the
+	 * timeout would kill a call that authenticates fine on its own -- the
+	 * upstream peer answers the target's own challenge live. Leave the
+	 * call alone. */
+	__atomic_store_n(&w->resolved, 1, __ATOMIC_RELAXED);
+	*skip = 1;
+	*skip_auth = w->acked_auth;
+	return 0;
+}
+
+static void l2tp_switch_pap_log_skip(struct l2tp_switch_pap_watcher_t *w,
+				     uint16_t skip_auth)
+{
+	if (skip_auth)
+		log_session(log_info1, w->downstream,
+			    "l2tp-switch: downstream authenticates with"
+			    " protocol 0x%04x, not PAP -- no PAP request"
+			    " injected, authentication is left to the"
+			    " upstream peer\n", skip_auth);
+	else
+		log_session(log_info1, w->downstream,
+			    "l2tp-switch: downstream does not ask for"
+			    " authentication -- no PAP request injected\n");
+}
+
+/* Hands the injection to the downstream leg's own context. ALWAYS through
+ * triton_context_call(), from whichever context decided it, never as a
+ * direct call: that guarantees it runs after the forwarding step that is
+ * still in progress on this thread, so it cannot overtake the frame being
+ * written.
+ *
+ * One hold per call to l2tp_switch_pap_send_request(), taken here. That
+ * function releases exactly this hold itself (its own `out` label); the
+ * res < 0 branch below releases it here instead, for the one case where the
+ * scheduling itself failed and send_request() will never run at all. Without
+ * this, a bare pointer to `w` would sit in another context's call queue with
+ * nothing keeping the watcher's memory alive until it runs -- see the
+ * struct's own refcount field comment for the concrete race (a downstream CDN
+ * handled directly, freeing `w`, before a queued call already aimed at it
+ * gets to execute). */
+static void l2tp_switch_pap_start_send(struct l2tp_switch_pap_watcher_t *w)
+{
+	int res = -1;
+
+	l2tp_switch_pap_watcher_hold(w);
+
+	pthread_mutex_lock(&w->downstream->paren_conn->ctx_lock);
+	if (w->downstream->paren_conn->ctx.tpd)
+		res = triton_context_call(&w->downstream->paren_conn->ctx,
+					  l2tp_switch_pap_send_request, w);
+	pthread_mutex_unlock(&w->downstream->paren_conn->ctx_lock);
+	if (res < 0) {
+		/* Downstream's own context is already gone -- that leg is
+		 * tearing down on its own; nothing left for this watcher to
+		 * do. */
+		pthread_mutex_lock(&w->lock);
+		__atomic_store_n(&w->resolved, 1, __ATOMIC_RELAXED);
+		pthread_mutex_unlock(&w->lock);
+		l2tp_switch_pap_watcher_put(w);
+	}
+}
+
+/* Called by the upstream link once the Configure-Ack it reported through
+ * l2tp_switch_pap_observe() (return value 1) has been WRITTEN to the
+ * downstream socket. That ack is what lets the downstream reach LCP Opened;
+ * a PAP request that reached it earlier would be silently discarded as
+ * arriving before authentication is allowed -- and, injected from the
+ * downstream context, it could: nothing ordered the two contexts' writes. */
+static void l2tp_switch_pap_upstream_ack_delivered(struct l2tp_switch_pap_watcher_t *w)
+{
+	int trigger_send = 0, skip = 0;
+	uint16_t skip_auth = 0;
+
+	pthread_mutex_lock(&w->lock);
+	if (w->upstream_ack_pending) {
+		w->upstream_ack_pending = 0;
+		w->upstream_ack_delivered = 1;
+		if (!__atomic_load_n(&w->resolved, __ATOMIC_RELAXED) &&
+		    !w->request_sent && w->seen_confack_from_downstream)
+			trigger_send = l2tp_switch_pap_decide_locked(w, &skip, &skip_auth);
+	}
+	pthread_mutex_unlock(&w->lock);
+
+	if (skip)
+		l2tp_switch_pap_log_skip(w, skip_auth);
+	if (trigger_send)
+		l2tp_switch_pap_start_send(w);
+}
+
+/* Called from l2tp_switch_link_read() with a tee()'d, read-only peek copy of
+ * a chunk that is about to pass through in the given direction. Does nothing
+ * once the watcher has already resolved (success, failure, or freed). Returns
+ * 1 if the frame is an upstream LCP Configure-Ack whose forwarding the caller
+ * must report through l2tp_switch_pap_upstream_ack_delivered(). */
+static int l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int from_upstream,
+				   const uint8_t *buf, size_t len)
 {
 	int trigger_send = 0;
 	int resolved_now = 0;
 	int is_nak = 0;
 	int log_lcp = 0;
 	int skip_injection = 0;
+	int report_delivery = 0;
 	uint16_t skip_auth = 0;
 
 	if (len < 4)
-		return; /* shorter than any control-frame header we care about */
+		return 0; /* shorter than any control-frame header we care about */
 
 	pthread_mutex_lock(&w->lock);
 	if (__atomic_load_n(&w->resolved, __ATOMIC_RELAXED)) {
 		pthread_mutex_unlock(&w->lock);
-		return;
+		return 0;
 	}
 
 	if (!from_upstream && len >= sizeof(struct l2tp_switch_lcp_hdr)) {
@@ -4916,7 +5031,9 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 				/* The upstream peer acknowledging the target's
 				 * Configure-Request echoes its options exactly,
 				 * so this is what the target asked to
-				 * authenticate its peer with. */
+				 * authenticate its peer with. It is only
+				 * counted once it has been forwarded -- see
+				 * l2tp_switch_pap_upstream_ack_delivered(). */
 				uint16_t proto;
 				uint8_t algo;
 				int truncated;
@@ -4930,28 +5047,15 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 					w->acked_auth_unknown = truncated;
 				}
 				w->seen_confack_from_upstream = 1;
+				w->upstream_ack_pending = 1;
+				report_delivery = 1;
 			} else {
 				w->seen_confack_from_downstream = 1;
-			}
-
-			if (w->seen_confack_from_upstream && w->seen_confack_from_downstream) {
-				w->request_sent = 1;
-				if (w->acked_auth == L2TP_SWITCH_PPP_PAP ||
-				    w->acked_auth_unknown) {
-					trigger_send = 1;
-				} else {
-					/* The target does not authenticate with
-					 * PAP (CHAP, EAP, or nothing at all): an
-					 * injected PAP request would never be
-					 * answered, and the timeout would kill a
-					 * call that authenticates fine on its own
-					 * -- the upstream peer answers the
-					 * target's own challenge live. Leave the
-					 * call alone. */
-					__atomic_store_n(&w->resolved, 1, __ATOMIC_RELAXED);
-					skip_injection = 1;
-					skip_auth = w->acked_auth;
-				}
+				/* Otherwise the upstream ack's own delivery
+				 * notification decides, once it happens. */
+				if (w->upstream_ack_delivered)
+					trigger_send = l2tp_switch_pap_decide_locked(
+						w, &skip_injection, &skip_auth);
 			}
 		}
 	} else if (!from_upstream) {
@@ -4977,59 +5081,11 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 	if (log_lcp)
 		l2tp_switch_pap_log_lcp(w, buf, len);
 
-	if (skip_injection) {
-		if (skip_auth)
-			log_session(log_info1, w->downstream,
-				    "l2tp-switch: downstream authenticates with"
-				    " protocol 0x%04x, not PAP -- no PAP request"
-				    " injected, authentication is left to the"
-				    " upstream peer\n", skip_auth);
-		else
-			log_session(log_info1, w->downstream,
-				    "l2tp-switch: downstream does not ask for"
-				    " authentication -- no PAP request"
-				    " injected\n");
-	}
+	if (skip_injection)
+		l2tp_switch_pap_log_skip(w, skip_auth);
 
-	if (trigger_send) {
-		/* One hold per call to l2tp_switch_pap_send_request(), taken
-		 * here regardless of which path reaches it -- direct call or
-		 * scheduled via triton_context_call(). That function releases
-		 * exactly this hold itself (its own `out` label); the res < 0
-		 * branch below releases it here instead, for the one case
-		 * where the scheduling itself failed and send_request() will
-		 * never run at all. Without this, a bare pointer to `w` would
-		 * sit in another context's call queue with nothing keeping
-		 * the watcher's memory alive until it runs -- see this
-		 * struct's own refcount field comment for the concrete race
-		 * (a downstream CDN handled directly, freeing `w`, before a
-		 * queued call already aimed at it gets to execute). */
-		l2tp_switch_pap_watcher_hold(w);
-
-		if (from_upstream) {
-			int res = -1;
-
-			pthread_mutex_lock(&w->downstream->paren_conn->ctx_lock);
-			if (w->downstream->paren_conn->ctx.tpd)
-				res = triton_context_call(&w->downstream->paren_conn->ctx,
-							  l2tp_switch_pap_send_request, w);
-			pthread_mutex_unlock(&w->downstream->paren_conn->ctx_lock);
-			if (res < 0) {
-				/* Downstream's own context is already gone --
-				 * that leg is tearing down on its own; nothing
-				 * left for this watcher to do. send_request()
-				 * was never scheduled, so it will never run to
-				 * release the hold taken above -- release it
-				 * here instead. */
-				pthread_mutex_lock(&w->lock);
-				__atomic_store_n(&w->resolved, 1, __ATOMIC_RELAXED);
-				pthread_mutex_unlock(&w->lock);
-				l2tp_switch_pap_watcher_put(w);
-			}
-		} else {
-			l2tp_switch_pap_send_request(w);
-		}
-	}
+	if (trigger_send)
+		l2tp_switch_pap_start_send(w);
 
 	if (resolved_now) {
 		if (is_nak) {
@@ -5043,6 +5099,8 @@ static void l2tp_switch_pap_observe(struct l2tp_switch_pap_watcher_t *w, int fro
 				    " live PAP request\n");
 		}
 	}
+
+	return report_delivery;
 }
 
 /* Bounded: up to ~1s total (20 * up to 50ms), matching the kind of
@@ -5091,9 +5149,10 @@ static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link)
 			   SPLICE_F_NONBLOCK);
 		if (teed > 0) {
 			got = read(link->peek_pipe_rd, peek, sizeof(peek));
-			if (got > 0)
-				l2tp_switch_pap_observe(w, link->from_upstream,
-							peek, (size_t)got);
+			if (got > 0 &&
+			    l2tp_switch_pap_observe(w, link->from_upstream,
+						    peek, (size_t)got))
+				link->ack_pending = 1;
 		}
 	}
 	l2tp_switch_pap_watcher_put(w);
@@ -5208,6 +5267,20 @@ fail:
 	return -1;
 }
 
+/* Tells the PAP watcher that the upstream LCP Configure-Ack it saw in
+ * l2tp_switch_link_peek() has now been written to the downstream socket. */
+static void l2tp_switch_link_ack_forwarded(struct l2tp_switch_link_t *link)
+{
+	struct l2tp_switch_pap_watcher_t *w =
+		l2tp_switch_pap_watcher_get(link->downstream_sess);
+
+	link->ack_pending = 0;
+	if (!w)
+		return;
+	l2tp_switch_pap_upstream_ack_delivered(w);
+	l2tp_switch_pap_watcher_put(w);
+}
+
 static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 {
 	struct l2tp_switch_link_t *link = container_of(h, typeof(*link), hnd);
@@ -5236,6 +5309,9 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 
 		if (l2tp_switch_link_write_out(link, n) < 0)
 			return 0; /* link is gone */
+
+		if (link->ack_pending)
+			l2tp_switch_link_ack_forwarded(link);
 	}
 }
 

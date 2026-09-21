@@ -28,7 +28,13 @@ IDLE_LINGER = 8.0
 
 
 @pytest.mark.l2tp_switch
-def test_switch_show_lists_per_session_line(pytestconfig, accel_cmd, accel_pppd, peer_bin):
+# 1 worker thread is what triton runs with on a 1-CPU host (its default is one
+# thread per online CPU), including the 1-vCPU QEMU legs of the CI matrix.
+# `l2tp switch show` once handed its per-call walk to the tunnel's context and
+# waited for it on the CLI thread: with a single worker that wait could never
+# be satisfied, so the per-call lines silently vanished there and only there.
+@pytest.mark.parametrize("thread_count", [None, 1], ids=["default-threads", "one-worker-thread"])
+def test_switch_show_lists_per_session_line(pytestconfig, accel_cmd, accel_pppd, peer_bin, thread_count):
     switch_cli, down_cli, switch_l2tp, down_l2tp = alloc_ports(4)
     d_started, d_thread, d_ctrl, d_cfg = start_instance(
         accel_pppd, accel_cmd, down_cli, "127.0.0.1", down_l2tp, "downstreamsecret"
@@ -52,6 +58,7 @@ def test_switch_show_lists_per_session_line(pytestconfig, accel_cmd, accel_pppd,
     target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,persistent
     match=Calling-Number,exact,472913,downstream
     """,
+            thread_count=thread_count,
         )
         assert s_started
 

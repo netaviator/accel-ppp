@@ -71,7 +71,7 @@ def read_log(cfg):
     return log + "\n--- log-error ---\n" + err
 
 
-def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra=""):
+def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra="", thread_count=None):
     # cfg's own path has to be known before the config text (which
     # references log_path(cfg)) can be written, so it's reserved directly
     # rather than through config.make_tmp(), which only returns a name
@@ -82,6 +82,11 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     os.close(fd)
     log = log_path(cfg)
     err_log = err_log_path(cfg)
+    # triton runs one worker thread per online CPU by default, so the 1-vCPU
+    # QEMU legs of the CI matrix run the daemon single-threaded; a developer
+    # machine never does. L2TP_TEST_THREAD_COUNT=1 reproduces that here.
+    threads = thread_count or os.environ.get("L2TP_TEST_THREAD_COUNT")
+    thread_line = f"thread-count={threads}" if threads else ""
 
     with open(cfg, "w") as f:
         f.write(
@@ -93,6 +98,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     {extra}
     [core]
     log-error={err_log}
+    {thread_line}
     [log]
     log-file={log}
     level=5

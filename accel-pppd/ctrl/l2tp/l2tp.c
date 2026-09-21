@@ -231,6 +231,10 @@ struct l2tp_switch_avps {
 struct l2tp_conn_t
 {
 	pthread_mutex_t ctx_lock;
+	pthread_mutex_t sessions_lock; /* guards WRITES to ->sessions (tsearch/
+		tdelete/tdestroy, all on this tunnel's own context) against the
+		`l2tp switch show` walk of it on the CLI thread; reads on the
+		tunnel's own context need no lock */
 	struct triton_context_t ctx;
 
 	struct triton_md_handler_t hnd;
@@ -1095,9 +1099,12 @@ static void l2tp_session_free_ptr(void *ptr)
 
 static void l2tp_tunnel_free_sessions(struct l2tp_conn_t *conn)
 {
-	void *sessions = conn->sessions;
+	void *sessions;
 
+	pthread_mutex_lock(&conn->sessions_lock);
+	sessions = conn->sessions;
 	conn->sessions = NULL;
+	pthread_mutex_unlock(&conn->sessions_lock);
 	tdestroy(sessions, l2tp_session_free_ptr);
 	/* Let l2tp_session_free() handle the session counter and
 	 * the reference held by the tunnel.
@@ -1180,6 +1187,7 @@ static int l2tp_tunnel_disconnect_push(struct l2tp_conn_t *conn,
 static void __tunnel_destroy(struct l2tp_conn_t *conn)
 {
 	pthread_mutex_destroy(&conn->ctx_lock);
+	pthread_mutex_destroy(&conn->sessions_lock);
 
 	if (conn->hnd.fd >= 0)
 		close(conn->hnd.fd);
@@ -1420,14 +1428,17 @@ static void l2tp_session_free(struct l2tp_sess_t *sess)
 		pack->sess_entry.prev = NULL;
 	}
 
+	pthread_mutex_lock(&sess->paren_conn->sessions_lock);
 	if (sess->paren_conn->sessions) {
 		if (!tdelete(sess, &sess->paren_conn->sessions, sess_cmp)) {
+			pthread_mutex_unlock(&sess->paren_conn->sessions_lock);
 			log_session(log_error, sess,
 				    "impossible to delete session:"
 				    " session unreachable from its parent tunnel\n");
 			return;
 		}
 	}
+	pthread_mutex_unlock(&sess->paren_conn->sessions_lock);
 	/* Parent tunnel doesn't hold the session anymore. This is true even
 	 * if sess->paren_conn->sessions was NULL (which means that
 	 * l2tp_session_free() is being called by tdestroy()).
@@ -1972,7 +1983,9 @@ static struct l2tp_sess_t *l2tp_tunnel_new_session(struct l2tp_conn_t *conn)
 		if (sess->sid == 0)
 			continue;
 
+		pthread_mutex_lock(&conn->sessions_lock);
 		sess_search = tsearch(sess, &conn->sessions, sess_cmp);
+		pthread_mutex_unlock(&conn->sessions_lock);
 		if (*sess_search != sess)
 			continue;
 
@@ -2102,6 +2115,7 @@ static struct l2tp_conn_t *l2tp_tunnel_alloc(const struct sockaddr_in *peer,
 
 	memset(conn, 0, sizeof(*conn));
 	pthread_mutex_init(&conn->ctx_lock, NULL);
+	pthread_mutex_init(&conn->sessions_lock, NULL);
 	INIT_LIST_HEAD(&conn->send_queue);
 	INIT_LIST_HEAD(&conn->rtms_queue);
 
@@ -5227,6 +5241,14 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 
 static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 {
+	/* Detach from the owning session first, under the pair lock: the
+	 * `l2tp switch show` walk reads src->switch_link (and the link's byte
+	 * counter) on the CLI thread while holding that same lock, so once
+	 * this returns no reader can still be looking at `link`. */
+	pthread_mutex_lock(&l2tp_switch_pair_lock);
+	link->src->switch_link = NULL;
+	pthread_mutex_unlock(&l2tp_switch_pair_lock);
+
 	/* Every pair has exactly one from_upstream link and one that isn't,
 	 * and -- across every teardown path (the l2tp_session_free() hook,
 	 * l2tp_switch_teardown_peer(), l2tp_switch_link_fail()) -- both
@@ -5269,7 +5291,6 @@ static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 	close(link->pipe_wr);
 	close(link->peek_pipe_rd);
 	close(link->peek_pipe_wr);
-	link->src->switch_link = NULL;
 	_free(link);
 }
 
@@ -5430,7 +5451,9 @@ static int l2tp_switch_link_create(struct l2tp_sess_t *src,
 		return -1;
 	}
 
+	pthread_mutex_lock(&l2tp_switch_pair_lock);
 	src->switch_link = link;
+	pthread_mutex_unlock(&l2tp_switch_pair_lock);
 	return 0;
 }
 
@@ -8208,131 +8231,80 @@ static void switch_show_walk(const void *nodep, VISIT which, int depth)
 {
 	struct l2tp_sess_t *sess = *(struct l2tp_sess_t **)nodep;
 	FILE *out = switch_show_out;
+	struct l2tp_sess_t *up;
+	unsigned long long bytes_in = 0, bytes_out = 0;
+	char calling[64];
+	uint16_t up_tid, up_peer_tid;
 
 	if (which != postorder && which != leaf)
 		return;
-	if (!sess->switch_upstream)
-		return; /* only list downstream legs -- one line per call */
 
-	/* sess->switch_link is this (downstream) leg's own link: it reads
-	 * from the downstream socket and writes to upstream, i.e. it's the
-	 * "target rx / upstream tx" direction (from_upstream == 0). The
-	 * other direction is the upstream leg's own link, reachable via
-	 * sess->switch_upstream->switch_link. Both are read here purely for
-	 * display -- see l2tp_switch_target_t for the persistent, per-target
-	 * totals these feed into once the call ends. */
+	/* Only downstream legs are listed -- one line per call. Everything
+	 * about the pairing is read under the pair lock: it is what
+	 * l2tp_switch_unpair() and l2tp_switch_link_free() take before they
+	 * clear the pointers read here (and before the upstream session, its
+	 * calling number or either link can be freed), so nothing dereferenced
+	 * below can go away while it is held. sess->switch_link is this
+	 * (downstream) leg's own link -- it reads from the downstream socket
+	 * and writes to upstream, i.e. the "target rx / upstream tx" direction;
+	 * the other direction is the upstream leg's own link. Both are read
+	 * purely for display -- see l2tp_switch_target_t for the persistent,
+	 * per-target totals these feed into once the call ends. */
+	pthread_mutex_lock(&l2tp_switch_pair_lock);
+	up = sess->switch_upstream;
+	if (!up) {
+		pthread_mutex_unlock(&l2tp_switch_pair_lock);
+		return;
+	}
+	snprintf(calling, sizeof(calling), "%s",
+		 up->calling_num ? up->calling_num : "?");
+	up_tid = up->paren_conn->tid;
+	up_peer_tid = up->paren_conn->peer_tid;
+	if (sess->switch_link)
+		bytes_in = __atomic_load_n(&sess->switch_link->bytes,
+					   __ATOMIC_RELAXED);
+	if (up->switch_link)
+		bytes_out = __atomic_load_n(&up->switch_link->bytes,
+					    __ATOMIC_RELAXED);
+	pthread_mutex_unlock(&l2tp_switch_pair_lock);
+
 	fprintf(out, "    call: %s tunnel %hu-%hu / %hu-%hu"
 		     " bytes_in=%llu bytes_out=%llu\r\n",
-		 sess->switch_upstream->calling_num ?
-			 sess->switch_upstream->calling_num : "?",
-		 sess->switch_upstream->paren_conn->tid,
-		 sess->switch_upstream->paren_conn->peer_tid,
-		 sess->paren_conn->tid, sess->paren_conn->peer_tid,
-		 (unsigned long long)(sess->switch_link ?
-			 __atomic_load_n(&sess->switch_link->bytes,
-					 __ATOMIC_RELAXED) : 0),
-		 (unsigned long long)(sess->switch_upstream->switch_link ?
-			 __atomic_load_n(&sess->switch_upstream->switch_link->bytes,
-					 __ATOMIC_RELAXED) : 0));
+		calling, up_tid, up_peer_tid,
+		sess->paren_conn->tid, sess->paren_conn->peer_tid,
+		bytes_in, bytes_out);
 }
 
-/* One `l2tp switch show` call listing for one tunnel. The tunnel's sessions
- * tree (and the pairing pointers switch_show_walk() follows) is only ever
- * mutated on the tunnel's own context, so the walk runs there and hands the
- * text back; the CLI thread must not twalk() it directly. Heap-allocated and
- * reference-counted (waiter + callee) so a context call that is slow, or
- * never runs, cannot leave the other side with a dangling pointer. */
-#define L2TP_SWITCH_SHOW_WAIT_SEC 2
-
-struct l2tp_switch_show_req {
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-	struct l2tp_conn_t *conn;
-	char *text;
-	size_t len;
-	int done;
-	int refs;
-};
-
-static void switch_show_req_put(struct l2tp_switch_show_req *req)
+/* Sends the per-call lines of `conn` to `client`. Caller holds a tunnel
+ * reference on conn.
+ *
+ * The walk runs right here on the CLI thread, under conn->sessions_lock --
+ * which every write to the sessions tree also takes -- rather than hopping
+ * onto the tunnel's own context and waiting for it. An earlier version did
+ * the hop and blocked the CLI worker until the context answered; with a
+ * single triton worker thread (the default on a 1-CPU host) the context
+ * could never run while the CLI thread was blocked, the wait always timed
+ * out, and the per-call lines were silently omitted. The text is built in
+ * memory so the lock is never held across the (possibly slow) client
+ * write. */
+static void switch_show_calls(struct l2tp_conn_t *conn, void *client)
 {
-	int refs;
-
-	pthread_mutex_lock(&req->lock);
-	refs = --req->refs;
-	pthread_mutex_unlock(&req->lock);
-	if (refs)
-		return;
-
-	pthread_mutex_destroy(&req->lock);
-	pthread_cond_destroy(&req->cond);
-	free(req->text);
-	_free(req);
-}
-
-static void switch_show_calls_ctx(void *data)
-{
-	struct l2tp_switch_show_req *req = data;
 	char *text = NULL;
 	size_t len = 0;
 	FILE *f = open_memstream(&text, &len);
 
-	if (f) {
-		switch_show_out = f;
-		twalk(req->conn->sessions, switch_show_walk);
-		fclose(f); /* finalizes text/len */
-	}
-
-	pthread_mutex_lock(&req->lock);
-	req->text = text;
-	req->len = f ? len : 0;
-	req->done = 1;
-	pthread_cond_signal(&req->cond);
-	pthread_mutex_unlock(&req->lock);
-
-	tunnel_put(req->conn); /* the hold switch_show_calls() took for us */
-	switch_show_req_put(req);
-}
-
-/* Sends the per-call lines of `conn` to `client`. Caller holds a tunnel
- * reference on conn. */
-static void switch_show_calls(struct l2tp_conn_t *conn, void *client)
-{
-	struct l2tp_switch_show_req *req = _malloc(sizeof(*req));
-	struct timespec deadline;
-	int res = -1;
-
-	if (!req)
+	if (!f)
 		return;
-	memset(req, 0, sizeof(*req));
-	pthread_mutex_init(&req->lock, NULL);
-	pthread_cond_init(&req->cond, NULL);
-	req->conn = conn;
-	req->refs = 2; /* this function + switch_show_calls_ctx() */
-	tunnel_hold(conn); /* the callee's; outlives our own wait if we time out */
 
-	pthread_mutex_lock(&conn->ctx_lock);
-	if (conn->ctx.tpd)
-		res = triton_context_call(&conn->ctx, switch_show_calls_ctx, req);
-	pthread_mutex_unlock(&conn->ctx_lock);
-	if (res < 0) {
-		tunnel_put(conn);
-		switch_show_req_put(req); /* the callee's, never scheduled */
-		switch_show_req_put(req);
-		return;
-	}
+	switch_show_out = f;
+	pthread_mutex_lock(&conn->sessions_lock);
+	twalk(conn->sessions, switch_show_walk);
+	pthread_mutex_unlock(&conn->sessions_lock);
+	fclose(f); /* finalizes text/len */
 
-	clock_gettime(CLOCK_REALTIME, &deadline);
-	deadline.tv_sec += L2TP_SWITCH_SHOW_WAIT_SEC;
-	pthread_mutex_lock(&req->lock);
-	while (!req->done &&
-	       pthread_cond_timedwait(&req->cond, &req->lock, &deadline) == 0)
-		;
-	if (req->done && req->len)
-		cli_send(client, req->text);
-	pthread_mutex_unlock(&req->lock);
-
-	switch_show_req_put(req);
+	if (len)
+		cli_send(client, text);
+	free(text);
 }
 
 static int l2tp_switch_show_exec(const char *cmd, char * const *fields,

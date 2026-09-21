@@ -11,6 +11,8 @@
 # TSAN_OPTIONS / ASAN_OPTIONS / UBSAN_OPTIONS from the calling environment are
 # forwarded, for images built with a sanitizer (suppressions live at
 # /src/tests/tsan.supp inside the container).
+# DOCKER_RUN_ARGS adds extra `docker run` arguments, e.g. DOCKER_RUN_ARGS=--cpus=0.5
+# to imitate a slow CI runner.
 # Re-create the image after rebuilding: shards run the binary baked into it,
 # not the working tree's.
 set -eu
@@ -42,7 +44,8 @@ PY
 pids=""
 for shard in "$work"/shard*; do
     name=$(basename "$shard")
-    docker run --rm --privileged -v "$repo":/src \
+    # shellcheck disable=SC2086 # DOCKER_RUN_ARGS is meant to word-split
+    docker run --rm --privileged ${DOCKER_RUN_ARGS:-} -v "$repo":/src \
         -e TSAN_OPTIONS -e ASAN_OPTIONS -e UBSAN_OPTIONS "$image" sh -c \
         "cd /src/tests && python3 -m pytest -q -p no:cacheprovider -m l2tp_switch $(cat "$shard")" \
         >"$work/$name.log" 2>&1 &

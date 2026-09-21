@@ -1,6 +1,6 @@
 import pytest
 from common import config, accel_pppd_process, l2tp_peer_process
-from helpers import alloc_ports, start_instance, switch_show, wait_up
+from helpers import alloc_ports, start_instance, switch_show, wait_for, wait_up
 
 
 @pytest.mark.l2tp_switch
@@ -45,13 +45,23 @@ def test_switch_forwards_proxy_avps(pytestconfig, accel_cmd, accel_pppd, peer_bi
                     "--proxy-password", "secretpw",
                 ],
             )
-            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
+            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 60.0)
             assert rc == 0, err
 
             # the assertion lives on the switch instance itself: it placed
             # exactly one downstream call carrying the proxy AVPs
-            out = switch_show(accel_cmd, switch_cli)
-            assert "placed: 1" in out
+            # Polled: the downstream placement completes on a tunnel
+            # context and on a slow runner can land after the harness has
+            # already returned.
+            out = ""
+
+            def placed():
+                nonlocal out
+                out = switch_show(accel_cmd, switch_cli)
+                return "placed: 1" in out
+
+            wait_for(placed, 10.0)
+            assert "placed: 1" in out, out
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)

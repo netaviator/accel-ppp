@@ -24,7 +24,7 @@ jobs:
           - distro: "ubuntu-latest"
             sanitizer: "thread"
             env_name: "TSAN_OPTIONS"
-            env_value: "halt_on_error=1:second_deadlock_stack=1:report_thread_leaks=0:suppressions=${{ github.workspace }}/tests/tsan.supp"
+            env_value: "halt_on_error=1:second_deadlock_stack=1:report_thread_leaks=0"
 
     runs-on: ${{ matrix.distro }}
     steps:
@@ -67,7 +67,9 @@ jobs:
 
       - name: Run standalone unit tests (with ${{ matrix.sanitizer }})
         env:
-          ${{ matrix.env_name }}: ${{ matrix.env_value }}
+          # github.workspace is not available inside the matrix definition,
+          # so the TSAN suppressions path is appended here.
+          ${{ matrix.env_name }}: ${{ matrix.env_value }}${{ matrix.sanitizer == 'thread' && format(':suppressions={0}/tests/tsan.supp', github.workspace) || '' }}
         run: |
           gcc -O1 -g -Wall -fno-strict-aliasing -D_GNU_SOURCE \
               -DOPENSSL_API_COMPAT=0x10100000L \
@@ -99,7 +101,9 @@ jobs:
         timeout-minutes: 15
         working-directory: ./tests
         env:
-          ${{ matrix.env_name }}: ${{ matrix.env_value }}
+          # github.workspace is not available inside the matrix definition,
+          # so the TSAN suppressions path is appended here.
+          ${{ matrix.env_name }}: ${{ matrix.env_value }}${{ matrix.sanitizer == 'thread' && format(':suppressions={0}/tests/tsan.supp', github.workspace) || '' }}
         run: sudo -E python3 -m pytest -Wall --order-dependencies -v
 
       - name: Check dmesg for kernel issues

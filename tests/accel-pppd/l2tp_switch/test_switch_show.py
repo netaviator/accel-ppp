@@ -1,16 +1,30 @@
-import pytest
+import re
 import time
+
+import pytest
 from common import config, accel_pppd_process, l2tp_peer_process
 from helpers import (
-    alloc_ports, start_instance, switch_show, tunnels_active,
+    alloc_ports, start_instance, switch_show, finish_harness,
     wait_for, wait_for_tunnels_active, wait_up,
 )
 
 DATA_PATTERN = "SWITCHOK"
 
+
+def _events(out):
+    """[(event-name, timestamp), ...] as the --listen harness logged them."""
+    return [
+        (m.group(1), float(m.group(2)))
+        for m in re.finditer(r"event=(\S+) round=\d+ t=([\d.]+)", out)
+    ]
+
+
+def _times(events, name):
+    return [t for (event, t) in events if event == name]
+
 # Must match the `idle-linger=` written into the [l2tp-switch] configs below
 # (the daemon default is 20s; the tests shorten it to run fast).
-IDLE_LINGER = 4.0
+IDLE_LINGER = 8.0
 
 
 @pytest.mark.l2tp_switch
@@ -52,13 +66,26 @@ def test_switch_show_lists_per_session_line(pytestconfig, accel_cmd, accel_pppd,
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
                     "--data-pattern", DATA_PATTERN,
+                    # Keep the upstream call alive while `show` is polled:
+                    # once the harness process exits the daemon may tear the
+                    # call down at any moment (it learns of it from an ICMP
+                    # unreachable), so on a fast runner the per-call line
+                    # could be gone before the first poll and on a slow one
+                    # the timing is anyone's guess. The harness is joined
+                    # below, after the assertions.
+                    "--hold-seconds", "40",
                 ],
             )
-            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
+            out_box = [""]
+            try:
+                _, out = _wait_show(accel_cmd, switch_cli, "call: 472913", 10.0)
+                assert "call: 472913" in out, out
+                # bytes_out counts the splice's data; wait for it too
+                wait_for(lambda: _bytes_out(_show_into(out_box, accel_cmd, switch_cli)) >= len(DATA_PATTERN), 10.0)
+                out = out_box[0]
+            finally:
+                rc, hout, err = finish_harness(peer_thread, peer_ctrl, 60.0)
             assert rc == 0, err
-
-            _, out = _wait_show(accel_cmd, switch_cli, "call: 472913", 5.0)
-            assert "call: 472913" in out, out
 
             # per-target line: active count and non-zero bytes_out (the
             # harness's upstream-originated write travels target-bound)
@@ -82,6 +109,16 @@ def test_switch_show_lists_per_session_line(pytestconfig, accel_cmd, accel_pppd,
     finally:
         accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=down_cli)
         config.delete_tmp(d_cfg)
+
+
+def _show_into(box, accel_cmd, cli_port):
+    box[0] = switch_show(accel_cmd, cli_port)
+    return box[0]
+
+
+def _bytes_out(out):
+    m = re.search(r"call:.*bytes_out=(\d+)", out)
+    return int(m.group(1)) if m else -1
 
 
 def _wait_show(accel_cmd, cli_port, needle, timeout):
@@ -130,7 +167,7 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
             "--peer-port", str(down_l2tp),
             "--secret", "downstreamsecret",
             "--rounds", "1",
-            "--hold-seconds", "45",
+            "--hold-seconds", "60",
         ],
     )
 
@@ -145,7 +182,7 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
             extra=f"""
     [l2tp-switch]
     target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,on-demand
-    idle-linger=4
+    idle-linger=8
     match=Calling-Number,exact,472913,downstream
     """,
         )
@@ -167,32 +204,44 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
                 ],
             )
 
-            # Best-effort, matching this suite's own tolerance for racy
-            # timing elsewhere (e.g. test_switch_on_demand_connect.py's
-            # mid-connect checks): on a fast loopback connect,
-            # "[connecting]" can come and go between two polls, or never
-            # be observed at all. Not asserted on -- just given a chance.
-            for _ in range(20):
+            # `--send-stopccn` ends the call on the wire right after the
+            # handshake, so how long `[up]`/`active=1` is visible depends on
+            # how fast the downstream connect is relative to that StopCCN --
+            # a race a slow runner can lose. So the live poll below is
+            # best-effort (poll tightly, wait patiently, stop once the call
+            # is over), and the state itself is proven from the downstream
+            # peer's own record afterwards: it must have received the tunnel
+            # setup and the call, i.e. the target really connected on demand.
+            saw_up = False
+            saw_active = False
+
+            def watch():
+                nonlocal saw_up, saw_active
                 out = switch_show(accel_cmd, switch_cli)
                 if "[up]" in out:
-                    break
-                time.sleep(0.05)
+                    saw_up = True
+                if "active=1" in out:
+                    saw_active = True
+                # done once the call was seen and is over again, or the
+                # harness has finished
+                return saw_up or (saw_active and "active=0" in out) or \
+                    peer_ctrl["process"].poll() is not None
 
-            up, out = _wait_show(accel_cmd, switch_cli, "[up]", 8.0)
-            assert up, f"on-demand target never showed [up] once active:\n{out}"
-            assert "active=1" in out, out
+            wait_for(watch, 8.0, interval=0.05)
 
-            rc, harness_out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 20.0)
+            rc, harness_out, err = finish_harness(peer_thread, peer_ctrl, 60.0)
             assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{harness_out}"
 
             idle, out = _wait_show(accel_cmd, switch_cli, "active=0", 15.0)
             assert idle, f"call never ended:\n{out}"
             assert "[idle]" in out, out
-            assert tunnels_active(accel_cmd, switch_cli) == 1, (
-                f"tunnel closed immediately instead of lingering:\n{out}"
-            )
 
-            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER + 5.0, switch_cli)
+            # Whether the tunnel lingers open (rather than closing at once)
+            # is asserted below from the downstream peer's own timestamps: a
+            # client-side "tunnel still open at T" check taken after the
+            # harness process exits lags the daemon's linger start by
+            # seconds on a slow runner.
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER + 30.0, switch_cli)
             assert closed, (
                 f"tunnel never closed after its idle linger (tunnels"
                 f" active={n})"
@@ -204,3 +253,18 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
             config.delete_tmp(s_cfg)
     finally:
         rc, down_out, down_err = l2tp_peer_process.wait(down_thread, down_ctrl, 60.0)
+        assert rc is not None, f"downstream harness never finished:\n{down_out}"
+
+    events = _events(down_out)
+    cdn = _times(events, "recv_cdn")
+    stopccn = _times(events, "recv_stopccn")
+    assert len(_times(events, "recv_sccrq")) == 1, f"expected one tunnel:\n{down_out}"
+    assert len(_times(events, "recv_icrq")) == 1, f"expected one call:\n{down_out}"
+    assert cdn and stopccn, f"downstream never saw the call end and tunnel close:\n{down_out}"
+    # The tunnel lingered (did not close at once) and closed on the switch's
+    # own idle-linger, measured on the downstream peer's own clock.
+    linger = stopccn[0] - cdn[0]
+    assert IDLE_LINGER * 0.8 < linger < IDLE_LINGER + 5.0, (
+        f"tunnel closed {linger:.1f}s after the call ended, not the"
+        f" {IDLE_LINGER:.0f}s linger:\n{down_out}"
+    )

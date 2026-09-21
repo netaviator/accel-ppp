@@ -35,13 +35,13 @@ import time
 import pytest
 from common import config, accel_pppd_process, l2tp_peer_process
 from helpers import (
-    alloc_ports, start_instance, switch_show, tunnels_active,
+    alloc_ports, start_instance, switch_show,
     wait_for, wait_for_tunnels_active,
 )
 
 # Must match the `idle-linger=` written into the [l2tp-switch] configs below
 # (the daemon default is 20s; the tests shorten it to run fast).
-IDLE_LINGER = 4.0
+IDLE_LINGER = 8.0
 
 # Written through the established call before it is torn down. Its real job
 # here is the pause the harness takes around it (see that harness's own
@@ -125,9 +125,9 @@ def _place_and_end_one_call(peer_bin, accel_cmd, cli_port, peer_port, expect_con
     # same one used once the tunnel is actually gone, see
     # docs/l2tp_switching.md's Observability section). The genuine "no
     # idle linger at all" regression this used to catch directly is instead
-    # caught a few seconds later, by this test's own mid-window
-    # tunnels_active() == 1 assertion below -- a zero-linger implementation
-    # would already have torn the tunnel down well before that point.
+    # caught by the tests' downstream-side timing assertions (the peer's own
+    # CDN -> StopCCN delta) -- a zero-linger implementation closes the
+    # tunnel immediately and fails those.
     assert "[idle]" in show, (
         f"target's tunnel is not idle immediately after its last call"
         f" ended:\n{show}"
@@ -146,7 +146,7 @@ def _start_switch(accel_pppd, accel_cmd, cli_port, l2tp_port, downstream_port):
         extra=f"""
     [l2tp-switch]
     target=downstream,127.0.0.1,{downstream_port},downstreamsecret,on-demand
-    idle-linger=4
+    idle-linger={int(IDLE_LINGER)}
     match=Calling-Number,exact,472913,downstream
     """,
     )
@@ -169,42 +169,18 @@ def test_on_demand_tunnel_closes_after_idle_linger(pytestconfig, accel_cmd, acce
 
             ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 1)
 
-            # Mid-window: comfortably past any "close it as soon as the last
-            # call ends" behaviour, and comfortably short of the linger.
-            # `l2tp switch show`'s own status word is "[idle]" either way
-            # here (the CLI deliberately does not distinguish "idle but
-            # still open" from "idle and closed" in that human-facing
-            # summary -- see docs/l2tp_switching.md), so the actual
-            # "still open" claim is checked via `show stat`'s tunnel count
-            # instead, which is unaffected by that ambiguity.
-            time.sleep(IDLE_LINGER * 0.4)
-            out = switch_show(accel_cmd, switch_cli)
-            assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd, switch_cli)
-            assert n == 1, (
-                f"tunnel closed {time.monotonic() - ended:.1f}s after the call"
-                f" ended, well inside the {IDLE_LINGER:.0f}s linger -- a"
-                f" back-to-back call would have to reconnect (tunnels"
-                f" active={n}):\n{out}"
-            )
-
-            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER, switch_cli)
-            closed_after = time.monotonic() - ended
+            # Wait for the tunnel to close on its own. How long the tunnel
+            # stayed open is asserted below from the downstream peer's own
+            # timestamps (its CDN and StopCCN), which are exact; a client-side
+            # timestamp taken after the harness process exits is not -- on a
+            # slow runner it lags the daemon's own linger start by seconds --
+            # so no "still open at T" / "closed no sooner than T" check is
+            # made from here.
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER + 20.0, switch_cli)
             assert closed, (
-                f"target's tunnel was still up {closed_after:.1f}s after its"
-                " last call ended -- it is waiting for the downstream peer's"
-                f" own idle policy instead of closing itself (tunnels"
-                f" active={n})"
-            )
-            # Measured from a client-side timestamp taken once the harness
-            # process has exited, i.e. later than the daemon started its
-            # linger; under a loaded machine (TSAN, shared CI runners) that
-            # gap has been seen to exceed a second, so the bound only has to
-            # rule out "closes as soon as the last call ends", not pin the
-            # window to within a second.
-            assert closed_after > IDLE_LINGER * 0.5, (
-                f"tunnel closed after only {closed_after:.1f}s -- shorter than"
-                f" the {IDLE_LINGER:.0f}s window back-to-back calls rely on"
+                "target's tunnel never closed on its own -- it is waiting for"
+                " the downstream peer's own idle policy instead of closing"
+                f" itself (tunnels active={n})"
             )
             out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
@@ -245,7 +221,7 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
     # An implementation that arms the teardown and then lets it fire blindly
     # therefore closes the tunnel well before that call's own window ends, instead of
     # giving that call's own end a full window of its own.
-    gap = IDLE_LINGER * 0.5
+    gap = IDLE_LINGER * 0.25
 
     switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
     down_thread, down_ctrl = _start_downstream(peer_bin, down_l2tp, 90)
@@ -257,53 +233,18 @@ def test_on_demand_linger_cancelled_by_a_new_call(pytestconfig, accel_cmd, accel
         assert s_started
 
         try:
-            first_ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 1)
-
+            _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 1)
             time.sleep(gap)
-            out = switch_show(accel_cmd, switch_cli)
-            assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd, switch_cli)
-            assert n == 1, (
-                f"tunnel closed {time.monotonic() - first_ended:.1f}s after the"
-                f" first call, before the second one could reuse it (tunnels"
-                f" active={n}):\n{out}"
-            )
+            _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 2)
 
-            second_ended = _place_and_end_one_call(peer_bin, accel_cmd, switch_cli, switch_l2tp, 2)
-
-            # Past the first call's own deadline (first_ended + linger) by a
-            # clear margin (midway between it and the second call's own
-            # deadline): that timer must have been cancelled and re-armed
-            # by the second call, not left to close a tunnel whose idle
-            # window started later.
-            stale_deadline_passed = (first_ended + second_ended) / 2 + IDLE_LINGER
-            time.sleep(max(0.0, stale_deadline_passed - time.monotonic()))
-            out = switch_show(accel_cmd, switch_cli)
-            assert "[idle]" in out, out
-            n = tunnels_active(accel_cmd, switch_cli)
-            assert n == 1, (
-                "tunnel closed on the *first* call's linger deadline"
-                f" ({time.monotonic() - second_ended:.1f}s after the second"
-                f" call ended, not the full window it is owed) (tunnels"
-                f" active={n})"
-            )
-
-            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER, switch_cli)
-            closed_after = time.monotonic() - second_ended
-            assert closed, (
-                f"tunnel still up {closed_after:.1f}s after the second call"
-                f" ended (tunnels active={n})"
-            )
-            # Measured from a client-side timestamp taken once the harness
-            # process has exited, i.e. later than the daemon started its
-            # linger; under a loaded machine (TSAN, shared CI runners) that
-            # gap has been seen to exceed a second, so the bound only has to
-            # rule out "closes as soon as the last call ends", not pin the
-            # window to within a second.
-            assert closed_after > IDLE_LINGER * 0.5, (
-                f"tunnel closed {closed_after:.1f}s after the second call"
-                f" ended -- short of its own {IDLE_LINGER:.0f}s window"
-            )
+            # Everything this test is about -- that the second call reused
+            # the first call's tunnel, and that the tunnel then stayed open
+            # for the second call's own full window rather than closing on
+            # the first call's stale deadline -- is asserted below from the
+            # downstream peer's own timestamps. Client-side timestamps are
+            # not used: on a slow runner they lag the daemon by seconds.
+            closed, _, n = wait_for_tunnels_active(accel_cmd, 0, IDLE_LINGER + 20.0, switch_cli)
+            assert closed, f"tunnel never closed on its own (tunnels active={n})"
             out = switch_show(accel_cmd, switch_cli)
             assert "[idle]" in out, out
         finally:

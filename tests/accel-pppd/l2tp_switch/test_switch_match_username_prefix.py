@@ -56,9 +56,18 @@ def test_switch_matches_on_proxied_username_prefix(pytestconfig, accel_cmd, acce
             rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
             assert rc == 0, err
 
-            (exit, out, err) = process.run([accel_cmd, "-p", str(switch_cli), "l2tp switch show"])
-            assert "matched: 1" in out, out
-            assert "placed: 1" in out, out
+            # "matched" is counted when the ICRQ is handled, but "placed" only
+            # once the downstream leg's ICRQ has been queued and flushed --
+            # after the harness may already have exited, so on a slow runner
+            # a single read right here can still see placed: 0. Poll for it.
+            out = [""]
+
+            def placed():
+                out[0] = switch_show(accel_cmd, switch_cli)
+                return "placed: 1" in out[0]
+
+            assert wait_for(placed, 5.0), out[0]
+            assert "matched: 1" in out[0], out[0]
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)

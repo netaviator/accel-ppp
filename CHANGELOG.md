@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Breaking Changes
+- L2TP switch: removed the live-PAP-injection mechanism. This feature, added to
+  allow switched calls to authenticate against downstream LNS targets that don't
+  consume `Proxy-Authen-*` AVPs, had two confirmed production failure modes: a
+  watcher-creation race that silently disabled injection against fast targets, and
+  redundant injection against calls that had already authenticated live on their
+  own, which broke at least one previously-working partner setup. The switch now
+  requires one of two conditions for authentication: the upstream LAC must relay
+  live PAP/CHAP frames on the wire, or the downstream LNS must consume
+  `Proxy-Authen-*` AVPs itself. See docs/l2tp_switching.md#authentication and the
+  design spec (`docs/superpowers/specs/2026-09-22-l2tp-switch-drop-pap-injection-design.md`)
+  for guidance on diagnosing and resolving this with affected partners.
+
 ### Deprecations
 - `log_pgsql` is deprecated and scheduled for removal. The `LOG_PGSQL` build
   flag now fails the build; build with `LOG_PGSQL_DEPRECATED=TRUE` to keep it

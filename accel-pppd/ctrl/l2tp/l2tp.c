@@ -4907,12 +4907,12 @@ struct l2tp_switch_finish_ctx {
 };
 
 /* Second half of bringing a switched call's splice up, on the DOWNSTREAM
- * leg's own tunnel context: creates the live-PAP watcher and the
- * downstream->upstream link. Both belong to the downstream leg -- they are
- * torn down by its l2tp_session_free()/l2tp_switch_teardown_peer() on this
- * same context -- so creating them here, instead of from the upstream
- * context as an earlier version did, means a concurrent teardown of this
- * leg can no longer miss a half-published link or watcher and leak it.
+ * leg's own tunnel context: creates the downstream->upstream link, which
+ * belongs to the downstream leg and is torn down by its l2tp_session_free()/
+ * l2tp_switch_teardown_peer() on this same context. Creating it here,
+ * instead of from the upstream context as an earlier version did, ensures a
+ * concurrent teardown of this leg cannot miss a half-published link and leak
+ * it.
  *
  * Consumes the two temporary holds l2tp_switch_finish_upstream() carried
  * over in `ctx`, on every path. */

@@ -4779,7 +4779,8 @@ static void l2tp_switch_pap_timeout(struct triton_timer_t *t)
 	log_session(log_error, w->downstream,
 		    "l2tp-switch: downstream never answered our injected live"
 		    " PAP request within %ims, disconnecting call\n",
-		    3000);
+		    3000 /* was l2tp_switch_conf_pap_timeout_ms(); see
+		    	    the comment at the other call site above */);
 	l2tp_session_disconnect_push(w->downstream, 2, 6);
 }
 

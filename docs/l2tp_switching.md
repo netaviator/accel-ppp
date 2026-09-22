@@ -53,6 +53,10 @@ match=<attr-name>,<mode>,<value>,<target-name>
   target whose tunnel failed to come up (or, for a `persistent` target,
   dropped); default `5`, whole seconds 1–3600. Keep it below
   `connect-timeout` if a queued call should get more than one attempt.
+- `pap-timeout=<seconds>` has been removed (it configured the now-deleted
+  live-PAP-injection watcher — see Authentication below). A leftover
+  `pap-timeout=` line in an existing config is silently ignored and does
+  nothing; remove it.
 - `match=<attr-name>,<mode>,<value>,<target-name>` — routes calls to one
   target based on the value of one L2TP AVP. Repeatable; several rules
   may point at the same target.

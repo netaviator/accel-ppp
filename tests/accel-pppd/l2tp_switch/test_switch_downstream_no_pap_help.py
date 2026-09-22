@@ -36,7 +36,7 @@ def test_switch_downstream_no_pap_help(pytestconfig, accel_cmd, accel_pppd, peer
                 "--peer-port", str(down_l2tp),
                 "--secret", "downstreamsecret",
                 "--rounds", "1",
-                "--hold-seconds", "6",
+                "--hold-seconds", "12",
                 "--minimal-lcp",
                 "--lcp-auth", "pap",
             ],
@@ -55,22 +55,32 @@ def test_switch_downstream_no_pap_help(pytestconfig, accel_cmd, accel_pppd, peer
                     "--proxy-username", "injected-user",
                     "--proxy-password", "injected-pass",
                     "--minimal-lcp",
-                    "--hold-seconds", "5",
+                    "--hold-seconds", "10",
                 ],
             )
 
             out = ""
 
-            def still_up():
+            def is_up():
                 nonlocal out
                 out = switch_show(accel_cmd, switch_cli)
                 return "active: 1" in out
 
+            assert wait_for(is_up, 5.0), (
+                f"call never came up:\n{out}"
+                f"\n--- switch log ---\n{read_log(s_cfg)}"
+            )
+
+            def torn_down():
+                nonlocal out
+                out = switch_show(accel_cmd, switch_cli)
+                return "active: 1" not in out
+
             # Negative check (scale=False, per wait_for's own docstring):
-            # nothing on our side should ever tear this call down over the
-            # whole hold window -- proves no injected PAP request, no
-            # reply-timeout, no CDN sent by the switch itself.
-            assert wait_for(still_up, 4.0, scale=False), (
+            # spend the full window watching for the switch to tear the
+            # call down on its own -- confirms no injected PAP request, no
+            # reply-timeout, no CDN from the switch itself.
+            assert not wait_for(torn_down, 4.0, scale=False), (
                 f"switch tore the call down on its own:\n{out}"
                 f"\n--- switch log ---\n{read_log(s_cfg)}"
             )

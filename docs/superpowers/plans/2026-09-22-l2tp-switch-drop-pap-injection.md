@@ -15,7 +15,7 @@
 - **Build and test environment:** the host is macOS; building and running this suite requires a Linux container (linuxkit's kernel has PPPoL2TP built in; macOS does not). Every build/test step in this plan assumes a running privileged container named `accel` with the repo mounted at `/src`:
   ```bash
   docker ps --filter name=^accel$ --format '{{.Names}}' | grep -q accel || \
-    docker run -d --name accel --privileged -v /Users/jgilla/Downloads/accel-ppp:/src debian:12 sleep infinity
+    docker run -d --name accel --privileged -v <repo-path>:/src debian:12 sleep infinity
   docker exec accel bash -c 'command -v cmake || (apt update && apt install -y build-essential cmake libpcre2-dev libssl-dev liblua5.1-0-dev python3-pytest python3-pytest-dependency python3-pytest-order iproute2 ppp pppoe tcpdump timelimit libxml2-dev zlib1g-dev)'
   docker exec accel bash -c 'mkdir -p /build'
   ```

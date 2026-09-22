@@ -4509,18 +4509,25 @@ static void l2tp_switch_link_count_bytes(struct l2tp_switch_link_t *link, ssize_
 	}
 }
 
-/* live-PAP-auth logging: peek at what just landed in link->pipe_rd --
+/* downstream LCP-auth logging: peek at what just landed in link->pipe_rd --
  * tee(2) duplicates, it does not consume, so the real splice(out) that
  * follows sees pipe_rd exactly as if this were not here. Must run before
  * that splice drains pipe_rd. Only the downstream-fed direction is ever
  * worth inspecting -- see l2tp_switch_link_log_lcp_auth(). */
-static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link)
+static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link, ssize_t n)
 {
 	uint8_t peek[64]; /* enough for an LCP Configure-Request's common
 			     options -- see l2tp_switch_link_log_lcp_auth() */
 	ssize_t teed, got;
 
-	if (link->from_upstream)
+	/* LCP frames this logs (Configure-Request with options,
+	 * Protocol-Reject, Terminate-Request) are well under this; ordinary
+	 * data traffic on this direction -- the high-volume subscriber
+	 * download path -- is well over it. Skips the tee()/read() pair on
+	 * every data frame for the call's whole lifetime, unconditionally --
+	 * there is no "done peeking" signal any more the way the removed
+	 * watcher had once PAP resolved. */
+	if (link->from_upstream || n > 128)
 		return;
 
 	teed = tee(link->pipe_rd, link->peek_pipe_wr, sizeof(peek),
@@ -4665,7 +4672,7 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 			return 0;
 
 		l2tp_switch_link_count_bytes(link, n);
-		l2tp_switch_link_peek(link);
+		l2tp_switch_link_peek(link, n);
 
 		if (l2tp_switch_link_write_out(link, n) < 0)
 			return 0; /* link is gone */
@@ -4823,11 +4830,13 @@ static int l2tp_switch_link_create(struct l2tp_sess_t *src,
 	if (pipe2(pfd, O_CLOEXEC | O_NONBLOCK) < 0)
 		return -1;
 
-	/* live-PAP watcher's peek target -- created once here, alongside the
-	 * real splice pipe, and reused for the link's whole lifetime rather
-	 * than per-read (see l2tp_switch_link_read()): a pipe pair per read
-	 * call would be wasteful for a link that keeps carrying steady-state
-	 * data traffic long after PAP resolves. */
+	/* peek target for l2tp_switch_link_log_lcp_auth()'s downstream LCP-auth
+	 * logging -- created once here, alongside the real splice pipe, and
+	 * reused for the link's whole lifetime rather than per-read: a pipe
+	 * pair per read call would be wasteful. The peek itself is skipped
+	 * for any frame over 128 bytes (see l2tp_switch_link_peek()), so
+	 * steady-state data traffic never actually pays for it despite the
+	 * pipe existing for the link's whole life. */
 	if (pipe2(peek_pfd, O_CLOEXEC | O_NONBLOCK) < 0) {
 		close(pfd[0]);
 		close(pfd[1]);

@@ -19,7 +19,7 @@ AVPs. In production it has two independent, confirmed failure modes:
    drops frames when there's no watcher yet (`if (!w) return;`) — no log, no
    error. The watcher's state never gets set, no PAP is ever injected, and
    the call hangs until the target's own native auth timeout kills it.
-   Confirmed against a partner's (Luiz Amaral / IP-Fast) own tcpdump: ICCN
+   Confirmed against the tcpdump of a partner running accel-ppp as their LNS: ICCN
    carries the correct proxied credentials, the target's Configure-Request
    asks for PAP, both Configure-Acks are exchanged correctly, and then
    nothing — 5 seconds of silence — until the target's own Term-Request and
@@ -34,7 +34,7 @@ AVPs. In production it has two independent, confirmed failure modes:
    unsolicited duplicate PAP request, having already moved past the
    Authentication phase, and our own 3-second `pap-timeout` then kills an
    otherwise fully-working, already-passing-traffic call. Confirmed against
-   a second partner (Simon Kautz, Juniper LNS): LCP, authentication, IPCP,
+   a second partner running a Juniper LNS: LCP, authentication, IPCP,
    and bidirectional data all complete successfully, then the switch itself
    sends a CDN (`Result Code 2 / Error Code 6`, RFC 2661 Appendix B —
    "generic vendor-specific error") at very close to exactly 3.00-3.03
@@ -49,15 +49,17 @@ subsystem that has to reconstruct call state by guessing from a side copy of
 traffic, this removes the injection mechanism entirely. The two partners
 onboarded so far are the concrete motivating cases:
 
-- Simon's Juniper: dropping the feature **restores** previously-working
-  behavior (live auth already worked end-to-end before the feature existed).
-- Luiz's accel-ppp LNS: dropping the feature means his setup goes back to
-  not authenticating switched calls, exactly as before the feature was
-  built. This is accepted: he will need to adapt his LNS configuration (or
-  software) to consume the proxied `Proxy-Authen-Name`/`Proxy-Authen-Response`
-  AVPs itself, which is the RFC 2661-compliant way to handle a proxied call
-  in the first place, rather than relying on us to fake a live PPP exchange
-  it can already avoid.
+- The partner running a Juniper LNS: dropping the feature **restores**
+  previously-working behavior (live auth already worked end-to-end before
+  the feature existed).
+- The partner running accel-ppp as their own downstream LNS: dropping the
+  feature means their setup goes back to not authenticating switched
+  calls, exactly as before the feature was built. This is accepted: they
+  will need to adapt their LNS configuration (or software) to consume the
+  proxied `Proxy-Authen-Name`/`Proxy-Authen-Response` AVPs itself, which is
+  the RFC 2661-compliant way to handle a proxied call in the first place,
+  rather than relying on us to fake a live PPP exchange it can already
+  avoid.
 
 ## Scope
 
@@ -167,7 +169,7 @@ feature).
 - Any change to how accel-ppp's normal LNS mode (not the switch) handles
   `Proxy-Authen-*` AVPs on its own incoming calls. Whether accel-ppp could
   usefully gain that as a first-class LNS feature (which would directly
-  help partners like Luiz who run accel-ppp as their own downstream LNS) is
+  help partners running accel-ppp as their own downstream LNS) is
   a separate, independent piece of work, not part of this change.
 - Any change to partner-facing onboarding process/docs beyond the
   in-repo `docs/l2tp_switching.md` update above.

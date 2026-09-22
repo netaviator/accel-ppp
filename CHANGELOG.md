@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-### Breaking Changes
-- L2TP switch: removed the live-PAP-injection mechanism. This feature, added to
+### Breaking / Compatibility
+- L2TP switch: removed the live-PAP-injection mechanism (this mechanism was
+  never released). This feature, added to
   allow switched calls to authenticate against downstream LNS targets that don't
   consume `Proxy-Authen-*` AVPs, had two confirmed production failure modes: a
   watcher-creation race that silently disabled injection against fast targets, and
@@ -11,7 +12,10 @@
   own, which broke at least one previously-working partner setup. The switch now
   requires one of two conditions for authentication: the upstream LAC must relay
   live PAP/CHAP frames on the wire, or the downstream LNS must consume
-  `Proxy-Authen-*` AVPs itself. See docs/l2tp_switching.md#authentication and the
+  `Proxy-Authen-*` AVPs itself. The `pap-timeout=` config option under
+  `[l2tp-switch]` is also removed; an existing `pap-timeout=` line is now
+  silently ignored and should be deleted from config. See
+  docs/l2tp_switching.md#authentication and the
   design spec (`docs/superpowers/specs/2026-09-22-l2tp-switch-drop-pap-injection-design.md`)
   for guidance on diagnosing and resolving this with affected partners.
 

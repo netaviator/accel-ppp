@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Breaking / Compatibility
+- L2TP switch: removed the live-PAP-injection mechanism (this mechanism was
+  never released). This feature, added to
+  allow switched calls to authenticate against downstream LNS targets that don't
+  consume `Proxy-Authen-*` AVPs, had two confirmed production failure modes: a
+  watcher-creation race that silently disabled injection against fast targets, and
+  redundant injection against calls that had already authenticated live on their
+  own, which broke at least one previously-working partner setup. The switch now
+  requires one of two conditions for authentication: the upstream LAC must relay
+  live PAP/CHAP frames on the wire, or the downstream LNS must consume
+  `Proxy-Authen-*` AVPs itself. The `pap-timeout=` config option under
+  `[l2tp-switch]` is also removed; an existing `pap-timeout=` line is now
+  silently ignored and should be deleted from config. See
+  docs/l2tp_switching.md#authentication and the
+  design spec (`docs/superpowers/specs/2026-09-22-l2tp-switch-drop-pap-injection-design.md`)
+  for guidance on diagnosing and resolving this with affected partners.
+
 ### Deprecations
 - `log_pgsql` is deprecated and scheduled for removal. The `LOG_PGSQL` build
   flag now fails the build; build with `LOG_PGSQL_DEPRECATED=TRUE` to keep it
@@ -12,7 +29,6 @@
 ### Features
 - New `metrics` module: HTTP endpoint exposing the same numbers as `accel-cmd show stat` at `/metrics`, in either Prometheus exposition or JSON format. Configurable listen address and optional IPv4 CIDR allow-list.
 - L2TP: switch mode (RFC 2661 section 5.1) -- relay a configured subset of incoming calls to a downstream LNS instead of terminating PPP/RADIUS locally, selecting the target per call by Calling-Number, Called-Number, or a realm/prefix in the proxied username (`[l2tp-switch]`, `l2tp switch show|add|del`); each target can be `persistent` (eager, reconnect forever) or `on-demand` (default: connect only when needed, idle-teardown after 20s). See docs/l2tp_switching.md.
-- L2TP switch: inject a live PAP `Authenticate-Request` on a switched call's downstream leg once LCP has settled, built from the credentials already captured via the upstream leg's proxied `Proxy-Authen-*` AVPs, so switched calls authenticate correctly against a downstream LNS that doesn't itself consume those AVPs (most don't). Passive: the existing splice(2) relay is never disturbed, no local PPP session or RADIUS lookup is involved, and the credential bytes are only ever relayed, never validated locally. PAP only. See docs/l2tp_switching.md#authentication.
 
 ## 1.14.0 - 2026-01-24
 

@@ -56,7 +56,6 @@ static void free_rule(struct l2tp_switch_rule_t *r)
 static int conf_idle_linger_sec = L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC;
 static int conf_connect_timeout_sec = L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC;
 static int conf_reconnect_interval_sec = L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC;
-static int conf_pap_timeout_sec = L2TP_SWITCH_DEFAULT_PAP_TIMEOUT_SEC;
 
 int l2tp_switch_conf_idle_linger_ms(void)
 {
@@ -71,11 +70,6 @@ int l2tp_switch_conf_connect_timeout_ms(void)
 int l2tp_switch_conf_reconnect_interval_ms(void)
 {
 	return conf_reconnect_interval_sec * 1000;
-}
-
-int l2tp_switch_conf_pap_timeout_ms(void)
-{
-	return conf_pap_timeout_sec * 1000;
 }
 
 /* Parses a whole number of seconds in [1, L2TP_SWITCH_MAX_TIMING_SEC]. */
@@ -99,7 +93,6 @@ static void switch_conf_clear(void)
 	conf_idle_linger_sec = L2TP_SWITCH_DEFAULT_IDLE_LINGER_SEC;
 	conf_connect_timeout_sec = L2TP_SWITCH_DEFAULT_CONNECT_TIMEOUT_SEC;
 	conf_reconnect_interval_sec = L2TP_SWITCH_DEFAULT_RECONNECT_INTERVAL_SEC;
-	conf_pap_timeout_sec = L2TP_SWITCH_DEFAULT_PAP_TIMEOUT_SEC;
 
 	struct l2tp_switch_rule_t *r;
 	struct l2tp_switch_target_t *t;
@@ -534,10 +527,6 @@ int l2tp_switch_conf_load(void)
 		if (!strcmp(opt->name, "reconnect-interval") && opt->val)
 			if (parse_timing_sec(opt->name, opt->val,
 					     &conf_reconnect_interval_sec) < 0)
-				return -1;
-		if (!strcmp(opt->name, "pap-timeout") && opt->val)
-			if (parse_timing_sec(opt->name, opt->val,
-					     &conf_pap_timeout_sec) < 0)
 				return -1;
 		if (!strcmp(opt->name, "connect-timeout") && opt->val)
 			if (parse_timing_sec(opt->name, opt->val,

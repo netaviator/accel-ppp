@@ -255,13 +255,6 @@ static int serve_minimal_lcp_and_cdn(int fd, const struct sockaddr_in *their_add
 	       round, now_monotonic());
 	fflush(stdout);
 
-	if (expect_pap_name &&
-	    wait_for_pap_request(data_fd, expect_pap_name, expect_pap_password,
-				 5, round) != 0) {
-		close(data_fd);
-		return -1;
-	}
-
 	if (cdn_after_lcp_ms > 0) {
 		struct l2tp_packet_t *pack;
 		struct l2tp_avp_result_code res = { htons(1), htons(0) };

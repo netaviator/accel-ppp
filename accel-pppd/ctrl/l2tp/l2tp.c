@@ -4744,7 +4744,9 @@ static void l2tp_switch_pap_send_request(void *data)
 		    "l2tp-switch: injected live PAP request on downstream leg\n");
 
 	w->timeout_timer.expire = l2tp_switch_pap_timeout;
-	w->timeout_timer.period = l2tp_switch_conf_pap_timeout_ms();
+	w->timeout_timer.period = 3000; /* was l2tp_switch_conf_pap_timeout_ms();
+	the config option was removed in this task -- the whole watcher
+	this belongs to is removed in the next task */
 	if (triton_timer_add(&downstream->paren_conn->ctx, &w->timeout_timer, 0) < 0)
 		log_session(log_warn, downstream,
 			    "l2tp-switch: failed to arm live PAP reply timeout"
@@ -4777,7 +4779,7 @@ static void l2tp_switch_pap_timeout(struct triton_timer_t *t)
 	log_session(log_error, w->downstream,
 		    "l2tp-switch: downstream never answered our injected live"
 		    " PAP request within %ims, disconnecting call\n",
-		    l2tp_switch_conf_pap_timeout_ms());
+		    3000);
 	l2tp_session_disconnect_push(w->downstream, 2, 6);
 }
 

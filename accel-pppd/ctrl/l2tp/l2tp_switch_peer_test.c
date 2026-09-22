@@ -224,14 +224,6 @@ int cdn_timeout = 5;
  * if l2tp_switch_pap_send_request() has no liveness check on the watcher
  * it dereferences (see test_switch_downstream_pap_race.py). */
 int cdn_after_lcp_ms;
-/* --listen + --minimal-lcp only: after this call's own minimal LCP settles,
- * wait for the switch's injected PAP Authenticate-Request and answer it
- * directly -- see wait_for_pap_request()'s own comment. Both must be set
- * together or not at all (enforced at option-parsing time below); NULL
- * (the default) skips this step entirely, same as omitting
- * --cdn-after-lcp-ms skips that one. */
-const char *expect_pap_name;
-const char *expect_pap_password;
 const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -321,8 +313,6 @@ int main(int argc, char **argv)
 		{"sccrp-storm-ms", required_argument, 0, 'M'},
 		{"cdn-timeout", required_argument, 0, 'T'},
 		{"cdn-after-lcp-ms", required_argument, 0, 'C'},
-		{"expect-pap-name", required_argument, 0, 'E'},
-		{"expect-pap-password", required_argument, 0, 'P'},
 		{0, 0, 0, 0},
 	};
 
@@ -339,7 +329,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:E:P:A:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:A:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -420,12 +410,6 @@ int main(int argc, char **argv)
 			if (cdn_after_lcp_ms < 0)
 				return die("invalid --cdn-after-lcp-ms");
 			break;
-		case 'E':
-			expect_pap_name = optarg;
-			break;
-		case 'P':
-			expect_pap_password = optarg;
-			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -438,8 +422,7 @@ int main(int argc, char **argv)
 				   " [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
 				   " [--sccrp-storm-ms M] [--hold-seconds N]"
-				   " [--minimal-lcp [--cdn-after-lcp-ms M |"
-				   " --expect-pap-name U --expect-pap-password W]]]");
+				   " [--minimal-lcp [--cdn-after-lcp-ms M]]]");
 		}
 	}
 
@@ -448,15 +431,6 @@ int main(int argc, char **argv)
 
 	if (lcp_auth != LCP_AUTH_NONE && !minimal_lcp)
 		return die("--lcp-auth requires --minimal-lcp");
-
-	if (!!expect_pap_name != !!expect_pap_password)
-		return die("--expect-pap-name and --expect-pap-password must be"
-			   " given together");
-	if (expect_pap_name && !(listen_mode && minimal_lcp))
-		return die("--expect-pap-name requires --listen and --minimal-lcp");
-	if (expect_pap_name && cdn_after_lcp_ms > 0)
-		return die("--expect-pap-name and --cdn-after-lcp-ms are"
-			   " mutually exclusive");
 
 	if (listen_mode)
 		return run_listen_mode(listen_rounds);

@@ -55,8 +55,6 @@ extern int sccrp_delay_ms;
 extern int sccrp_storm_ms;
 extern int cdn_timeout;
 extern int cdn_after_lcp_ms;
-extern const char *expect_pap_name;
-extern const char *expect_pap_password;
 extern const char *second_call_number;
 extern uint16_t local_tid;
 extern uint16_t local_sid;
@@ -71,9 +69,6 @@ void comp_chap_md5(uint8_t *md5, uint8_t ident,
 		   const void *chall, size_t chall_len);
 int run_real_ppp(int data_fd);
 int run_minimal_lcp(int data_fd, int timeout_seconds);
-int wait_for_pap_request(int data_fd, const char *expect_name,
-			 const char *expect_password,
-			 int timeout_seconds, int round);
 
 /* l2tp_switch_peer_listen.c */
 int run_listen_mode(int rounds);

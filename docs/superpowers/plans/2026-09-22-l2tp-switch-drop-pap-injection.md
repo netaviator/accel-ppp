@@ -816,6 +816,18 @@ acting as a transparent pipe. **accel-ppp does not perform, complete, or
 relay authentication on the target's behalf** — it is a byte pipe, not a
 PPP peer, for this phase of the call.
 
+**accel-ppp plays both L2TP roles, one per leg — never one role for the
+whole call.** Upstream, it is the **LNS**: the real upstream LAC (whatever
+originally accepted the call — a DSLAM/BNG, another L2TP switch, etc.)
+tunnels the call to accel-ppp, which receives it. Downstream, it is the
+**LAC**: accel-ppp originates the outbound tunnel to the target, and per
+RFC 2661 it is specifically the LAC's role to send `Proxy-Authen-*` AVPs
+to the LNS when it already holds the client's credentials — which is
+exactly what accel-ppp does in the proxied path below. Bear this in mind
+when talking to a downstream partner about their configuration: their LNS
+platform's own documentation will use "LAC" to describe what accel-ppp is
+doing on this leg.
+
 **Requirement: exactly one of the following two conditions must hold, or
 the call will not authenticate.**
 
@@ -831,8 +843,9 @@ the call will not authenticate.**
    33) — optionally `Proxy-Authen-Challenge` (AVP 31) and
    `Proxy-Authen-ID` (AVP 32) for CHAP — on the call's ICCN (RFC 2661
    §4.4.2/§4.4.4), and never puts a live PAP/CHAP frame on the wire at all.
-   accel-ppp captures these AVPs off the *upstream* ICCN and re-injects
-   them verbatim into the ICCN it sends *downstream* to the target (see
+   accel-ppp captures these AVPs off the *upstream* ICCN it received (as
+   the LNS for that leg) and re-injects them verbatim into the ICCN it
+   sends *downstream* to the target (as the LAC for that leg — see
    `Configuration` above) — that is the entire extent of what this switch
    does with them. **The downstream target's own LNS software must consume
    these AVPs itself** — treating the call as already authenticated from

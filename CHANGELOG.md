@@ -19,6 +19,20 @@
   design spec (`docs/superpowers/specs/2026-09-22-l2tp-switch-drop-pap-injection-design.md`)
   for guidance on diagnosing and resolving this with affected partners.
 
+### Fixes
+- L2TP switch: fixed a data-loss race on the upstream leg of a switched
+  call. The upstream session's kernel socket used to stay unconnected until
+  the downstream leg's own connect handshake finished; any data frame the
+  real upstream peer sent in that window (most importantly its live LCP/PAP)
+  was silently dropped by the kernel, with no log anywhere. On an on-demand
+  target with no already-warm tunnel -- a fresh downstream handshake on
+  every call -- this reliably lost the upstream peer's opening PPP frames
+  and left the call hanging until the downstream target's own auth timeout
+  tore it down. The upstream socket is now connected as soon as the call is
+  recognized as switched, the same point the non-switch path already
+  connects it, so the kernel holds any early frames in its receive buffer
+  instead of dropping them.
+
 ### Deprecations
 - `log_pgsql` is deprecated and scheduled for removal. The `LOG_PGSQL` build
   flag now fails the build; build with `LOG_PGSQL_DEPRECATED=TRUE` to keep it

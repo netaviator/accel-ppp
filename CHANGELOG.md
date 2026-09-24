@@ -33,6 +33,15 @@
   connects it, so the kernel holds any early frames in its receive buffer
   instead of dropping them.
 
+### Debugging
+- L2TP switch: logs (debug level) which proxy AVP it captured off an
+  upstream ICCN, and the decoded value of `Proxy-Authen-Type` specifically
+  -- settling whether the upstream attempted proxy auth at all without
+  needing a raw packet capture of the upstream leg, which a downstream
+  partner reporting an auth problem usually cannot provide themselves.
+  `Proxy-Authen-Name`/`Challenge`/`Response` are credential material and are
+  never logged by value, only that an AVP of that id was present.
+
 ### Deprecations
 - `log_pgsql` is deprecated and scheduled for removal. The `LOG_PGSQL` build
   flag now fails the build; build with `LOG_PGSQL_DEPRECATED=TRUE` to keep it

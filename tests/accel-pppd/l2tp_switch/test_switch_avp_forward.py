@@ -1,6 +1,6 @@
 import pytest
 from common import config, accel_pppd_process, l2tp_peer_process
-from helpers import alloc_ports, start_instance, switch_show, wait_for, wait_up
+from helpers import alloc_ports, start_instance, read_log, switch_show, wait_for, wait_up, finish_harness
 
 
 @pytest.mark.l2tp_switch
@@ -68,3 +68,81 @@ def test_switch_forwards_proxy_avps(pytestconfig, accel_cmd, accel_pppd, peer_bi
     finally:
         accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=down_cli)
         config.delete_tmp(d_cfg)
+
+
+@pytest.mark.l2tp_switch
+def test_switch_logs_captured_proxy_authen_type_without_leaking_credentials(
+    pytestconfig, accel_cmd, accel_pppd, peer_bin
+):
+    """Diagnosing whether a given switched call's upstream ICCN actually
+    carried Proxy-Authen-Type -- e.g. a partner reporting their downstream
+    LNS never sees it -- currently requires a raw packet capture of the
+    upstream leg, which isn't always available (a downstream partner can
+    usually only capture their own leg, not ours). l2tp_switch_capture_avp()
+    now logs, at debug level, which proxy AVP it captured and, for
+    Proxy-Authen-Type specifically, its decoded value -- the one field
+    whose presence/value settles that question without needing a capture at
+    all. Proxy-Authen-Name/Challenge/Response are credential material (RFC
+    2661 4.4.5) and must never appear in the log themselves -- only that an
+    AVP of that id was captured, never its value.
+    """
+    switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
+
+    down_thread, down_ctrl = l2tp_peer_process.start(
+        peer_bin,
+        [
+            "--listen",
+            "--peer-port", str(down_l2tp),
+            "--secret", "downstreamsecret",
+            "--rounds", "1",
+            "--hold-seconds", "8",
+        ],
+    )
+
+    try:
+        s_started, s_thread, s_ctrl, s_cfg = start_instance(
+            accel_pppd,
+            accel_cmd,
+            switch_cli,
+            "127.0.0.1",
+            switch_l2tp,
+            "upstreamsecret",
+            extra=f"""
+    [l2tp-switch]
+    target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,persistent
+    match=Calling-Number,exact,472913,downstream
+    """,
+        )
+        assert s_started
+
+        try:
+            assert "[up]" in wait_up(accel_cmd, switch_cli)
+
+            peer_thread, peer_ctrl = l2tp_peer_process.start(
+                peer_bin,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", str(switch_l2tp),
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "472913",
+                    "--proxy-username", "simon",
+                    "--proxy-password", "secretpw",
+                ],
+            )
+            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
+            assert rc == 0, err
+
+            log = read_log(s_cfg)
+            assert "captured proxy AVP Proxy-Authen-Type (id=29" in log, (
+                f"expected a debug log line for the captured Proxy-Authen-Type AVP:\n{log}"
+            )
+            assert "upstream ICCN proxy authen type = 3" in log, (
+                f"expected the decoded Proxy-Authen-Type value (3 == PAP) in the log:\n{log}"
+            )
+            assert "simon" not in log, "the proxied username leaked into the log"
+            assert "secretpw" not in log, "the proxied password leaked into the log"
+        finally:
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
+            config.delete_tmp(s_cfg)
+    finally:
+        finish_harness(down_thread, down_ctrl, 15.0)

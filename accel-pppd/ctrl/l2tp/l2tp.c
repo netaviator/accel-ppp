@@ -5246,6 +5246,24 @@ static int l2tp_switch_capture_avp(struct l2tp_sess_t *sess,
 	}
 
 	sess->switch_avps->count++;
+
+	/* Name/Challenge/Response are credential material (RFC 2661 4.4.5) --
+	 * only that an AVP of this id was captured is logged, never its
+	 * value. Type is the one exception: its value (0-5, which auth
+	 * mechanism) isn't sensitive, and is exactly what settles whether the
+	 * upstream even attempted proxy auth in the first place -- otherwise
+	 * only answerable from a raw capture of the upstream leg, which a
+	 * downstream partner reporting a problem usually cannot provide (they
+	 * can only capture their own leg, not ours). */
+	log_session(log_debug, sess,
+		    "l2tp-switch: captured proxy AVP %s (id=%d, len=%d)"
+		    " from upstream ICCN\n",
+		    attr->attr->name, attr->attr->id, slot->len);
+	if (attr->attr->id == Proxy_Authen_Type)
+		log_session(log_debug, sess,
+			    "l2tp-switch: upstream ICCN proxy authen type = %d\n",
+			    attr->val.uint16);
+
 	return 0;
 }
 

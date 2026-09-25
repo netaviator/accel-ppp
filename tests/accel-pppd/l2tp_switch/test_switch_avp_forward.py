@@ -132,15 +132,24 @@ def test_switch_logs_captured_proxy_authen_type_without_leaking_credentials(
             rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 15.0)
             assert rc == 0, err
 
-            log = read_log(s_cfg)
-            assert "captured proxy AVP Proxy-Authen-Type (id=29" in log, (
-                f"expected a debug log line for the captured Proxy-Authen-Type AVP:\n{log}"
+            # log_file.c writes are queued and drained by their own
+            # context, not synchronous with the call that logged them --
+            # the harness exiting is no guarantee the daemon's log has
+            # caught up yet. Poll rather than read once.
+            log = [""]
+
+            def type_logged():
+                log[0] = read_log(s_cfg)
+                return "upstream ICCN proxy authen type = 3" in log[0]
+
+            assert wait_for(type_logged, 5.0), (
+                f"expected the decoded Proxy-Authen-Type value (3 == PAP) in the log:\n{log[0]}"
             )
-            assert "upstream ICCN proxy authen type = 3" in log, (
-                f"expected the decoded Proxy-Authen-Type value (3 == PAP) in the log:\n{log}"
+            assert "captured proxy AVP Proxy-Authen-Type (id=29" in log[0], (
+                f"expected a debug log line for the captured Proxy-Authen-Type AVP:\n{log[0]}"
             )
-            assert "simon" not in log, "the proxied username leaked into the log"
-            assert "secretpw" not in log, "the proxied password leaked into the log"
+            assert "simon" not in log[0], "the proxied username leaked into the log"
+            assert "secretpw" not in log[0], "the proxied password leaked into the log"
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)

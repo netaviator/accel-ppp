@@ -142,15 +142,24 @@ def test_switch_matches_on_username_prefix_still_captures_proxy_authen_type(
             rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
             assert rc == 0, err
 
-            log = read_log(s_cfg)
-            assert "captured proxy AVP Proxy-Authen-Name" in log, (
-                f"sanity check failed -- the match itself didn't fire:\n{log}"
+            # log_file.c writes are queued and drained by their own
+            # context, not synchronous with the call that logged them --
+            # the harness exiting is no guarantee the daemon's log has
+            # caught up yet. Poll rather than read once.
+            log = [""]
+
+            def name_logged():
+                log[0] = read_log(s_cfg)
+                return "captured proxy AVP Proxy-Authen-Name" in log[0]
+
+            assert wait_for(name_logged, 5.0), (
+                f"sanity check failed -- the match itself didn't fire:\n{log[0]}"
             )
-            assert "captured proxy AVP Proxy-Authen-Type" in log, (
+            assert "captured proxy AVP Proxy-Authen-Type" in log[0], (
                 "Proxy-Authen-Type was not captured off the upstream ICCN"
                 " even though Proxy-Authen-Name was -- it arrived earlier"
                 " in the same ICCN, before the username-prefix match set"
-                f" sess->switch_target:\n{log}"
+                f" sess->switch_target:\n{log[0]}"
             )
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)

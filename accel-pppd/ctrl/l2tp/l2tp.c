@@ -6128,9 +6128,27 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 			 * reinterprets a small integer as a pointer and
 			 * crashes on the memcpy -- confirmed by reproducing
 			 * this exact segfault on a real VM before narrowing
-			 * the case grouping to just these AVPs). */
-			if (sess->switch_target &&
-			    l2tp_switch_capture_avp(sess, attr) < 0) {
+			 * the case grouping to just these AVPs).
+			 *
+			 * Deliberately NOT gated on sess->switch_target: the
+			 * match attempt above only sets it once the AVP it
+			 * actually matches on is reached, which for an
+			 * ICCN-time match (Proxy-Authen-Name, most commonly)
+			 * can be *after* Proxy-Authen-Type -- Type is
+			 * attribute id 29, numerically (and so positionally,
+			 * on every encoder checked against this) ahead of
+			 * Name/Challenge/ID/Response. Gating capture on
+			 * switch_target already being set silently dropped
+			 * Type alone whenever the match rule matched a later
+			 * AVP in the same ICCN, while Name/Response (visited
+			 * after the match fired) were captured fine --
+			 * confirmed against a partner's own capture of the
+			 * switch's outbound ICCN. Capturing unconditionally
+			 * costs nothing for a call that turns out not to be
+			 * switched: l2tp_session_free() already frees
+			 * sess->switch_avps regardless of switch_target (see
+			 * l2tp_switch_unpair()). */
+			if (l2tp_switch_capture_avp(sess, attr) < 0) {
 				log_session(log_error, sess,
 					    "impossible to handle ICCN:"
 					    " capturing proxy AVP failed\n");

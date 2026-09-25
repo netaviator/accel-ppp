@@ -32,6 +32,19 @@
   recognized as switched, the same point the non-switch path already
   connects it, so the kernel holds any early frames in its receive buffer
   instead of dropping them.
+- L2TP switch: fixed `Proxy-Authen-Type` being silently dropped from the
+  switch's own outbound ICCN to the downstream target whenever the switch's
+  `match=` rule fires on an ICCN-time AVP (`Proxy-Authen-Name`, most
+  commonly) rather than an ICRQ-time one (`Calling-Number`/`Called-Number`).
+  AVP capture off the upstream ICCN was gated on the target match having
+  already been resolved, but the match itself is only resolved once the
+  matching AVP is reached in the same pass over ICCN's attributes --
+  `Proxy-Authen-Type` (AVP id 29) sits earlier in that attribute order than
+  `Proxy-Authen-Name`/`Challenge`/`ID`/`Response` (ids 30-33), so it was
+  visited, and silently skipped, before the match fired. The other
+  Proxy-Authen AVPs, visited after the match, were captured and forwarded
+  correctly -- reported by a partner who saw Type missing from the switch's
+  ICCN to their LNS while the rest were present.
 
 ### Debugging
 - L2TP switch: logs (debug level) which proxy AVP it captured off an

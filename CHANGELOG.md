@@ -19,6 +19,42 @@
   design spec (`docs/superpowers/specs/2026-09-22-l2tp-switch-drop-pap-injection-design.md`)
   for guidance on diagnosing and resolving this with affected partners.
 
+### Fixes
+- L2TP switch: fixed a data-loss race on the upstream leg of a switched
+  call. The upstream session's kernel socket used to stay unconnected until
+  the downstream leg's own connect handshake finished; any data frame the
+  real upstream peer sent in that window (most importantly its live LCP/PAP)
+  was silently dropped by the kernel, with no log anywhere. On an on-demand
+  target with no already-warm tunnel -- a fresh downstream handshake on
+  every call -- this reliably lost the upstream peer's opening PPP frames
+  and left the call hanging until the downstream target's own auth timeout
+  tore it down. The upstream socket is now connected as soon as the call is
+  recognized as switched, the same point the non-switch path already
+  connects it, so the kernel holds any early frames in its receive buffer
+  instead of dropping them.
+- L2TP switch: fixed `Proxy-Authen-Type` being silently dropped from the
+  switch's own outbound ICCN to the downstream target whenever the switch's
+  `match=` rule fires on an ICCN-time AVP (`Proxy-Authen-Name`, most
+  commonly) rather than an ICRQ-time one (`Calling-Number`/`Called-Number`).
+  AVP capture off the upstream ICCN was gated on the target match having
+  already been resolved, but the match itself is only resolved once the
+  matching AVP is reached in the same pass over ICCN's attributes --
+  `Proxy-Authen-Type` (AVP id 29) sits earlier in that attribute order than
+  `Proxy-Authen-Name`/`Challenge`/`ID`/`Response` (ids 30-33), so it was
+  visited, and silently skipped, before the match fired. The other
+  Proxy-Authen AVPs, visited after the match, were captured and forwarded
+  correctly -- reported by a partner who saw Type missing from the switch's
+  ICCN to their LNS while the rest were present.
+
+### Debugging
+- L2TP switch: logs (debug level) which proxy AVP it captured off an
+  upstream ICCN, and the decoded value of `Proxy-Authen-Type` specifically
+  -- settling whether the upstream attempted proxy auth at all without
+  needing a raw packet capture of the upstream leg, which a downstream
+  partner reporting an auth problem usually cannot provide themselves.
+  `Proxy-Authen-Name`/`Challenge`/`Response` are credential material and are
+  never logged by value, only that an AVP of that id was present.
+
 ### Deprecations
 - `log_pgsql` is deprecated and scheduled for removal. The `LOG_PGSQL` build
   flag now fails the build; build with `LOG_PGSQL_DEPRECATED=TRUE` to keep it

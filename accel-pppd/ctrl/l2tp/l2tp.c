@@ -4964,10 +4964,10 @@ out:
 }
 
 /* First half, on the UPSTREAM leg's context (scheduled from the downstream
- * leg's ICRP handling): connects upstream's kernel socket and creates the
- * upstream->downstream link, then hands over to
- * l2tp_switch_finish_downstream() for the downstream leg's own half. The
- * two temporary holds travel with `ctx`. */
+ * leg's ICRP handling): creates the upstream->downstream link (upstream's
+ * own kernel socket is already connected -- see l2tp_recv_ICCN()), then
+ * hands over to l2tp_switch_finish_downstream() for the downstream leg's
+ * own half. The two temporary holds travel with `ctx`. */
 static void l2tp_switch_finish_upstream(void *data)
 {
 	struct l2tp_switch_finish_ctx *ctx = data;
@@ -4989,12 +4989,11 @@ static void l2tp_switch_finish_upstream(void *data)
 	if (upstream->state1 == STATE_CLOSE || downstream->state1 == STATE_CLOSE)
 		goto put_holds;
 
-	if (l2tp_session_connect_socket(upstream, 0) < 0) {
-		log_session(log_error, upstream,
-			    "l2tp-switch: connecting upstream kernel socket"
-			    " failed\n");
-		goto err;
-	}
+	/* upstream's kernel socket is already connected -- l2tp_recv_ICCN()
+	 * does it as soon as the call is recognized as switched, specifically
+	 * so the kernel starts holding the real peer's data frames instead of
+	 * dropping them while the downstream handshake below is still in
+	 * flight. See its own comment for why. */
 
 	if (l2tp_switch_link_create(upstream, downstream,
 				    upstream->switch_target, 1) < 0) {
@@ -5247,6 +5246,24 @@ static int l2tp_switch_capture_avp(struct l2tp_sess_t *sess,
 	}
 
 	sess->switch_avps->count++;
+
+	/* Name/Challenge/Response are credential material (RFC 2661 4.4.5) --
+	 * only that an AVP of this id was captured is logged, never its
+	 * value. Type is the one exception: its value (0-5, which auth
+	 * mechanism) isn't sensitive, and is exactly what settles whether the
+	 * upstream even attempted proxy auth in the first place -- otherwise
+	 * only answerable from a raw capture of the upstream leg, which a
+	 * downstream partner reporting a problem usually cannot provide (they
+	 * can only capture their own leg, not ours). */
+	log_session(log_debug, sess,
+		    "l2tp-switch: captured proxy AVP %s (id=%d, len=%d)"
+		    " from upstream ICCN\n",
+		    attr->attr->name, attr->attr->id, slot->len);
+	if (attr->attr->id == Proxy_Authen_Type)
+		log_session(log_debug, sess,
+			    "l2tp-switch: upstream ICCN proxy authen type = %d\n",
+			    attr->val.uint16);
+
 	return 0;
 }
 
@@ -6111,9 +6128,27 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 			 * reinterprets a small integer as a pointer and
 			 * crashes on the memcpy -- confirmed by reproducing
 			 * this exact segfault on a real VM before narrowing
-			 * the case grouping to just these AVPs). */
-			if (sess->switch_target &&
-			    l2tp_switch_capture_avp(sess, attr) < 0) {
+			 * the case grouping to just these AVPs).
+			 *
+			 * Deliberately NOT gated on sess->switch_target: the
+			 * match attempt above only sets it once the AVP it
+			 * actually matches on is reached, which for an
+			 * ICCN-time match (Proxy-Authen-Name, most commonly)
+			 * can be *after* Proxy-Authen-Type -- Type is
+			 * attribute id 29, numerically (and so positionally,
+			 * on every encoder checked against this) ahead of
+			 * Name/Challenge/ID/Response. Gating capture on
+			 * switch_target already being set silently dropped
+			 * Type alone whenever the match rule matched a later
+			 * AVP in the same ICCN, while Name/Response (visited
+			 * after the match fired) were captured fine --
+			 * confirmed against a partner's own capture of the
+			 * switch's outbound ICCN. Capturing unconditionally
+			 * costs nothing for a call that turns out not to be
+			 * switched: l2tp_session_free() already frees
+			 * sess->switch_avps regardless of switch_target (see
+			 * l2tp_switch_unpair()). */
+			if (l2tp_switch_capture_avp(sess, attr) < 0) {
 				log_session(log_error, sess,
 					    "impossible to handle ICCN:"
 					    " capturing proxy AVP failed\n");
@@ -6150,6 +6185,32 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 	}
 
 	if (sess->switch_target) {
+		/* Connect the upstream leg's own kernel socket right now,
+		 * rather than waiting for the downstream leg's handshake to
+		 * finish (the old l2tp_switch_finish_upstream() timing) --
+		 * matching exactly when the non-switch path below already
+		 * does it for an ordinary call. Once connect() registers this
+		 * session with the kernel's L2TP subsystem, any data frame
+		 * the real upstream peer sends is held in this socket's own
+		 * (already forced to L2TP_SWITCH_SOCKBUF_SIZE) receive
+		 * buffer until something reads it -- exactly the same
+		 * absorb-a-burst mechanism l2tp_switch_set_sockbuf() already
+		 * relies on elsewhere. Before this, the kernel has no session
+		 * registered for this ID at all and silently drops the
+		 * frame; on an on-demand target with no already-warm tunnel,
+		 * the downstream handshake this triggers below can easily
+		 * take longer than the real peer waits before sending its
+		 * first live PPP frame. */
+		if (l2tp_session_connect_socket(sess, 0) < 0) {
+			log_session(log_error, sess,
+				    "impossible to switch call:"
+				    " connecting upstream kernel socket"
+				    " failed, disconnecting session\n");
+			l2tp_session_disconnect(sess, 2, 6);
+
+			return -1;
+		}
+
 		if (l2tp_switch_place_downstream_call(sess) < 0) {
 			log_session(log_error, sess,
 				    "impossible to switch call:"

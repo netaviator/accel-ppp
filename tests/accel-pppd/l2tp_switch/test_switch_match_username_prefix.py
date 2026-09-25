@@ -1,7 +1,7 @@
 import pytest
 import time
 from common import process, config, accel_pppd_process, l2tp_peer_process
-from helpers import alloc_ports, start_instance, switch_show, wait_for, wait_up
+from helpers import alloc_ports, start_instance, read_log, switch_show, wait_for, wait_up
 
 
 @pytest.mark.l2tp_switch
@@ -68,6 +68,99 @@ def test_switch_matches_on_proxied_username_prefix(pytestconfig, accel_cmd, acce
 
             assert wait_for(placed, 5.0), out[0]
             assert "matched: 1" in out[0], out[0]
+        finally:
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
+            config.delete_tmp(s_cfg)
+    finally:
+        accel_pppd_process.end(d_thread, d_ctrl, accel_cmd, 10.0, cli_port=down_cli)
+        config.delete_tmp(d_cfg)
+
+
+@pytest.mark.l2tp_switch
+def test_switch_matches_on_username_prefix_still_captures_proxy_authen_type(
+    pytestconfig, accel_cmd, accel_pppd, peer_bin
+):
+    """Proxy-Authen-Type (id 29) is numerically, and therefore
+    positionally, the first of the Proxy-Authen-* AVPs on the wire -- the
+    test harness's own ICCN builder adds it before Name and Response (see
+    l2tp_switch_peer_test.c), matching every real LAC's encoder this has
+    been checked against.
+
+    When the match rule is on Calling-Number (available at ICRQ time),
+    sess->switch_target is already set before ICCN's own AVP loop even
+    starts, so every Proxy-Authen-* AVP in it -- Type included -- gets
+    captured. But when the match rule is on Proxy-Authen-Name (or any
+    other ICCN-time AVP), sess->switch_target is only set partway through
+    that same loop, at the AVP that actually matches. Type, arriving
+    earlier in the same ICCN, is visited while switch_target is still
+    unset -- and l2tp_recv_ICCN's capture call was gated on switch_target
+    already being set, so Type was silently never captured at all, while
+    Name/Response (visited after the match fires) were. See
+    l2tp_switch_capture_avp()'s own debug logging, added specifically to
+    make this diagnosable without a packet capture.
+    """
+    switch_cli, down_cli, switch_l2tp, down_l2tp = alloc_ports(4)
+    d_started, d_thread, d_ctrl, d_cfg = start_instance(
+        accel_pppd, accel_cmd, down_cli, "127.0.0.1", down_l2tp, "downstreamsecret"
+    )
+    assert d_started
+
+    try:
+        s_started, s_thread, s_ctrl, s_cfg = start_instance(
+            accel_pppd,
+            accel_cmd,
+            switch_cli,
+            "127.0.0.1",
+            switch_l2tp,
+            "upstreamsecret",
+            extra=f"""
+    [l2tp-switch]
+    # Pinned to persistent, and matched on Proxy-Authen-Name rather than
+    # Calling-Number, same reasoning as
+    # test_switch_matches_on_proxied_username_prefix() above -- this is the
+    # config shape that exposes the ordering hazard this test is about.
+    target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,persistent
+    match=Proxy-Authen-Name,prefix,downstream-,downstream
+    """,
+        )
+        assert s_started
+
+        try:
+            assert "[up]" in wait_up(accel_cmd, switch_cli)
+
+            peer_thread, peer_ctrl = l2tp_peer_process.start(
+                peer_bin,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", str(switch_l2tp),
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "000000",
+                    "--proxy-username", "downstream-54546#level66@bsa-vdsl",
+                    "--proxy-password", "irrelevant",
+                ],
+            )
+            rc, out, err = l2tp_peer_process.wait(peer_thread, peer_ctrl, 10.0)
+            assert rc == 0, err
+
+            # log_file.c writes are queued and drained by their own
+            # context, not synchronous with the call that logged them --
+            # the harness exiting is no guarantee the daemon's log has
+            # caught up yet. Poll rather than read once.
+            log = [""]
+
+            def name_logged():
+                log[0] = read_log(s_cfg)
+                return "captured proxy AVP Proxy-Authen-Name" in log[0]
+
+            assert wait_for(name_logged, 5.0), (
+                f"sanity check failed -- the match itself didn't fire:\n{log[0]}"
+            )
+            assert "captured proxy AVP Proxy-Authen-Type" in log[0], (
+                "Proxy-Authen-Type was not captured off the upstream ICCN"
+                " even though Proxy-Authen-Name was -- it arrived earlier"
+                " in the same ICCN, before the username-prefix match set"
+                f" sess->switch_target:\n{log[0]}"
+            )
         finally:
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)

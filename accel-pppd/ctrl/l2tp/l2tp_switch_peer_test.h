@@ -55,6 +55,7 @@ extern int sccrp_delay_ms;
 extern int sccrp_storm_ms;
 extern int cdn_timeout;
 extern int cdn_after_lcp_ms;
+extern int cdn_after_iccn_ms;
 extern const char *second_call_number;
 extern uint16_t local_tid;
 extern uint16_t local_sid;

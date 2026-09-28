@@ -224,6 +224,12 @@ int cdn_timeout = 5;
  * if l2tp_switch_pap_send_request() has no liveness check on the watcher
  * it dereferences (see test_switch_downstream_pap_race.py). */
 int cdn_after_lcp_ms;
+/* --listen only: wait this many ms after a call's ICCN is acked, then send
+ * that call's CDN -- like --cdn-after-lcp-ms, but with no data socket and no
+ * LCP, so it works against an upstream that only writes a raw --data-pattern
+ * probe. Every --listen mode's own hold (--hold-seconds) still applies to the
+ * tunnel afterwards. */
+int cdn_after_iccn_ms;
 const char *second_call_number;
 /* Randomized per-process rather than fixed: the kernel's L2TP core keys
  * tunnels by tunnel_id alone (global per network namespace), not per
@@ -313,6 +319,7 @@ int main(int argc, char **argv)
 		{"sccrp-storm-ms", required_argument, 0, 'M'},
 		{"cdn-timeout", required_argument, 0, 'T'},
 		{"cdn-after-lcp-ms", required_argument, 0, 'C'},
+		{"cdn-after-iccn-ms", required_argument, 0, 'I'},
 		{0, 0, 0, 0},
 	};
 
@@ -329,7 +336,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:A:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:I:A:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -410,6 +417,11 @@ int main(int argc, char **argv)
 			if (cdn_after_lcp_ms < 0)
 				return die("invalid --cdn-after-lcp-ms");
 			break;
+		case 'I':
+			cdn_after_iccn_ms = atoi(optarg);
+			if (cdn_after_iccn_ms < 0)
+				return die("invalid --cdn-after-iccn-ms");
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -422,12 +434,16 @@ int main(int argc, char **argv)
 				   " [--hold-seconds N]"
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
 				   " [--sccrp-storm-ms M] [--hold-seconds N]"
-				   " [--minimal-lcp [--cdn-after-lcp-ms M]]]");
+				   " [--minimal-lcp [--cdn-after-lcp-ms M]]"
+				   " [--cdn-after-iccn-ms M]]");
 		}
 	}
 
 	if (cdn_after_lcp_ms > 0 && !(listen_mode && minimal_lcp))
 		return die("--cdn-after-lcp-ms requires --listen and --minimal-lcp");
+
+	if (cdn_after_iccn_ms > 0 && !listen_mode)
+		return die("--cdn-after-iccn-ms requires --listen");
 
 	if (lcp_auth != LCP_AUTH_NONE && !minimal_lcp)
 		return die("--lcp-auth requires --minimal-lcp");

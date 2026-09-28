@@ -74,8 +74,15 @@ def test_switch_never_splices_into_a_reused_destination_fd(
     """
     switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
     shim_log = str(tmp_path / "shim.log")
+    # An ASAN-built daemon refuses to start when the preloaded shim precedes
+    # libasan in the initial library list; the shim only wraps splice(), so
+    # skipping that check is safe.
+    asan_options = ":".join(
+        filter(None, [os.environ.get("ASAN_OPTIONS"), "verify_asan_link_order=0"])
+    )
     env = dict(
         os.environ,
+        ASAN_OPTIONS=asan_options,
         LD_PRELOAD=splice_delay_shim,
         SPLICE_SHIM_MARKER=DATA_PATTERN,
         SPLICE_SHIM_DELAY_MS=str(SHIM_DELAY_MS),

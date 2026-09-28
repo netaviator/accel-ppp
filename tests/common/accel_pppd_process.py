@@ -15,9 +15,9 @@ def accel_pppd_thread_func(accel_pppd_control):
     print("accel_pppd_thread_func: after wait")
 
 
-def start(accel_pppd, args, accel_cmd, max_wait_time, cli_port=None):
+def start(accel_pppd, args, accel_cmd, max_wait_time, cli_port=None, env=None):
     print("accel_pppd_start: begin")
-    accel_pppd_process = Popen([accel_pppd] + args, stdout=PIPE, stderr=PIPE)
+    accel_pppd_process = Popen([accel_pppd] + args, stdout=PIPE, stderr=PIPE, env=env)
     accel_pppd_control = {"process": accel_pppd_process}
     accel_pppd_thread = Thread(
         target=accel_pppd_thread_func,

@@ -131,6 +131,40 @@ static int send_sccrp_storm(int fd, const struct sockaddr_in *their_addr,
 	return 0;
 }
 
+/* Sends a CDN for one call over the control channel `fd`. Returns 0, or
+ * die()'s non-zero result after reporting the failure. */
+static int send_call_cdn(int fd, const struct sockaddr_in *their_addr,
+			 uint16_t their_tid, uint16_t their_sid,
+			 uint16_t our_sid, uint16_t *my_ns,
+			 const uint16_t *peer_next_nr)
+{
+	struct l2tp_packet_t *pack;
+	struct l2tp_avp_result_code res = { htons(1), htons(0) };
+
+	pack = l2tp_packet_alloc(2, Message_Type_Call_Disconnect_Notify,
+				 their_addr, 0, secret, strlen(secret));
+	if (!pack)
+		return die("CDN alloc failed");
+	/* RFC 2661 5.1: Assigned-Session-ID here is the *sender's*
+	 * own id for this call -- ours -- while the header sid is
+	 * always the recipient's, same convention the ICRP above
+	 * already follows for their_sid/our_sid. */
+	l2tp_packet_add_int16(pack, Assigned_Session_ID, our_sid, 1);
+	l2tp_packet_add_octets(pack, Result_Code, (uint8_t *)&res,
+			       sizeof(res), 1);
+	pack->hdr.tid = htons(their_tid);
+	pack->hdr.sid = htons(their_sid);
+	pack->hdr.Ns = htons((*my_ns)++);
+	pack->hdr.Nr = htons(*peer_next_nr);
+	if (l2tp_packet_send(fd, pack) < 0) {
+		l2tp_packet_free(pack);
+		return die("CDN send failed");
+	}
+	l2tp_packet_free(pack);
+
+	return 0;
+}
+
 /*
  * Plays the *downstream target's* role instead of the usual upstream
  * one: binds --peer-port (any source address, since the switch's own
@@ -256,34 +290,13 @@ static int serve_minimal_lcp_and_cdn(int fd, const struct sockaddr_in *their_add
 	fflush(stdout);
 
 	if (cdn_after_lcp_ms > 0) {
-		struct l2tp_packet_t *pack;
-		struct l2tp_avp_result_code res = { htons(1), htons(0) };
-
 		usleep((useconds_t)cdn_after_lcp_ms * 1000);
 
-		pack = l2tp_packet_alloc(2, Message_Type_Call_Disconnect_Notify,
-					 their_addr, 0, secret, strlen(secret));
-		if (!pack) {
+		if (send_call_cdn(fd, their_addr, their_tid, their_sid, our_sid,
+				  my_ns, peer_next_nr)) {
 			close(data_fd);
-			return die("CDN alloc failed");
+			return 1;
 		}
-		/* RFC 2661 5.1: Assigned-Session-ID here is the *sender's*
-		 * own id for this call -- ours -- while the header sid is
-		 * always the recipient's, same convention the ICRP above
-		 * already follows for their_sid/our_sid. */
-		l2tp_packet_add_int16(pack, Assigned_Session_ID, our_sid, 1);
-		l2tp_packet_add_octets(pack, Result_Code, (uint8_t *)&res,
-				       sizeof(res), 1);
-		pack->hdr.tid = htons(their_tid);
-		pack->hdr.sid = htons(their_sid);
-		pack->hdr.Ns = htons((*my_ns)++);
-		pack->hdr.Nr = htons(*peer_next_nr);
-		if (l2tp_packet_send(fd, pack) < 0) {
-			l2tp_packet_free(pack);
-			close(data_fd);
-			return die("CDN send failed");
-		}
-		l2tp_packet_free(pack);
 
 		printf("event=sent_cdn round=%d t=%.6f\n", round, now_monotonic());
 		fflush(stdout);
@@ -419,6 +432,23 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			if (cdn_after_lcp_ms > 0)
 				break; /* the race this round exists to force is
 					  already over; nothing more to serve */
+		}
+
+		/* --cdn-after-iccn-ms: end this call from the target's side
+		 * once its ICCN has been acked, without a data socket or LCP of
+		 * its own. Lets a driving test tear the downstream leg down at
+		 * a chosen moment while the upstream leg is still carrying
+		 * traffic. */
+		if (type == Message_Type_Incoming_Call_Connected &&
+		    cdn_after_iccn_ms > 0) {
+			usleep((useconds_t)cdn_after_iccn_ms * 1000);
+			if (send_call_cdn(fd, their_addr, their_tid,
+					  call_their_sid, call_our_sid,
+					  my_ns, peer_next_nr))
+				return 1;
+			printf("event=sent_cdn round=%d t=%.6f\n", round,
+			       now_monotonic());
+			fflush(stdout);
 		}
 
 		if (stop)

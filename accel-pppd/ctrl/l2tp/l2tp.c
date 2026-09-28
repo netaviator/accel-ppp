@@ -187,6 +187,13 @@ struct l2tp_sess_t
 	struct list_head send_queue;
 
 	pthread_mutex_t apses_lock;
+	pthread_mutex_t switch_fd_lock; /* switched calls only: makes "read
+		ppp.fd and splice() into it" (the OTHER leg's link, on the other
+		tunnel's context) and "close ppp.fd" (this leg's own link, on this
+		one's) mutually exclusive, so a splice can never land on an fd
+		number this session already closed and something else reopened.
+		Leaf lock, held only around one non-blocking splice or one
+		close(); see l2tp_switch_link_splice_out() */
 	struct triton_context_t apses_ctx;
 	int apses_state;
 	struct ap_ctrl ctrl;
@@ -1209,6 +1216,7 @@ static void __session_destroy(struct l2tp_sess_t *sess)
 	struct l2tp_conn_t *conn = sess->paren_conn;
 
 	pthread_mutex_destroy(&sess->apses_lock);
+	pthread_mutex_destroy(&sess->switch_fd_lock);
 
 	if (sess->ppp.fd >= 0)
 		close(sess->ppp.fd);
@@ -2020,6 +2028,7 @@ static struct l2tp_sess_t *l2tp_tunnel_alloc_session(struct l2tp_conn_t *conn)
 	sess->timeout_timer.period = conf_timeout * 1000;
 
 	pthread_mutex_init(&sess->apses_lock, NULL);
+	pthread_mutex_init(&sess->switch_fd_lock, NULL);
 	ppp_init(&sess->ppp);
 
 	/* The tunnel holds a reference to the session */
@@ -4551,6 +4560,36 @@ static int l2tp_switch_link_wait_writable(int fd, int timeout_ms)
 	return poll(&pfd, 1, timeout_ms);
 }
 
+/* One splice() of up to `n` bytes from link->pipe_rd into the destination
+ * leg's socket, with that fd read and used under the destination session's
+ * switch_fd_lock: the destination leg closes it (l2tp_switch_link_free()) on
+ * the OTHER tunnel's context, and without the lock the number could be closed
+ * and handed out again to an unrelated open() between the load and the
+ * splice(), which would then write this call's PPP payload into that fd.
+ *
+ * Sets *dst_fd to the fd used (-1: already closed, nothing was spliced) and
+ * returns splice()'s result with errno intact. Never blocks under the lock:
+ * both ends are O_NONBLOCK (the pipe from l2tp_switch_link_create(), the
+ * socket from l2tp_session_connect_socket()). */
+static ssize_t l2tp_switch_link_splice_out(struct l2tp_switch_link_t *link,
+					   ssize_t n, int *dst_fd)
+{
+	struct l2tp_sess_t *dst = link->dst;
+	ssize_t w = -1;
+	int err = EBADF;
+
+	pthread_mutex_lock(&dst->switch_fd_lock);
+	*dst_fd = __atomic_load_n(&dst->ppp.fd, __ATOMIC_RELAXED);
+	if (*dst_fd >= 0) {
+		w = splice(link->pipe_rd, NULL, *dst_fd, NULL, n, SPLICE_F_MOVE);
+		err = errno;
+	}
+	pthread_mutex_unlock(&dst->switch_fd_lock);
+
+	errno = err;
+	return w;
+}
+
 /* Splices `n` bytes from link->pipe_rd out to the destination leg. Returns 0
  * on success, -1 after failing the link -- the caller must not touch `link`
  * again in that case, l2tp_switch_link_fail() may have freed it. */
@@ -4561,16 +4600,17 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 
 	while (n > 0) {
 		/* The destination leg tears down on the OTHER tunnel's context
-		 * and sets its fd to -1 (l2tp_switch_link_free()) without
-		 * synchronizing with this one: read it once per lap, and treat
-		 * "gone" as the peer closing rather than as a splice failure. */
-		int dst_fd = __atomic_load_n(&link->dst->ppp.fd, __ATOMIC_RELAXED);
-		ssize_t w;
+		 * and sets its fd to -1 (l2tp_switch_link_free()): read it once
+		 * per lap, under its lock, and treat "gone" as the peer closing
+		 * rather than as a splice failure. The poll()s below use the
+		 * fd after the lock is dropped, which is harmless: at worst
+		 * they wait on a reused fd for a bounded time and the next lap
+		 * finds it gone. */
+		int dst_fd;
+		ssize_t w = l2tp_switch_link_splice_out(link, n, &dst_fd);
 
 		if (dst_fd < 0)
 			goto peer_gone;
-
-		w = splice(link->pipe_rd, NULL, dst_fd, NULL, n, SPLICE_F_MOVE);
 
 		if (w >= 0) {
 			enomem_retries = 0;
@@ -4718,14 +4758,22 @@ static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 	}
 
 	if (link->hnd.tpd) {
-		triton_md_unregister_handler(&link->hnd, 1 /* close fd */);
-		/* triton_md_unregister_handler() closes and resets
-		 * link->hnd.fd, but that is a separate int from
-		 * link->src->ppp.fd (same value, different storage) -- left
-		 * alone, __session_destroy() finds a stale fd number still
-		 * >= 0 and close()s it a second time, potentially closing
-		 * an unrelated fd some other thread opened in the meantime. */
+		/* Not triton's own close-on-unregister: the fd has to be closed
+		 * and link->src->ppp.fd reset in one step under switch_fd_lock,
+		 * or the other leg's link (on the other tunnel's context, see
+		 * l2tp_switch_link_splice_out()) can splice into the number
+		 * after it is closed -- and reused by an unrelated fd. */
+		triton_md_unregister_handler(&link->hnd, 0);
+		pthread_mutex_lock(&link->src->switch_fd_lock);
+		/* link->hnd.fd and link->src->ppp.fd are the same value in
+		 * separate storage -- __session_destroy() would otherwise find a
+		 * stale fd number still >= 0 and close() it a second time,
+		 * potentially closing an unrelated fd some other thread opened
+		 * in the meantime. */
 		__atomic_store_n(&link->src->ppp.fd, -1, __ATOMIC_RELAXED);
+		close(link->hnd.fd);
+		pthread_mutex_unlock(&link->src->switch_fd_lock);
+		link->hnd.fd = -1;
 	}
 	close(link->pipe_rd);
 	close(link->pipe_wr);

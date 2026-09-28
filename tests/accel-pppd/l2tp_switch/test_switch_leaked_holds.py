@@ -68,6 +68,14 @@ FLOOD_LEAD_MS = 300
 FIN_WAIT_AFTER_MS = 300
 FLOOD_TAIL_MS = 400
 
+# How long to wait for the switch to finish everything it tore down. A leak
+# never resolves, so this only bounds how long a failing test takes -- but it
+# must outlast a tunnel whose peer has gone away: the upstream harness exits
+# right after the CDN without acking the switch's StopCCN, and that tunnel
+# then retransmits it (1+2+4+8+16 s of backoff, then a last wait) before it
+# gives up, some 47 s with the default retransmit settings.
+SETTLE_TIMEOUT = 75.0
+
 
 def _fin_flood(deadline_ms):
     """The harness's --fin-flood A:S:W for a switch timer due `deadline_ms`
@@ -114,10 +122,10 @@ def _assert_nothing_leaked(accel_cmd, s_cli, ctrl, cfg, baseline_fds, what):
 
     def settled():
         state["finishing"] = l2tp_finishing(accel_cmd, s_cli)
-        state["fds"] = fd_count(pid)
+        state["fds"] = fd_count(pid, s_cli)
         return state["finishing"] == (0, 0) and state["fds"] <= baseline_fds
 
-    assert wait_for(settled, 4.0), (
+    assert wait_for(settled, SETTLE_TIMEOUT, scale=False), (
         f"{what}: (tunnels, sessions) still finishing = {state['finishing']}"
         f" and {state['fds']} file descriptors open (baseline {baseline_fds})"
         " long after everything was torn down -- a reference taken for a"
@@ -138,7 +146,7 @@ def test_abort_of_stalled_tunnel_lost_to_its_teardown_leaks_nothing(
     s_cli, s_port, down_port = alloc_ports(3)
 
     with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
-        baseline_fds = fd_count(ctrl["process"].pid)
+        baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # A downstream that never answers: the switch's tunnel stays in
         # WAIT_SCCRP until the connect timeout, which the harness anchors on
@@ -195,7 +203,7 @@ def test_disconnect_of_queued_call_lost_to_its_tunnel_teardown_leaks_nothing(
     s_cli, s_port, down_port = alloc_ports(3)
 
     with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
-        baseline_fds = fd_count(ctrl["process"].pid)
+        baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # Never answers within the test: the call stays queued until the
         # connect timeout.
@@ -258,7 +266,7 @@ def test_idle_close_lost_to_its_tunnel_teardown_leaks_nothing(
     s_cli, s_port, down_port = alloc_ports(3)
 
     with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
-        baseline_fds = fd_count(ctrl["process"].pid)
+        baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # A patient downstream (it does not hang up on its own once the call
         # ends), anchoring the flood on the CDN the switch sends it when the

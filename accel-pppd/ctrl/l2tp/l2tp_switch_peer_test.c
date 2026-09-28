@@ -320,6 +320,8 @@ int main(int argc, char **argv)
 		{"cdn-timeout", required_argument, 0, 'T'},
 		{"cdn-after-lcp-ms", required_argument, 0, 'C'},
 		{"cdn-after-iccn-ms", required_argument, 0, 'I'},
+		{"fin-flood", required_argument, 0, 'F'},
+		{"fin-flood-on", required_argument, 0, 'O'},
 		{0, 0, 0, 0},
 	};
 
@@ -336,7 +338,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:I:A:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:I:A:F:O:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -422,6 +424,20 @@ int main(int argc, char **argv)
 			if (cdn_after_iccn_ms < 0)
 				return die("invalid --cdn-after-iccn-ms");
 			break;
+		case 'F':
+			if (parse_fin_flood(optarg))
+				return 1;
+			break;
+		case 'O':
+			if (!strcmp(optarg, "sccrq"))
+				fin_flood_on = FIN_FLOOD_ON_SCCRQ;
+			else if (!strcmp(optarg, "cdn"))
+				fin_flood_on = FIN_FLOOD_ON_CDN;
+			else if (!strcmp(optarg, "iccn"))
+				fin_flood_on = FIN_FLOOD_ON_ICCN;
+			else
+				return die("invalid --fin-flood-on (sccrq|cdn|iccn)");
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -435,7 +451,9 @@ int main(int argc, char **argv)
 				   " [--listen [--rounds N] [--sccrp-delay-ms M]"
 				   " [--sccrp-storm-ms M] [--hold-seconds N]"
 				   " [--minimal-lcp [--cdn-after-lcp-ms M]]"
-				   " [--cdn-after-iccn-ms M]]");
+				   " [--cdn-after-iccn-ms M]]"
+				   " [--fin-flood A:S:W --fin-flood-on"
+				   " sccrq|cdn (--listen) | iccn]");
 		}
 	}
 
@@ -447,6 +465,14 @@ int main(int argc, char **argv)
 
 	if (lcp_auth != LCP_AUTH_NONE && !minimal_lcp)
 		return die("--lcp-auth requires --minimal-lcp");
+
+	if ((fin_flood_on == FIN_FLOOD_OFF) != (fin_flood_len_ms == 0))
+		return die("--fin-flood and --fin-flood-on go together");
+	if (fin_flood_on == FIN_FLOOD_ON_ICCN && listen_mode)
+		return die("--fin-flood-on iccn is for the calling role");
+	if (fin_flood_on != FIN_FLOOD_OFF &&
+	    fin_flood_on != FIN_FLOOD_ON_ICCN && !listen_mode)
+		return die("--fin-flood-on sccrq|cdn requires --listen");
 
 	if (listen_mode)
 		return run_listen_mode(listen_rounds);
@@ -613,6 +639,11 @@ int main(int argc, char **argv)
 		printf("event=sent_iccn t=%.6f\n", now_monotonic());
 		fflush(stdout);
 	}
+
+	if (fin_flood_on == FIN_FLOOD_ON_ICCN &&
+	    run_fin_flood(fd, &peer_addr, peer_tid, local_tid, my_ns,
+			  peer_next_nr))
+		return 1;
 
 	if (real_ppp && (!proxy_username || !proxy_password))
 		return die("--real-ppp requires --proxy-username and --proxy-password");

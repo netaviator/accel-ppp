@@ -278,6 +278,8 @@ struct l2tp_conn_t
 	unsigned int sess_count;
 
 	struct l2tp_switch_target_t *switch_target; /* NULL for ordinary tunnels */
+	struct list_head switch_hops; /* l2tp_switch_hop.entry: cross-context
+		calls queued on ctx and not yet run; guarded by ctx_lock */
 };
 
 static pthread_mutex_t l2tp_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1317,6 +1319,110 @@ static void l2tp_switch_avps_free(struct l2tp_switch_avps *avps)
 	_free(avps);
 }
 
+/* A call handed to another tunnel's triton context, tracked so that the
+ * tunnel's teardown can undo it.
+ *
+ * The switch takes a hold on whatever a cross-context call will touch (a
+ * tunnel or a session, sometimes a file descriptor or a malloc'd argument
+ * too) and leaves it to the callee to release. But triton_context_unregister()
+ * frees calls still queued on a context WITHOUT running them, and
+ * l2tp_tunnel_free() unregisters the tunnel's context -- so a call queued to a
+ * tunnel that is freed before the call gets its turn is dropped, and its holds
+ * with it: the tunnel or session they pin is never destroyed. It is not an
+ * exotic ordering: ctx_thread() serves a context's timers and md handlers
+ * before its pending calls, so a StopCCN's FIN_WAIT timer, a read error or
+ * retransmission exhaustion frees the tunnel ahead of a call scheduled into
+ * it moments earlier.
+ *
+ * So every such call goes through l2tp_switch_hop(), which records it on the
+ * target tunnel's switch_hops (under ctx_lock, the same lock that already
+ * keeps calls off a context that is being unregistered). If the call runs,
+ * l2tp_switch_hop_run() takes it off the list and calls `func`. If the tunnel
+ * is freed first, l2tp_tunnel_free() takes the whole list under the same lock,
+ * in the same critical section as the unregister, and runs each `cancel` --
+ * which must release exactly what `func` would have, and nothing else. The
+ * two are exclusive: the free runs on the tunnel's own context, the only one
+ * that runs queued calls, and a call queued after the unregister is refused
+ * by the ctx.tpd check. */
+struct l2tp_switch_hop {
+	struct list_head entry;
+	void (*func)(void *arg);
+	void (*cancel)(void *arg);
+	void *arg;
+};
+
+static void l2tp_switch_hop_run(void *data)
+{
+	struct l2tp_switch_hop *hop = data;
+	struct l2tp_conn_t *conn = l2tp_tunnel_self();
+	void (*func)(void *) = hop->func;
+	void *arg = hop->arg;
+
+	pthread_mutex_lock(&conn->ctx_lock);
+	list_del(&hop->entry);
+	pthread_mutex_unlock(&conn->ctx_lock);
+	_free(hop);
+
+	func(arg);
+}
+
+/* Schedules func(arg) into conn's context. Returns 0 if it will run -- or be
+ * cancelled, either way owning whatever the caller held for it -- and -1 if
+ * it was not scheduled (conn's context is already gone, or out of memory), in
+ * which case the caller still owns those holds. The caller's own hold on
+ * `conn` (or on the session that pins it) keeps its memory alive across this
+ * call; it does not keep the context registered, which is what the ctx.tpd
+ * check is for. */
+static int l2tp_switch_hop(struct l2tp_conn_t *conn, void (*func)(void *),
+			   void (*cancel)(void *), void *arg)
+{
+	struct l2tp_switch_hop *hop = _malloc(sizeof(*hop));
+	int res = -1;
+
+	if (!hop)
+		return -1;
+	hop->func = func;
+	hop->cancel = cancel;
+	hop->arg = arg;
+
+	pthread_mutex_lock(&conn->ctx_lock);
+	if (conn->ctx.tpd) {
+		list_add_tail(&hop->entry, &conn->switch_hops);
+		res = triton_context_call(&conn->ctx, l2tp_switch_hop_run, hop);
+		if (res < 0)
+			list_del(&hop->entry);
+	}
+	pthread_mutex_unlock(&conn->ctx_lock);
+
+	if (res < 0)
+		_free(hop);
+
+	return res;
+}
+
+/* Runs the cancel of every hop l2tp_tunnel_free() took off a tunnel. Called
+ * with no lock held: a cancel can hop into yet another tunnel. */
+static void l2tp_switch_hops_cancel(struct list_head *hops)
+{
+	while (!list_empty(hops)) {
+		struct l2tp_switch_hop *hop = list_first_entry(hops, typeof(*hop),
+							       entry);
+
+		list_del(&hop->entry);
+		hop->cancel(hop->arg);
+		_free(hop);
+	}
+}
+
+/* Cancel of l2tp_switch_teardown_peer(): its peer's own tunnel was freed
+ * first, which closed every session on it, this one included -- that free
+ * already did everything the teardown would have, so only the hold taken to
+ * survive the hop is left. */
+static void l2tp_switch_teardown_peer_cancel(void *data)
+{
+	session_put(data);
+}
+
 static void l2tp_session_free(struct l2tp_sess_t *sess)
 {
 	struct l2tp_packet_t *pack;
@@ -1389,19 +1495,13 @@ static void l2tp_session_free(struct l2tp_sess_t *sess)
 		if (cascade) {
 			int res = -1;
 
-			/* ctx_lock + ctx.tpd: the hold keeps the peer -- and so
-			 * its l2tp_conn_t -- alive across the hop, but not that
-			 * tunnel's triton context registered.
-			 * l2tp_tunnel_free() NULLs ctx.tpd well before the last
-			 * reference drops, and triton_context_call()
-			 * dereferences it unchecked. Same guard
-			 * l2tp_session_apses_*() already uses for this hop. */
-			pthread_mutex_lock(&u.peer->paren_conn->ctx_lock);
-			if (u.peer->paren_conn->ctx.tpd)
-				res = triton_context_call(&u.peer->paren_conn->ctx,
-							  l2tp_switch_teardown_peer,
-							  u.peer);
-			pthread_mutex_unlock(&u.peer->paren_conn->ctx_lock);
+			/* The hold keeps the peer -- and so its l2tp_conn_t --
+			 * alive across the hop, but not that tunnel's triton
+			 * context registered: see l2tp_switch_hop(). */
+			res = l2tp_switch_hop(u.peer->paren_conn,
+					      l2tp_switch_teardown_peer,
+					      l2tp_switch_teardown_peer_cancel,
+					      u.peer);
 			if (res < 0)
 				session_put(u.peer);
 		}
@@ -1634,6 +1734,7 @@ err:
 static void l2tp_tunnel_free(struct l2tp_conn_t *conn)
 {
 	struct l2tp_packet_t *pack;
+	LIST_HEAD(hops);
 
 	switch (conn->state) {
 	case STATE_INIT:
@@ -1708,10 +1809,20 @@ static void l2tp_tunnel_free(struct l2tp_conn_t *conn)
 	if (conn->sessions)
 		l2tp_tunnel_free_sessions(conn);
 
+	/* Unregistering drops any call still queued on the context without
+	 * running it: take the l2tp-switch calls among them off the list in the
+	 * same critical section, so none is lost and none can be added after
+	 * -- see l2tp_switch_hop(). */
 	pthread_mutex_lock(&conn->ctx_lock);
-	if (conn->ctx.tpd)
+	if (conn->ctx.tpd) {
+		list_splice_init(&conn->switch_hops, &hops);
 		triton_context_unregister(&conn->ctx);
+	}
 	pthread_mutex_unlock(&conn->ctx_lock);
+
+	/* Still ahead of the self-reference drop below: a cancel may release
+	 * the last other reference to this tunnel. */
+	l2tp_switch_hops_cancel(&hops);
 
 	/* Drop the reference the tunnel holds to itself */
 	tunnel_put(conn);
@@ -2114,6 +2225,7 @@ static struct l2tp_conn_t *l2tp_tunnel_alloc(const struct sockaddr_in *peer,
 	pthread_mutex_init(&conn->sessions_lock, NULL);
 	INIT_LIST_HEAD(&conn->send_queue);
 	INIT_LIST_HEAD(&conn->rtms_queue);
+	INIT_LIST_HEAD(&conn->switch_hops);
 
 	conn->hnd.fd = socket(PF_INET, SOCK_DGRAM, 0);
 	if (conn->hnd.fd < 0) {
@@ -4963,6 +5075,22 @@ struct l2tp_switch_finish_ctx {
 	struct l2tp_sess_t *downstream;
 };
 
+/* Cancel of both halves of the splice's finishing (see below): the tunnel
+ * they were scheduled into was freed first, which closed every session on
+ * it, and the leg that did already cascaded the teardown to the other one --
+ * exactly what the STATE_CLOSE early exit of either half relies on. So all
+ * that is left is what that exit releases: the ctx and its two holds. */
+static void l2tp_switch_finish_cancel(void *data)
+{
+	struct l2tp_switch_finish_ctx *ctx = data;
+	struct l2tp_sess_t *upstream = ctx->upstream;
+	struct l2tp_sess_t *downstream = ctx->downstream;
+
+	_free(ctx);
+	session_put(downstream);
+	session_put(upstream);
+}
+
 /* Second half of bringing a switched call's splice up, on the DOWNSTREAM
  * leg's own tunnel context: creates the downstream->upstream link, which
  * belongs to the downstream leg and is torn down by its l2tp_session_free()/
@@ -5055,14 +5183,12 @@ static void l2tp_switch_finish_upstream(void *data)
 	 * call (gated on from_upstream); l2tp_switch_link_free() undoes it --
 	 * see the comments there. */
 
-	/* ctx_lock + ctx.tpd: the holds keep the downstream session (and so its
-	 * l2tp_conn_t) alive across the hop, but not its tunnel's context
-	 * registered -- same guard as every other cross-tunnel call here. */
-	pthread_mutex_lock(&downstream->paren_conn->ctx_lock);
-	if (downstream->paren_conn->ctx.tpd)
-		res = triton_context_call(&downstream->paren_conn->ctx,
-					  l2tp_switch_finish_downstream, ctx);
-	pthread_mutex_unlock(&downstream->paren_conn->ctx_lock);
+	/* The holds keep the downstream session (and so its l2tp_conn_t) alive
+	 * across the hop, but not its tunnel's context registered -- see
+	 * l2tp_switch_hop(). */
+	res = l2tp_switch_hop(downstream->paren_conn,
+			      l2tp_switch_finish_downstream,
+			      l2tp_switch_finish_cancel, ctx);
 	if (res < 0) {
 		log_session(log_error, upstream,
 			    "l2tp-switch: downstream context gone before the"
@@ -5191,22 +5317,13 @@ static int l2tp_recv_ICRP(struct l2tp_sess_t *sess,
 
 		session_hold(upstream);
 		session_hold(sess);
-		/* ctx_lock + ctx.tpd: the holds above keep both sessions (and
-		 * so upstream's l2tp_conn_t) alive across the hop, but not
-		 * upstream's tunnel *context* registered --
-		 * l2tp_tunnel_free() NULLs ctx.tpd long before the last
-		 * reference drops, and triton_context_call() dereferences it
-		 * without a NULL check. Same guard l2tp_session_apses_*()
-		 * already uses for this exact cross-tunnel hop; "context
-		 * gone" simply joins the scheduling-failure branch below. */
-		int res = -1;
-
-		pthread_mutex_lock(&upstream->paren_conn->ctx_lock);
-		if (upstream->paren_conn->ctx.tpd)
-			res = triton_context_call(&upstream->paren_conn->ctx,
-						  l2tp_switch_finish_upstream,
-						  ctx);
-		pthread_mutex_unlock(&upstream->paren_conn->ctx_lock);
+		/* The holds above keep both sessions (and so upstream's
+		 * l2tp_conn_t) alive across the hop, but not upstream's tunnel
+		 * *context* registered -- see l2tp_switch_hop(); "context gone"
+		 * simply joins the scheduling-failure branch below. */
+		int res = l2tp_switch_hop(upstream->paren_conn,
+					  l2tp_switch_finish_upstream,
+					  l2tp_switch_finish_cancel, ctx);
 
 		if (res < 0) {
 			_free(ctx);
@@ -5333,6 +5450,31 @@ static void l2tp_switch_disconnect_upstream(void *data)
 				 * l2tp_switch_place_downstream_call() below */
 }
 
+/* Cancel of l2tp_switch_disconnect_upstream(): upstream's own tunnel was
+ * freed first, which already closed the session and sent everything a
+ * disconnect would have -- only the hold is left. */
+static void l2tp_switch_disconnect_upstream_cancel(void *data)
+{
+	session_put(data);
+}
+
+/* Crosses into upstream's own tunnel context to disconnect it there, since
+ * touching its timers and send queue from any other context would violate this
+ * codebase's per-tunnel-context threading model. Consumes the caller's hold on
+ * upstream on every path: the callee releases it, or -- if the context is
+ * already gone -- it is released here. */
+static void l2tp_switch_disconnect_upstream_async(struct l2tp_sess_t *upstream)
+{
+	/* The hold keeps upstream's l2tp_conn_t alive, not its tunnel's
+	 * context registered -- see l2tp_switch_hop(). */
+	if (l2tp_switch_hop(upstream->paren_conn,
+			    l2tp_switch_disconnect_upstream,
+			    l2tp_switch_disconnect_upstream_cancel,
+			    upstream) < 0)
+		session_put(upstream); /* couldn't even schedule it; still
+					 * release our own hold */
+}
+
 /* Disposes of a tunnel whose on-demand connect budget was spent while it was
  * still mid-negotiation: tears it down if it really did stall, or takes the
  * target's connect slot back if it turns out to have established after all.
@@ -5428,6 +5570,13 @@ static void l2tp_switch_abort_stalled_tunnel(void *data)
 out:
 	tunnel_put(conn); /* the hold taken in
 			   * l2tp_switch_on_demand_timeout() below */
+}
+
+/* Cancel of l2tp_switch_abort_stalled_tunnel(): the tunnel was freed before
+ * the abort ran, so there is nothing left to abort -- only the hold. */
+static void l2tp_switch_abort_stalled_tunnel_cancel(void *data)
+{
+	tunnel_put(data);
 }
 
 /* An on-demand target's connect took longer than the budget a waiting call
@@ -5529,48 +5678,23 @@ static void l2tp_switch_on_demand_timeout(struct triton_timer_t *t)
 		  " disconnecting queued call(s)\n", target->name);
 
 	while (!list_empty(&drained)) {
-		int res = -1;
-
 		sess = list_first_entry(&drained, typeof(*sess),
 					switch_pending_entry);
 		list_del(&sess->switch_pending_entry);
 		/* Cross into this call's own upstream tunnel context -- mirrors
 		 * l2tp_switch_place_call()'s existing err_no_pairing path
 		 * exactly, reusing the same hold taken when this session was
-		 * queued.
-		 *
-		 * ctx_lock + ctx.tpd, the same guard l2tp_session_apses_*()
-		 * already uses for this exact cross-context hop: the session
-		 * hold keeps the l2tp_conn_t's *memory* alive, but not its
-		 * triton context registered -- l2tp_tunnel_free() unregisters
-		 * it (NULLing ctx.tpd) long before the last reference goes
-		 * away, and triton_context_call() dereferences ud->tpd with no
-		 * NULL check of its own. */
-		pthread_mutex_lock(&sess->paren_conn->ctx_lock);
-		if (sess->paren_conn->ctx.tpd)
-			res = triton_context_call(&sess->paren_conn->ctx,
-						  l2tp_switch_disconnect_upstream,
-						  sess);
-		pthread_mutex_unlock(&sess->paren_conn->ctx_lock);
-		if (res < 0)
-			session_put(sess);
+		 * queued. */
+		l2tp_switch_disconnect_upstream_async(sess);
 	}
 
-	if (stalled) {
-		int res = -1;
-
-		/* Same guard, this time on the tunnel's own ctx_lock: our
-		 * tunnel_hold() above pins the struct, not the context
-		 * registration. */
-		pthread_mutex_lock(&stalled->ctx_lock);
-		if (stalled->ctx.tpd)
-			res = triton_context_call(&stalled->ctx,
-						  l2tp_switch_abort_stalled_tunnel,
-						  stalled);
-		pthread_mutex_unlock(&stalled->ctx_lock);
-		if (res < 0)
-			tunnel_put(stalled);
-	}
+	/* Our tunnel_hold() above pins the struct, not the context
+	 * registration -- see l2tp_switch_hop(). */
+	if (stalled &&
+	    l2tp_switch_hop(stalled, l2tp_switch_abort_stalled_tunnel,
+			    l2tp_switch_abort_stalled_tunnel_cancel,
+			    stalled) < 0)
+		tunnel_put(stalled);
 }
 
 /* Closes an on-demand target's tunnel whose idle linger has run out. Runs in
@@ -5611,6 +5735,14 @@ static void l2tp_switch_close_idle_tunnel(void *data)
 out:
 	tunnel_put(conn); /* the hold taken in
 			   * l2tp_switch_target_idle_timer() below */
+}
+
+/* Cancel of l2tp_switch_close_idle_tunnel(): the tunnel was freed before the
+ * close ran, which is all the close was going to do -- only the hold is left.
+ * (No linger to re-arm either: the free already released the target's slot.) */
+static void l2tp_switch_close_idle_tunnel_cancel(void *data)
+{
+	tunnel_put(data);
 }
 
 /* An on-demand target's tunnel has now been callless for a full linger
@@ -5667,18 +5799,14 @@ static void l2tp_switch_target_idle_timer(struct triton_timer_t *t)
 	if (!conn)
 		return;
 
-	/* ctx_lock + ctx.tpd: the tunnel_hold() above keeps conn's memory
-	 * alive across this hop, but l2tp_tunnel_free() can have unregistered
-	 * its context in the meantime -- and triton_context_call() would then
-	 * spin_lock(NULL). Same guard the apses paths already use. The
-	 * re-arm below stays outside this lock: it takes target->lock, and
-	 * l2tp_tunnel_free() takes target->lock and conn->ctx_lock in that
-	 * order (never nested), which is the order kept here too. */
-	pthread_mutex_lock(&conn->ctx_lock);
-	if (conn->ctx.tpd)
-		res = triton_context_call(&conn->ctx,
-					  l2tp_switch_close_idle_tunnel, conn);
-	pthread_mutex_unlock(&conn->ctx_lock);
+	/* The tunnel_hold() above keeps conn's memory alive across this hop,
+	 * but l2tp_tunnel_free() can have unregistered its context in the
+	 * meantime -- see l2tp_switch_hop(). The re-arm below stays outside
+	 * its ctx_lock: it takes target->lock, and l2tp_tunnel_free() takes
+	 * target->lock and conn->ctx_lock in that order (never nested), which
+	 * is the order kept here too. */
+	res = l2tp_switch_hop(conn, l2tp_switch_close_idle_tunnel,
+			      l2tp_switch_close_idle_tunnel_cancel, conn);
 
 	if (res < 0) {
 		/* The close never got scheduled, and this callback has
@@ -5717,7 +5845,6 @@ static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
 	 * hold on upstream, after which upstream may already be gone. */
 	struct l2tp_switch_target_t *target = upstream->switch_target;
 	struct l2tp_sess_t *downstream;
-	int res;
 
 	/* This function runs in conn's context (the downstream target's
 	 * tunnel) -- NOT in upstream->paren_conn->ctx. Touching upstream's own
@@ -5864,23 +5991,8 @@ static void l2tp_switch_place_call_on(struct l2tp_sess_t *upstream,
 err_no_pairing:
 	/* No downstream leg exists yet -- upstream has no peer, so there is
 	 * nothing for a teardown hook to cascade to. Cross into upstream's own
-	 * context to disconnect it directly.
-	 *
-	 * ctx_lock + ctx.tpd: our hold on upstream keeps its l2tp_conn_t's
-	 * memory alive, but not that tunnel's triton context registered --
-	 * l2tp_tunnel_free() NULLs ctx.tpd well before the last reference
-	 * goes, and triton_context_call() dereferences it unchecked. Same
-	 * guard l2tp_session_apses_*() already uses for this exact hop. */
-	res = -1;
-	pthread_mutex_lock(&upstream->paren_conn->ctx_lock);
-	if (upstream->paren_conn->ctx.tpd)
-		res = triton_context_call(&upstream->paren_conn->ctx,
-					  l2tp_switch_disconnect_upstream,
-					  upstream);
-	pthread_mutex_unlock(&upstream->paren_conn->ctx_lock);
-	if (res < 0)
-		session_put(upstream); /* couldn't even schedule it; still
-					 * release our own hold */
+	 * context to disconnect it directly. */
+	l2tp_switch_disconnect_upstream_async(upstream);
 	goto out_idle;
 
 err_pairing_done:
@@ -5924,6 +6036,21 @@ static void l2tp_switch_place_call(void *data)
 	l2tp_switch_place_call_on(upstream, conn);
 	tunnel_put(conn); /* the hold taken when this call was scheduled, which
 			   * is what kept conn alive across the context hop */
+}
+
+/* Cancel of l2tp_switch_place_call(): conn was freed before the placement ran,
+ * so the call it was for has nowhere to go -- what l2tp_switch_place_call_on()
+ * does when conn is not usable any more: disconnect upstream, which consumes
+ * the hold on it, and drop the tunnel hold and the ctx. */
+static void l2tp_switch_place_call_cancel(void *data)
+{
+	struct l2tp_switch_place_ctx *ctx = data;
+	struct l2tp_sess_t *upstream = ctx->upstream;
+	struct l2tp_conn_t *conn = ctx->conn;
+
+	_free(ctx);
+	l2tp_switch_disconnect_upstream_async(upstream);
+	tunnel_put(conn);
 }
 
 /* Opens a connect budget for this target: arms the timer that bounds how long
@@ -6032,17 +6159,12 @@ static int l2tp_switch_place_via_tunnel(struct l2tp_sess_t *upstream,
 	place->conn = conn;
 
 	session_hold(upstream);
-	/* ctx_lock + ctx.tpd, the same guard the apses paths already use for
-	 * their cross-context hops: the tunnel_hold() pins conn's memory, but
-	 * l2tp_tunnel_free() can have unregistered its context since the
-	 * target->lock check in the caller, and triton_context_call() would
-	 * then spin_lock(NULL). "Context gone" is just another way to reach
-	 * the failure cleanup below. */
-	pthread_mutex_lock(&conn->ctx_lock);
-	if (conn->ctx.tpd)
-		res = triton_context_call(&conn->ctx, l2tp_switch_place_call,
-					  place);
-	pthread_mutex_unlock(&conn->ctx_lock);
+	/* The tunnel_hold() pins conn's memory, but l2tp_tunnel_free() can have
+	 * unregistered its context since the target->lock check in the caller
+	 * -- see l2tp_switch_hop(). "Context gone" is just another way to
+	 * reach the failure cleanup below. */
+	res = l2tp_switch_hop(conn, l2tp_switch_place_call,
+			      l2tp_switch_place_call_cancel, place);
 	if (res < 0) {
 		session_put(upstream);
 		_free(place);

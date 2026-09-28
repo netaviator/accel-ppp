@@ -57,6 +57,12 @@ extern int cdn_timeout;
 extern int cdn_after_lcp_ms;
 extern int cdn_after_iccn_ms;
 extern const char *second_call_number;
+/* --fin-flood, see l2tp_switch_peer_flood.c. */
+enum { FIN_FLOOD_OFF, FIN_FLOOD_ON_SCCRQ, FIN_FLOOD_ON_CDN, FIN_FLOOD_ON_ICCN };
+extern int fin_flood_on;
+extern int fin_flood_stopccn_ms;
+extern int fin_flood_start_ms;
+extern int fin_flood_len_ms;
 extern uint16_t local_tid;
 extern uint16_t local_sid;
 
@@ -70,6 +76,12 @@ void comp_chap_md5(uint8_t *md5, uint8_t ident,
 		   const void *chall, size_t chall_len);
 int run_real_ppp(int data_fd);
 int run_minimal_lcp(int data_fd, int timeout_seconds);
+
+/* l2tp_switch_peer_flood.c */
+int parse_fin_flood(const char *spec);
+int run_fin_flood(int fd, const struct sockaddr_in *their_addr,
+		  uint16_t their_tid, uint16_t our_tid,
+		  uint16_t ns, uint16_t nr);
 
 /* l2tp_switch_peer_listen.c */
 int run_listen_mode(int rounds);

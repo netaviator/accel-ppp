@@ -328,7 +328,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 		struct l2tp_packet_t *msg = NULL, *rsp;
 		struct l2tp_attr_t *attr, *msg_type;
 		uint16_t type = 0, their_sid = 0;
-		int stop = 0;
+		int stop = 0, flood = 0;
 
 		if (l2tp_recv(fd, &msg, NULL, secret, strlen(secret)) != 0)
 			continue; /* idle (EAGAIN), or a datagram that failed
@@ -364,6 +364,7 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 		} else if (type == Message_Type_Call_Disconnect_Notify) {
 			printf("event=recv_cdn round=%d t=%.6f\n",
 			       round, now_monotonic());
+			flood = fin_flood_on == FIN_FLOOD_ON_CDN;
 		} else if (type == Message_Type_Stop_Ctrl_Conn_Notify) {
 			unsigned int res = 0;
 
@@ -451,6 +452,18 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			fflush(stdout);
 		}
 
+		if (flood) {
+			/* --fin-flood-on cdn: the switch ends a call by
+			 * cascading a CDN to this leg, and that is also the
+			 * moment it starts the tunnel's idle linger, so the
+			 * CDN's arrival is the anchor for timing a flood
+			 * around the linger's expiry. */
+			if (run_fin_flood(fd, their_addr, their_tid, my_tid,
+					  *my_ns, *peer_next_nr))
+				return 1;
+			break;
+		}
+
 		if (stop)
 			break;
 	}
@@ -528,6 +541,18 @@ int run_listen_mode(int rounds)
 
 		printf("event=recv_sccrq round=%d t=%.6f\n", round, now_monotonic());
 		fflush(stdout);
+
+		if (fin_flood_on == FIN_FLOOD_ON_SCCRQ) {
+			/* Never answer: the switch's tunnel stays in
+			 * WAIT_SCCRP for the whole flood, then FIN_WAIT. */
+			if (run_fin_flood(fd, &their_addr, their_tid,
+					  1024 + (uint16_t)(random() % 60000),
+					  0, peer_next_nr))
+				return 1;
+			if (hold_seconds > 0)
+				sleep((unsigned int)hold_seconds);
+			continue;
+		}
 
 		/* Deliberately stall mid-negotiation (see sccrp_delay_ms). The
 		 * switch keeps retransmitting its SCCRQ meanwhile -- those

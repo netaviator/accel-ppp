@@ -162,19 +162,44 @@ static int rules_overlap(const struct l2tp_switch_rule_t *a,
 	       rule_matches_value(b, a->val, a->len);
 }
 
+/* Caller must already hold the match lock (l2tp_switch_match_lock()) --
+ * for a caller that offers several AVPs from the same packet to the rule
+ * table in a row (l2tp_recv_ICRQ()/l2tp_recv_ICCN(), one call per AVP),
+ * taking the lock once for the whole packet instead of once per AVP turns N
+ * rdlock/unlock pairs into 1 without changing what any single lookup
+ * returns: nothing can mutate l2tp_switch_rules while a reader holds this
+ * lock, so scanning it under one continuous read section is equivalent to
+ * scanning it under N back-to-back ones. */
+struct l2tp_switch_target_t *l2tp_switch_match_locked(const struct l2tp_dict_attr_t *attr,
+						      const uint8_t *val, int len)
+{
+	struct l2tp_switch_rule_t *r;
+
+	list_for_each_entry(r, &l2tp_switch_rules, entry)
+		if (r->attr == attr && rule_matches_value(r, val, len))
+			return r->target;
+
+	return NULL;
+}
+
+void l2tp_switch_match_lock(void)
+{
+	pthread_rwlock_rdlock(&l2tp_switch_rules_lock);
+}
+
+void l2tp_switch_match_unlock(void)
+{
+	pthread_rwlock_unlock(&l2tp_switch_rules_lock);
+}
+
 struct l2tp_switch_target_t *l2tp_switch_match(const struct l2tp_dict_attr_t *attr,
 					       const uint8_t *val, int len)
 {
-	struct l2tp_switch_rule_t *r;
-	struct l2tp_switch_target_t *target = NULL;
+	struct l2tp_switch_target_t *target;
 
-	pthread_rwlock_rdlock(&l2tp_switch_rules_lock);
-	list_for_each_entry(r, &l2tp_switch_rules, entry)
-		if (r->attr == attr && rule_matches_value(r, val, len)) {
-			target = r->target;
-			break;
-		}
-	pthread_rwlock_unlock(&l2tp_switch_rules_lock);
+	l2tp_switch_match_lock();
+	target = l2tp_switch_match_locked(attr, val, len);
+	l2tp_switch_match_unlock();
 
 	return target;
 }

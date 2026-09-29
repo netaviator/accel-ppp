@@ -354,6 +354,27 @@ static int valid_target_name(const char *name)
 	return 1;
 }
 
+/* Builds "name,peer-addr,peer-port[,mode]" for a diagnostic message,
+ * with the secret field replaced by a fixed placeholder. `val` itself
+ * must never be logged past this point in parse_target() -- once
+ * split_fields() has succeeded it still holds the real secret intact,
+ * so every error below here logs this instead. Returns NULL on
+ * allocation failure; callers fall back to a secret-free message. */
+static char *redact_target(const char *name, const char *addr,
+			    const char *port, const char *mode_str)
+{
+	char *out;
+	int ret;
+
+	if (mode_str)
+		ret = _asprintf(&out, "%s,%s,%s,***,%s", name, addr, port,
+				 mode_str);
+	else
+		ret = _asprintf(&out, "%s,%s,%s,***", name, addr, port);
+
+	return ret < 0 ? NULL : out;
+}
+
 static int parse_target(const char *val)
 {
 	/* target=<name>,<peer-addr>,<peer-port>,<secret>[,<mode>] */
@@ -368,10 +389,21 @@ static int parse_target(const char *val)
 
 	nf = split_fields(copy, f, 5);
 	if (nf < 4 || !all_non_empty(f, nf)) {
-		log_error("l2tp-switch: malformed target= \"%s\","
-			  " expected name,peer-addr,peer-port,secret[,mode]"
-			  " with no empty fields (secrets and names cannot"
-			  " contain ',')\n", val);
+		/* Never log `val` here: an empty field elsewhere (e.g. an
+		 * empty peer-addr followed by a real secret) leaves the
+		 * secret intact in it. */
+		if (nf < 0)
+			log_error("l2tp-switch: malformed target= (more than 5"
+				  " fields found), expected"
+				  " name,peer-addr,peer-port,secret[,mode] with no"
+				  " empty fields (secrets and names cannot contain"
+				  " ',')\n");
+		else
+			log_error("l2tp-switch: malformed target= (%d field(s)"
+				  " found), expected"
+				  " name,peer-addr,peer-port,secret[,mode] with no"
+				  " empty fields (secrets and names cannot contain"
+				  " ',')\n", nf);
 		goto err;
 	}
 	name = f[0];
@@ -394,7 +426,11 @@ static int parse_target(const char *val)
 
 	p = strtol(port, &endp, 10);
 	if (*endp || p <= 0 || p > UINT16_MAX) {
-		log_error("l2tp-switch: invalid peer-port in target=\"%s\"\n", val);
+		char *redacted = redact_target(name, addr, port, mode_str);
+
+		log_error("l2tp-switch: invalid peer-port in target=\"%s\"\n",
+			  redacted ? redacted : name);
+		_free(redacted);
 		goto err;
 	}
 
@@ -416,7 +452,11 @@ static int parse_target(const char *val)
 	t->peer_addr.sin_family = AF_INET;
 	t->peer_addr.sin_port = htons((uint16_t)p);
 	if (inet_aton(addr, &t->peer_addr.sin_addr) == 0) {
-		log_error("l2tp-switch: invalid peer-addr in target=\"%s\"\n", val);
+		char *redacted = redact_target(name, addr, port, mode_str);
+
+		log_error("l2tp-switch: invalid peer-addr in target=\"%s\"\n",
+			  redacted ? redacted : name);
+		_free(redacted);
 		free_target(t);
 		goto err;
 	}
@@ -427,9 +467,12 @@ static int parse_target(const char *val)
 	} else if (!strcmp(mode_str, "persistent")) {
 		t->mode = L2TP_SWITCH_MODE_PERSISTENT;
 	} else {
+		char *redacted = redact_target(name, addr, port, mode_str);
+
 		log_error("l2tp-switch: unknown mode \"%s\" in target=\"%s\","
 			  " expected \"persistent\" or \"on-demand\"\n",
-			  mode_str, val);
+			  mode_str, redacted ? redacted : name);
+		_free(redacted);
 		free_target(t);
 		goto err;
 	}

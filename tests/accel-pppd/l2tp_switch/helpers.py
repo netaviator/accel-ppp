@@ -71,7 +71,7 @@ def read_log(cfg):
     return log + "\n--- log-error ---\n" + err
 
 
-def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra="", thread_count=None, env=None):
+def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret, extra="", thread_count=None, env=None, l2tp_extra=""):
     # cfg's own path has to be known before the config text (which
     # references log_path(cfg)) can be written, so it's reserved directly
     # rather than through config.make_tmp(), which only returns a name
@@ -111,6 +111,7 @@ def start_instance(accel_pppd, accel_cmd, cli_port, l2tp_bind, l2tp_port, secret
     bind={l2tp_bind}
     port={l2tp_port}
     secret={secret}
+    {l2tp_extra}
     [ppp]
     verbose=1
     """

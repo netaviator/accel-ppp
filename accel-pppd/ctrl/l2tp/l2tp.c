@@ -3704,23 +3704,53 @@ static void l2tp_tunnel_finwait(struct l2tp_conn_t *conn)
 	if (conn->sessions)
 		l2tp_tunnel_free_sessions(conn);
 
-	/* l2tp_recv_StopCCN() is this function's only caller: we get here
-	 * exclusively after receiving the peer's own StopCCN, never after
-	 * sending ours (that path -- l2tp_tunnel_disconnect() -- relies on
-	 * the ordinary reliable-delivery retransmit queue instead, and never
-	 * reaches STATE_FIN_WAIT). By this point our ack was already sent by
-	 * the generic receive path, and the send queue was just cleared
-	 * above, so there is nothing left of ours to protect with a
-	 * worst-case retransmission cycle -- one base rtimeout of slack is
-	 * enough to let that ack actually leave the wire. For an l2tp-switch
-	 * target's persistent tunnel (l2tp.c's l2tp_switch_target_connect()),
-	 * this directly bounds how long the target stays unusable after a
-	 * peer-initiated teardown (e.g. a downstream LNS's own idle-tunnel
-	 * timeout firing on a session-less tunnel): previously up to
-	 * max_retransmit exponential-backoff retries' worth of wait (tens of
-	 * seconds at the defaults) on top of the reconnect_timer cadence.
-	 */
-	conn->timeout_timer.period = conn->rtimeout;
+	if (conn->switch_target) {
+		/* l2tp_recv_StopCCN() is this function's only caller: we get
+		 * here exclusively after receiving the peer's own StopCCN,
+		 * never after sending ours (that path --
+		 * l2tp_tunnel_disconnect() -- relies on the ordinary
+		 * reliable-delivery retransmit queue instead, and never
+		 * reaches STATE_FIN_WAIT). By this point our ack was already
+		 * sent by the generic receive path, and the send queue was
+		 * just cleared above, so there is nothing left of ours to
+		 * protect with a worst-case retransmission cycle -- one base
+		 * rtimeout of slack is enough to let that ack actually leave
+		 * the wire.
+		 *
+		 * Scoped to l2tp-switch target tunnels only
+		 * (conn->switch_target set, by l2tp_switch_target_connect()):
+		 * this directly bounds how long a target stays unusable after
+		 * a peer-initiated teardown (e.g. a downstream LNS's own
+		 * idle-tunnel timeout firing on a session-less tunnel), and
+		 * test_switch_leaked_holds.py's --fin-flood scenarios plus
+		 * test_switch_downstream_idle_stopccn.py depend on this short
+		 * window. An ordinary tunnel has no such latency requirement;
+		 * see the else branch below for why it keeps the old, full
+		 * backoff instead.
+		 */
+		conn->timeout_timer.period = conn->rtimeout;
+	} else {
+		/* Ordinary (non-switch) tunnel: keep it up during a full
+		 * retransmission cycle, same as before 6c601727 ("fix(l2tp):
+		 * reconnect l2tp-switch targets promptly after a peer
+		 * StopCCN"), which shortened this to a single rtimeout for
+		 * every tunnel while only intending to speed up l2tp-switch
+		 * target reconnects. If our own ZLB ack to the peer's StopCCN
+		 * is lost, the peer's own retransmitted StopCCN must still
+		 * find a live tunnel to ack -- otherwise it gets no reply at
+		 * all and has to exhaust its own retry budget blind.
+		 */
+		int rtimeout = conn->rtimeout;
+		int indx;
+
+		conn->timeout_timer.period = 0;
+		for (indx = 0; indx < conn->max_retransmit; ++indx) {
+			conn->timeout_timer.period += rtimeout;
+			rtimeout *= 2;
+			if (rtimeout > conn->rtimeout_cap)
+				rtimeout = conn->rtimeout_cap;
+		}
+	}
 	conn->timeout_timer.expire = l2tp_tunnel_finwait_timeout;
 
 	if (triton_timer_add(&conn->ctx, &conn->timeout_timer, 0) < 0) {

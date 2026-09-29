@@ -1884,6 +1884,17 @@ static void l2tp_session_apses_finished(void *data)
 	}
 }
 
+/* Cancel of l2tp_session_apses_finished(): the payload is only a session id,
+ * not a held reference, so there is nothing here to release. If the tunnel
+ * this hop was headed for is being freed, its own l2tp_tunnel_free_sessions()
+ * sweep has already run this exact session through l2tp_session_free() (it
+ * happens earlier in l2tp_tunnel_free(), before the ctx unregisters and any
+ * hop can be dropped) -- so l2tp_session_apses_finished() would have found
+ * nothing to do either, per its own STATE_CLOSE-vs-not-found comment above. */
+static void l2tp_switch_apses_finished_cancel(void *data)
+{
+}
+
 static void __apses_destroy(void *data)
 {
 	struct l2tp_sess_t *sess = data;
@@ -1905,7 +1916,6 @@ static void apses_finished(struct ap_session *apses)
 	struct l2tp_sess_t *sess = container_of(apses->ctrl, typeof(*sess),
 						ctrl);
 	intptr_t sid = sess->sid;
-	int res = 1;
 
 	switch (sess->apses_state) {
 	case APSTATE_STARTING:
@@ -1925,13 +1935,13 @@ static void apses_finished(struct ap_session *apses)
 
 	sess->apses_state = APSTATE_FINISHING;
 
-	pthread_mutex_lock(&sess->paren_conn->ctx_lock);
-	if (sess->paren_conn->ctx.tpd)
-		res = triton_context_call(&sess->paren_conn->ctx,
-					  l2tp_session_apses_finished,
-					  (void *)sid);
-	pthread_mutex_unlock(&sess->paren_conn->ctx_lock);
-	if (res < 0)
+	/* Crosses into the L2TP control channel's own context, same as every
+	 * other cross-tunnel call in this file -- see l2tp_switch_hop(). The
+	 * payload is only a session id, not a held reference, so a dropped
+	 * call has nothing to release -- see
+	 * l2tp_switch_apses_finished_cancel(). */
+	if (l2tp_switch_hop(sess->paren_conn, l2tp_session_apses_finished,
+			    l2tp_switch_apses_finished_cancel, (void *)sid) < 0)
 		log_ppp_warn("deleting session without notifying L2TP layer:"
 			     " call to L2TP control channel context failed\n");
 
@@ -1973,15 +1983,12 @@ static void apses_stop(void *data)
 		ap_session_terminate(&sess->ppp.ses, cause, 1);
 	} else {
 		intptr_t sid = sess->sid;
-		int res = 1;
 
-		pthread_mutex_lock(&sess->paren_conn->ctx_lock);
-		if (sess->paren_conn->ctx.tpd)
-			res = triton_context_call(&sess->paren_conn->ctx,
-						  l2tp_session_apses_finished,
-						  (void *)sid);
-		pthread_mutex_unlock(&sess->paren_conn->ctx_lock);
-		if (res < 0)
+		/* Same cross-context hop as apses_finished() above -- see
+		 * l2tp_switch_hop() and l2tp_switch_apses_finished_cancel(). */
+		if (l2tp_switch_hop(sess->paren_conn, l2tp_session_apses_finished,
+				    l2tp_switch_apses_finished_cancel,
+				    (void *)sid) < 0)
 			log_ppp_warn("deleting session without notifying L2TP layer:"
 				     " call to L2TP control channel context failed\n");
 	}

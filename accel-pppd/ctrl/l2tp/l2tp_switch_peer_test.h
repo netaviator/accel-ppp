@@ -82,6 +82,12 @@ int parse_fin_flood(const char *spec);
 int run_fin_flood(int fd, const struct sockaddr_in *their_addr,
 		  uint16_t their_tid, uint16_t our_tid,
 		  uint16_t ns, uint16_t nr);
+/* --busy-flood-ms: no StopCCN, no anchor -- just keeps the peer's own
+ * control-channel socket busy for `ms`, so its triton context thread stays
+ * in l2tp_conn_read() and cannot run a context call (e.g.
+ * l2tp_switch_teardown_peer()) scheduled into it meanwhile. */
+extern int busy_flood_ms;
+int run_busy_flood(int fd, const struct sockaddr_in *their_addr, int ms);
 
 /* l2tp_switch_peer_listen.c */
 int run_listen_mode(int rounds);

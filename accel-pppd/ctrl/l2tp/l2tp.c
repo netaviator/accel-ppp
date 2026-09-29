@@ -7916,6 +7916,21 @@ static void switch_show_walk(const void *nodep, VISIT which, int depth)
 		pthread_mutex_unlock(&l2tp_switch_pair_lock);
 		return;
 	}
+	/* `up` can still be non-NULL here even though its own call has
+	 * already finished: when the *upstream* leg is the one that closes,
+	 * l2tp_switch_unpair() nulls its own switch_downstream and marks its
+	 * own state1 STATE_CLOSE atomically (under this same lock), but does
+	 * not touch this (downstream) leg's switch_upstream back-pointer --
+	 * that only happens once the deferred l2tp_switch_teardown_peer() hop
+	 * l2tp_switch_hop() scheduled onto this leg's own tunnel context
+	 * actually runs there. The pairing hold keeps `up` valid memory in
+	 * the meantime, but its pairing state is stale. Every write of state1
+	 * to STATE_CLOSE goes through l2tp_switch_unpair() under this same
+	 * l2tp_switch_pair_lock, so this read cannot race it. */
+	if (up->state1 == STATE_CLOSE) {
+		pthread_mutex_unlock(&l2tp_switch_pair_lock);
+		return;
+	}
 	snprintf(calling, sizeof(calling), "%s",
 		 up->calling_num ? up->calling_num : "?");
 	up_tid = up->paren_conn->tid;

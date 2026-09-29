@@ -275,3 +275,116 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
         f"tunnel closed {linger:.1f}s after the call ended, not the"
         f" {IDLE_LINGER:.0f}s linger:\n{down_out}"
     )
+
+
+# `l2tp switch show` must not list a call as still active once its upstream
+# leg has actually finished, during the leaked-holds fix's own deferred
+# teardown-peer hop window. See l2tp.c's switch_show_walk() and the comment
+# above l2tp_switch_unpair()/l2tp_switch_teardown_peer().
+#
+# The window: l2tp_switch_unpair() nulls the closing leg's OWN pairing
+# pointer and marks its OWN state1 STATE_CLOSE atomically (under
+# l2tp_switch_pair_lock) from l2tp_session_free() -- but never touches the
+# *peer's* pointer back to it. That only happens once l2tp_switch_hop()'s
+# deferred l2tp_switch_teardown_peer() call actually runs on the peer's own
+# tunnel context. Until then the peer's switch_upstream/switch_downstream
+# pointer is still non-NULL, so switch_show_walk() can list the call as
+# active with a frozen byte count, even though the leg it points at is
+# already STATE_CLOSE.
+#
+# That window is normally a single triton context hop -- microseconds -- so
+# it is widened deterministically here with --busy-flood-ms: once the
+# downstream leg's call is up, the --listen peer harness floods its own
+# control channel with harmless junk (the same trick --fin-flood uses in
+# test_switch_leaked_holds.py) for a fixed window, keeping that leg's own
+# tunnel context busy in its read loop -- and so unable to run the
+# l2tp_switch_teardown_peer() hop the upstream leg's own teardown schedules
+# into it moments later.
+BUSY_FLOOD_MS = 4000
+_STALE_POLL_WINDOW_S = 2.0
+
+
+@pytest.mark.l2tp_switch
+def test_switch_show_does_not_list_call_finished_during_teardown_hop(
+    pytestconfig, accel_cmd, accel_pppd, peer_bin
+):
+    switch_cli, switch_l2tp, down_l2tp = alloc_ports(3)
+
+    down_thread, down_ctrl = l2tp_peer_process.start(
+        peer_bin,
+        [
+            "--listen",
+            "--peer-port", str(down_l2tp),
+            "--secret", "downstreamsecret",
+            "--rounds", "1",
+            "--busy-flood-ms", str(BUSY_FLOOD_MS),
+            "--hold-seconds", "8",
+        ],
+    )
+
+    try:
+        s_started, s_thread, s_ctrl, s_cfg = start_instance(
+            accel_pppd,
+            accel_cmd,
+            switch_cli,
+            "127.0.0.1",
+            switch_l2tp,
+            "upstreamsecret",
+            extra=f"""
+    [l2tp-switch]
+    target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,persistent
+    match=Calling-Number,exact,472913,downstream
+    """,
+        )
+        assert s_started
+
+        try:
+            assert "[up]" in wait_up(accel_cmd, switch_cli)
+
+            peer_thread, peer_ctrl = l2tp_peer_process.start(
+                peer_bin,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", str(switch_l2tp),
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "472913",
+                    "--data-pattern", DATA_PATTERN,
+                    "--send-stopccn",
+                ],
+            )
+            rc, out, err = finish_harness(peer_thread, peer_ctrl, 15.0)
+            assert rc == 0, f"upstream harness failed (rc={rc}): {err}\n{out}"
+
+            # By now the upstream harness has sent its StopCCN and exited,
+            # so the switch's upstream-facing tunnel context has (or is
+            # about to have) processed it and scheduled
+            # l2tp_switch_teardown_peer() onto the downstream leg's own
+            # context -- which is (deterministically) still busy in its
+            # junk flood and so cannot have run it yet. Poll `l2tp switch
+            # show` across the rest of that flood window: it must never
+            # list the call as still active.
+            stale = []
+            deadline = time.monotonic() + _STALE_POLL_WINDOW_S
+            while time.monotonic() < deadline:
+                shown = switch_show(accel_cmd, switch_cli)
+                if any(line.strip().startswith("call:") for line in shown.splitlines()):
+                    stale.append(shown)
+                time.sleep(0.05)
+        finally:
+            accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
+            config.delete_tmp(s_cfg)
+    finally:
+        rc, down_out, down_err = finish_harness(down_thread, down_ctrl, 20.0)
+
+    assert "event=recv_icrq" in down_out, (
+        "the call was never placed on the downstream leg -- broken test"
+        f" setup, not the staleness fix:\n{down_out}\n{down_err}"
+    )
+    assert "event=busy_flood_start" in down_out, (
+        f"the downstream harness never ran its busy flood:\n{down_out}"
+    )
+    assert not stale, (
+        "`l2tp switch show` listed a call as still active during the"
+        " deferred teardown-peer hop's window, after the upstream leg had"
+        " already sent its own StopCCN:\n" + "\n---\n".join(stale)
+    )

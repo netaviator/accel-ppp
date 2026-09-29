@@ -322,6 +322,7 @@ int main(int argc, char **argv)
 		{"cdn-after-iccn-ms", required_argument, 0, 'I'},
 		{"fin-flood", required_argument, 0, 'F'},
 		{"fin-flood-on", required_argument, 0, 'O'},
+		{"busy-flood-ms", required_argument, 0, 'B'},
 		{0, 0, 0, 0},
 	};
 
@@ -338,7 +339,7 @@ int main(int argc, char **argv)
 		local_sid = 1024 + (uint16_t)(random() % 60000);
 	}
 
-	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:I:A:F:O:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "a:p:s:c:n:u:w:d:xWS:RmH:LN:D:M:T:C:I:A:F:O:B:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'a':
 			if (inet_aton(optarg, &peer_addr.sin_addr) == 0)
@@ -438,6 +439,11 @@ int main(int argc, char **argv)
 			else
 				return die("invalid --fin-flood-on (sccrq|cdn|iccn)");
 			break;
+		case 'B':
+			busy_flood_ms = atoi(optarg);
+			if (busy_flood_ms <= 0)
+				return die("invalid --busy-flood-ms");
+			break;
 		default:
 			return die("usage: --peer-addr A --peer-port P"
 				   " --secret S [--calling-number C]"
@@ -453,7 +459,8 @@ int main(int argc, char **argv)
 				   " [--minimal-lcp [--cdn-after-lcp-ms M]]"
 				   " [--cdn-after-iccn-ms M]]"
 				   " [--fin-flood A:S:W --fin-flood-on"
-				   " sccrq|cdn (--listen) | iccn]");
+				   " sccrq|cdn (--listen) | iccn]"
+				   " [--busy-flood-ms N]");
 		}
 	}
 
@@ -462,6 +469,9 @@ int main(int argc, char **argv)
 
 	if (cdn_after_iccn_ms > 0 && !listen_mode)
 		return die("--cdn-after-iccn-ms requires --listen");
+
+	if (busy_flood_ms > 0 && !listen_mode)
+		return die("--busy-flood-ms requires --listen");
 
 	if (lcp_auth != LCP_AUTH_NONE && !minimal_lcp)
 		return die("--lcp-auth requires --minimal-lcp");

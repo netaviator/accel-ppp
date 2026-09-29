@@ -452,6 +452,24 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			fflush(stdout);
 		}
 
+		/* --busy-flood-ms: keep this leg's own control channel busy
+		 * right after its call is placed, with no StopCCN of its own
+		 * -- widens the window in which a context call scheduled into
+		 * this tunnel from elsewhere (e.g. the switch's deferred
+		 * l2tp_switch_teardown_peer() hop, once the other leg closes)
+		 * would otherwise run near-instantly. */
+		if (type == Message_Type_Incoming_Call_Connected &&
+		    busy_flood_ms > 0) {
+			printf("event=busy_flood_start round=%d t=%.6f\n",
+			       round, now_monotonic());
+			fflush(stdout);
+			if (run_busy_flood(fd, their_addr, busy_flood_ms))
+				return 1;
+			printf("event=busy_flood_end round=%d t=%.6f\n",
+			       round, now_monotonic());
+			fflush(stdout);
+		}
+
 		if (flood) {
 			/* --fin-flood-on cdn: the switch ends a call by
 			 * cascading a CDN to this leg, and that is also the

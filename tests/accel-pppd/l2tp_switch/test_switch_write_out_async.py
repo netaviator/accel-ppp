@@ -65,8 +65,16 @@ def test_switch_backpressure_does_not_stall_the_tunnels_cli(
     """
     switch_cli, down_cli, switch_l2tp, down_l2tp = alloc_ports(4)
     shim_log = str(tmp_path / "shim.log")
+    # An ASAN-built daemon refuses to start when a preloaded shim precedes
+    # libasan in the initial library list (see PR #14's splice_delay_shim
+    # for the same fix); this shim only wraps splice(), so skipping that
+    # check is safe.
+    asan_options = ":".join(
+        filter(None, [os.environ.get("ASAN_OPTIONS"), "verify_asan_link_order=0"])
+    )
     env = dict(
         os.environ,
+        ASAN_OPTIONS=asan_options,
         LD_PRELOAD=str(splice_eagain_shim),
         SPLICE_EAGAIN_SHIM_MARKER=DATA_PATTERN,
         SPLICE_EAGAIN_SHIM_MS=str(EAGAIN_WINDOW_MS),

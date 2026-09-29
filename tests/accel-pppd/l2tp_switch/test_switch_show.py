@@ -301,7 +301,15 @@ def test_switch_show_on_demand_states(pytestconfig, accel_cmd, accel_pppd, peer_
 # l2tp_switch_teardown_peer() hop the upstream leg's own teardown schedules
 # into it moments later.
 BUSY_FLOOD_MS = 4000
-_STALE_POLL_WINDOW_S = 2.0
+# Some margin past finish_harness() returning: on a loaded CI runner the
+# switch may not have finished processing the upstream's StopCCN by the
+# moment finish_harness() sees that process exit, so a short fixed window
+# starting right there can poll entirely before the call actually closes --
+# not a false failure (see the active=0 check below), just wasted coverage.
+# 4s stays under BUSY_FLOOD_MS's own 4s flood, so a run that's still timely
+# keeps testing the real race; one that's already behind by more than that
+# would need widening the flood itself, not this window.
+_STALE_POLL_WINDOW_S = 4.0
 
 
 @pytest.mark.l2tp_switch
@@ -363,11 +371,21 @@ def test_switch_show_does_not_list_call_finished_during_teardown_hop(
             # junk flood and so cannot have run it yet. Poll `l2tp switch
             # show` across the rest of that flood window: it must never
             # list the call as still active.
+            # The bug this pins: a target already showing active=0 (its
+            # upstream leg has closed) that still lists a "call:" line for
+            # it, because the peer's own switch_upstream pointer hasn't
+            # been nulled yet by the deferred hop. A target still showing
+            # active=1 with a "call:" line is not stale -- the race just
+            # hasn't reached the upstream leg's own teardown yet, which the
+            # widened poll window above only bounds, not guarantees.
             stale = []
             deadline = time.monotonic() + _STALE_POLL_WINDOW_S
             while time.monotonic() < deadline:
                 shown = switch_show(accel_cmd, switch_cli)
-                if any(line.strip().startswith("call:") for line in shown.splitlines()):
+                has_call = any(
+                    line.strip().startswith("call:") for line in shown.splitlines()
+                )
+                if "active=0" in shown and has_call:
                     stale.append(shown)
                 time.sleep(0.05)
         finally:

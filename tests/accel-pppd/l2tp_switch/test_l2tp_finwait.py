@@ -105,27 +105,33 @@ def test_ordinary_tunnel_survives_full_backoff_after_peer_stopccn(
         assert rc == 0, f"peer harness failed (rc={rc}): {err}\n{out}"
         assert out.startswith("ok "), out
 
-        # The harness sends StopCCN before printing "ok" and exiting, so by
-        # now the daemon must already have handled it: session torn down,
-        # tunnel moved from "active" to "finishing" (STATE_ESTB ->
-        # STATE_FIN_WAIT in l2tp_tunnel_finwait()).
-        tunnels_finishing, _ = l2tp_finishing(accel_cmd, cli_port)
-        assert tunnels_finishing == 1, (
-            "tunnel never entered FIN_WAIT after the peer's StopCCN "
-            f"(finishing count: {tunnels_finishing})"
+        # The harness sends StopCCN before printing "ok" and exiting, but a
+        # loaded host may not have let the daemon drain that packet off its
+        # socket yet -- poll rather than checking once, immediately.
+        finishing_seen = wait_for(
+            lambda: l2tp_finishing(accel_cmd, cli_port)[0] == 1, 2.0
+        )
+        assert finishing_seen, (
+            "tunnel never entered FIN_WAIT after the peer's StopCCN"
         )
 
-        time.sleep(STILL_ALIVE_CHECK_S)
-        tunnels_finishing, _ = l2tp_finishing(accel_cmd, cli_port)
-        assert tunnels_finishing == 1, (
-            f"tunnel was freed within {STILL_ALIVE_CHECK_S}s of its peer's "
-            f"StopCCN -- short of the {FULL_BACKOFF_SUM_S}s full "
-            f"retransmission-backoff window an ordinary tunnel must get "
-            f"(rtimeout={RTIMEOUT}, rtimeout-cap={RTIMEOUT_CAP}, "
-            f"retransmit={RETRANSMIT}). A lost ZLB ack would leave the "
-            f"peer retransmitting its StopCCN into a tunnel that no "
-            f"longer exists."
-        )
+        # It must STAY in FIN_WAIT for the whole window, not just at one
+        # sampled instant -- poll continuously rather than sleeping once and
+        # checking at the end, so an early free is caught close to when it
+        # actually happened rather than only inferred after the fact.
+        deadline = time.monotonic() + STILL_ALIVE_CHECK_S
+        while time.monotonic() < deadline:
+            tunnels_finishing, _ = l2tp_finishing(accel_cmd, cli_port)
+            assert tunnels_finishing == 1, (
+                f"tunnel was freed within {STILL_ALIVE_CHECK_S}s of its "
+                f"peer's StopCCN -- short of the {FULL_BACKOFF_SUM_S}s full "
+                f"retransmission-backoff window an ordinary tunnel must get "
+                f"(rtimeout={RTIMEOUT}, rtimeout-cap={RTIMEOUT_CAP}, "
+                f"retransmit={RETRANSMIT}). A lost ZLB ack would leave the "
+                f"peer retransmitting its StopCCN into a tunnel that no "
+                f"longer exists."
+            )
+            time.sleep(0.2)
 
         # Sanity: the fix must not make an ordinary tunnel's FIN_WAIT hang
         # forever -- it still has to free the tunnel once the full backoff

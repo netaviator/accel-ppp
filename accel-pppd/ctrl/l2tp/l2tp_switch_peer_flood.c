@@ -153,3 +153,29 @@ int run_fin_flood(int fd, const struct sockaddr_in *their_addr,
 
 	return 0;
 }
+
+int busy_flood_ms;
+
+/* --busy-flood-ms: like --fin-flood's junk half but with no StopCCN and no
+ * anchor -- just keep the peer's tunnel socket continuously readable for
+ * `ms` milliseconds, so whatever runs on triton's ctx_thread for that
+ * tunnel (an md handler draining the socket) starves out any context call
+ * scheduled into it meanwhile, per the same md-handlers-before-context-
+ * calls ordering run_fin_flood()'s own comment documents. Widens a
+ * cross-context hop's normally microsecond-wide window into something a
+ * test can reliably observe mid-flight. */
+int run_busy_flood(int fd, const struct sockaddr_in *their_addr, int ms)
+{
+	double until = now_monotonic() + (double)ms / 1000.0;
+	struct mmsghdr msgs[FLOOD_BATCH];
+	struct l2tp_hdr_t wire;
+	struct iovec iov;
+
+	if (init_junk(msgs, &iov, &wire, their_addr))
+		return 1;
+
+	while (now_monotonic() < until)
+		sendmmsg(fd, msgs, FLOOD_BATCH, 0);
+
+	return 0;
+}

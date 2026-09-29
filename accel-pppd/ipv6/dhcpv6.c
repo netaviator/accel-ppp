@@ -385,7 +385,9 @@ static void dhcpv6_send_reply(struct dhcpv6_packet *req, struct dhcpv6_pd *pd, i
 				insert_status(reply, opt1, D6_STATUS_NoPrefixAvail);
 			} else {
 
-				pd->dp_iaid = ia_na->iaid;
+				if (req->hdr->type == D6_REQUEST || req->rapid_commit)
+					pd->dp_iaid = ia_na->iaid;
+
 				if (!pd->dp_active && code == D6_REPLY)
 					insert_dp_routes(ses, pd, &req->addr.sin6_addr);
 

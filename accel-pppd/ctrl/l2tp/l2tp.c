@@ -4455,6 +4455,34 @@ struct l2tp_switch_link_t {
 			  * see target->rx_bytes/tx_bytes for the
 			  * persistent, per-target totals this feeds into */
 
+	/* Async retry of l2tp_switch_link_write_out(): armed instead of
+	 * blocking when a splice() into dst's socket reports EAGAIN/ENOMEM/
+	 * ENOBUFS, so this link's own context (src->paren_conn->ctx, same as
+	 * `hnd` below) is free to run every other session and the control
+	 * channel on that same tunnel while dst catches up, instead of
+	 * sitting in a blocking poll(). Lives on that same context for its
+	 * whole life -- armed, re-armed and deleted only from there -- which
+	 * is what makes triton_timer_del() on it always the safe "delete
+	 * only from the timer's own context" case (see the timer-safety
+	 * comment above l2tp_switch_target_schedule_retry()). write_pending
+	 * is 1 for exactly as long as retry_timer is armed; pipe_pending is
+	 * how many bytes of the *current* chunk (still sitting in pipe_rd,
+	 * the kernel pipe -- nothing is ever buffered in user memory here)
+	 * remain to reach dst. l2tp_switch_link_read() will not splice
+	 * another byte from src into pipe_rd while write_pending is set: only
+	 * one chunk is ever ridden out at a time, same as the blocking
+	 * version. eagain_waits/enomem_retries persist across retry_timer
+	 * ticks so the bounded-retry counts below survive being spread across
+	 * many non-blocking attempts instead of one blocking loop; both are
+	 * reset at the start of each new chunk (see l2tp_switch_link_read()),
+	 * matching the per-chunk scope the blocking version's own local
+	 * variables had. */
+	struct triton_timer_t retry_timer;
+	unsigned int write_pending:1;
+	ssize_t pipe_pending;
+	int eagain_waits;
+	int enomem_retries;
+
 	/* Set once at creation (below), read-only for this link's
 	 * whole lifetime -- which of the two directions this link carries,
 	 * and which target's traffic it counts against. */
@@ -4484,6 +4512,8 @@ struct l2tp_switch_link_t {
 
 static void l2tp_switch_link_fail(struct l2tp_switch_link_t *link);
 static void l2tp_switch_link_peer_gone(struct l2tp_switch_link_t *link);
+static void l2tp_switch_link_retry_timer(struct triton_timer_t *t);
+static int l2tp_switch_link_read(struct triton_md_handler_t *h);
 
 /* Mirrors accel-pppd/ppp/ppp_lcp.h's struct lcp_hdr_t/CONFACK/PPP_LCP:
  * that header also pulls in triton.h/ppp.h/ppp_fsm.h, coupling to the
@@ -4667,18 +4697,6 @@ static void l2tp_switch_link_peek(struct l2tp_switch_link_t *link, ssize_t n)
 	}
 }
 
-/* Waits up to `timeout_ms` for the destination leg's socket to become
- * writable. Returns poll()'s result. */
-static int l2tp_switch_link_wait_writable(int fd, int timeout_ms)
-{
-	struct pollfd pfd = {
-		.fd = fd,
-		.events = POLLOUT,
-	};
-
-	return poll(&pfd, 1, timeout_ms);
-}
-
 /* One splice() of up to `n` bytes from link->pipe_rd into the destination
  * leg's socket, with that fd read and used under the destination session's
  * switch_fd_lock: the destination leg closes it (l2tp_switch_link_free()) on
@@ -4709,22 +4727,70 @@ static ssize_t l2tp_switch_link_splice_out(struct l2tp_switch_link_t *link,
 	return w;
 }
 
-/* Splices `n` bytes from link->pipe_rd out to the destination leg. Returns 0
- * on success, -1 after failing the link -- the caller must not touch `link`
- * again in that case, l2tp_switch_link_fail() may have freed it. */
+/* Arms (or re-arms) link->retry_timer to retry the rest of the current
+ * chunk after `ms`, and disables this link's own read side for as long as
+ * that takes -- see the big comment on l2tp_switch_link_t's retry_timer
+ * field. Always called from this link's own context (from
+ * l2tp_switch_link_write_out(), itself only ever called from there), so
+ * both the triton_md_disable_handler() and the triton_timer_add()/_mod()
+ * below are the sanctioned "from the owning context" case; the latter pair
+ * are additionally documented safe from *any* context (see the comment
+ * above l2tp_switch_target_schedule_retry()), which is not relied on here
+ * but means a future caller from elsewhere would not corrupt timer state
+ * either way. */
+static void l2tp_switch_link_arm_retry(struct l2tp_switch_link_t *link,
+				       ssize_t n, int ms)
+{
+	link->pipe_pending = n;
+	link->write_pending = 1;
+	triton_md_disable_handler(&link->hnd, MD_MODE_READ);
+
+	/* triton_timer_mod()/_add() derive the timerfd's it_value from
+	 * `expire_tv` (a plain relative delay: seconds + microseconds), not
+	 * from `period` -- `period` instead sets it_interval, i.e. whether
+	 * and how the timer *repeats* on its own once armed. This link's
+	 * retry is a plain one-shot every time (this function is called
+	 * again, with a fresh delay, on every retry -- see
+	 * l2tp_switch_link_write_out()/_retry_timer()), so `period` is left
+	 * at 0 (no auto-repeat; harmless either way since every call here
+	 * reprograms it_value regardless) and only expire_tv is set. */
+	link->retry_timer.expire_tv.tv_sec = ms / 1000;
+	link->retry_timer.expire_tv.tv_usec = (ms % 1000) * 1000;
+	if (link->retry_timer.tpd)
+		triton_timer_mod(&link->retry_timer, 0);
+	else {
+		link->retry_timer.expire = l2tp_switch_link_retry_timer;
+		triton_timer_add(&link->src->paren_conn->ctx,
+				 &link->retry_timer, 0);
+	}
+}
+
+/* Splices `n` bytes from link->pipe_rd out to the destination leg, never
+ * blocking. Returns 0 once every byte has reached dst, -1 after failing the
+ * link -- the caller must not touch `link` again in that case,
+ * l2tp_switch_link_fail()/_peer_gone() have already freed it -- or 1 if
+ * some bytes remain and link->retry_timer is now armed to finish the rest
+ * once dst is writable again (or memory pressure has cleared): the caller
+ * must stop touching link->pipe_rd until then (see write_pending in
+ * l2tp_switch_link_read()) but link itself remains valid.
+ *
+ * This used to wait out EAGAIN/ENOMEM with a blocking poll() right here,
+ * which (its own removed comment said so) stalled every other session and
+ * the control channel of this link's own tunnel for as long as the
+ * destination stayed backpressured. l2tp_switch_link_arm_retry() replaces
+ * that with a timer on this link's own context instead: the two bounded
+ * retry budgets below (L2TP_SWITCH_EAGAIN_MAX_WAITS,
+ * L2TP_SWITCH_ENOMEM_MAX_RETRIES) and their intervals are unchanged, so the
+ * total time a call may spend backpressured before being dropped is exactly
+ * what it was before -- only whether this link's own context is blocked
+ * *while* that clock runs has changed. */
 static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n)
 {
-	int enomem_retries = 0;
-	int eagain_waits = 0;
-
 	while (n > 0) {
 		/* The destination leg tears down on the OTHER tunnel's context
 		 * and sets its fd to -1 (l2tp_switch_link_free()): read it once
 		 * per lap, under its lock, and treat "gone" as the peer closing
-		 * rather than as a splice failure. The poll()s below use the
-		 * fd after the lock is dropped, which is harmless: at worst
-		 * they wait on a reused fd for a bounded time and the next lap
-		 * finds it gone. */
+		 * rather than as a splice failure. */
 		int dst_fd;
 		ssize_t w = l2tp_switch_link_splice_out(link, n, &dst_fd);
 
@@ -4732,7 +4798,7 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 			goto peer_gone;
 
 		if (w >= 0) {
-			enomem_retries = 0;
+			link->enomem_retries = 0;
 			n -= w;
 			continue;
 		}
@@ -4742,24 +4808,12 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 
 		if (errno == EAGAIN) {
 			/* link->dst->ppp.fd is O_NONBLOCK (see
-			 * l2tp_session_connect_socket()); wait for it to
-			 * become writable rather than treating a momentarily
-			 * full send path as a hard failure. Bounded: this runs
-			 * on the source tunnel's own context, so an
-			 * indefinitely full destination would stall every
-			 * other session and the control channel (HELLOs, acks)
-			 * of that tunnel with it. */
-			int pres = l2tp_switch_link_wait_writable(dst_fd,
-						L2TP_SWITCH_EAGAIN_POLL_MS);
-
-			if (pres < 0 && errno != EINTR) {
-				log_session(log_error, link->src,
-					    "l2tp-switch: poll(out) failed: %s\n",
-					    strerror(errno));
-				goto fail;
-			}
-			if (pres == 0 &&
-			    ++eagain_waits >= L2TP_SWITCH_EAGAIN_MAX_WAITS) {
+			 * l2tp_session_connect_socket()); retry once dst is
+			 * likely writable rather than treating a momentarily
+			 * full send path as a hard failure. Bounded, exactly
+			 * as before: L2TP_SWITCH_EAGAIN_MAX_WAITS attempts,
+			 * L2TP_SWITCH_EAGAIN_POLL_MS apart. */
+			if (++link->eagain_waits >= L2TP_SWITCH_EAGAIN_MAX_WAITS) {
 				log_session(log_error, link->src,
 					    "l2tp-switch: destination not"
 					    " writable for %ims, dropping call\n",
@@ -4767,22 +4821,24 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 					    L2TP_SWITCH_EAGAIN_MAX_WAITS);
 				goto fail;
 			}
-			continue;
+			l2tp_switch_link_arm_retry(link, n,
+						   L2TP_SWITCH_EAGAIN_POLL_MS);
+			return 1;
 		}
 
 		if ((errno == ENOMEM || errno == ENOBUFS) &&
-		    enomem_retries < L2TP_SWITCH_ENOMEM_MAX_RETRIES) {
+		    link->enomem_retries < L2TP_SWITCH_ENOMEM_MAX_RETRIES) {
 			/* Transient kernel/network-stack memory pressure under
 			 * a burst -- confirmed on a real VM (splice(out)
 			 * failing with ENOMEM under a large instantaneous
 			 * burst, disconnecting an otherwise-healthy call).
 			 * Unlike EAGAIN, POLLOUT readiness doesn't necessarily
-			 * mean this has cleared, so back off on a short
-			 * timeout instead of waiting indefinitely for an event
-			 * that may already be (mis)reported as ready. */
-			enomem_retries++;
-			l2tp_switch_link_wait_writable(dst_fd, 50);
-			continue;
+			 * mean this has cleared, so this retries on a short
+			 * timeout rather than waiting for an event that may
+			 * already be (mis)reported as ready. */
+			link->enomem_retries++;
+			l2tp_switch_link_arm_retry(link, n, 50);
+			return 1;
 		}
 
 		if (errno == EBADF &&
@@ -4807,10 +4863,54 @@ fail:
 	return -1;
 }
 
+/* retry_timer's expire callback (see l2tp_switch_link_t's own field
+ * comment): retries the rest of the chunk l2tp_switch_link_write_out() left
+ * pending. Always runs on link's own context, the same one that armed the
+ * timer and the only one that ever calls l2tp_switch_link_free() on this
+ * link -- so if this fires at all, link_free() has not yet run and `link`
+ * is still valid; if link_free() already ran on an earlier turn of this
+ * same context, triton_timer_del() there already stopped this timer from
+ * ever firing again (see the field comment). */
+static void l2tp_switch_link_retry_timer(struct triton_timer_t *t)
+{
+	struct l2tp_switch_link_t *link =
+		container_of(t, typeof(*link), retry_timer);
+	ssize_t n = link->pipe_pending;
+	int res = l2tp_switch_link_write_out(link, n);
+
+	if (res < 0)
+		return; /* failed/gone -- link is already freed, don't touch it */
+
+	if (res == 1)
+		return; /* still pending -- write_out already re-armed us */
+
+	/* Fully drained: stop retrying and give the read side back. */
+	triton_timer_del(&link->retry_timer);
+	link->write_pending = 0;
+	triton_md_enable_handler(&link->hnd, MD_MODE_READ);
+
+	/* Edge-triggered (see l2tp_switch_link_create()): re-drive the read
+	 * loop ourselves in case more of src's data arrived while this chunk
+	 * was draining -- epoll will not re-signal for readability it has
+	 * already reported once, and l2tp_switch_link_read() bailed out
+	 * early for exactly this reason (its own write_pending check) without
+	 * ever reaching its own EAGAIN. */
+	l2tp_switch_link_read(&link->hnd);
+}
+
 static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 {
 	struct l2tp_switch_link_t *link = container_of(h, typeof(*link), hnd);
 	ssize_t n;
+
+	if (link->write_pending)
+		/* A previous chunk is still draining to dst (retry_timer is
+		 * armed) -- MD_MODE_READ is disabled for exactly this reason,
+		 * but an edge already queued for this callback before that
+		 * took effect can still land here. Let the timer finish
+		 * first; it re-drives this loop itself once it does (see
+		 * l2tp_switch_link_retry_timer() above). */
+		return 0;
 
 	while (1) {
 		n = splice(link->src->ppp.fd, NULL, link->pipe_wr, NULL,
@@ -4833,13 +4933,31 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 		l2tp_switch_link_count_bytes(link, n);
 		l2tp_switch_link_peek(link, n);
 
-		if (l2tp_switch_link_write_out(link, n) < 0)
-			return 0; /* link is gone */
+		/* Fresh chunk: reset both bounded-retry counts, matching the
+		 * per-chunk scope the blocking version's own local variables
+		 * had (see l2tp_switch_link_t's retry_timer field comment). */
+		link->eagain_waits = 0;
+		link->enomem_retries = 0;
+		if (l2tp_switch_link_write_out(link, n) != 0)
+			return 0; /* pending (write_pending now set) or gone */
 	}
 }
 
 static void l2tp_switch_link_free(struct l2tp_switch_link_t *link)
 {
+	/* Every caller of l2tp_switch_link_free() runs on this link's own
+	 * context (link->src->paren_conn->ctx) -- see the big comment on
+	 * retry_timer in l2tp_switch_link_t -- so this is always the
+	 * sanctioned "delete only from the timer's own context" case for
+	 * triton_timer_del(), never the foreign-context one the timer-safety
+	 * comment above l2tp_switch_target_schedule_retry() warns is unsafe.
+	 * Must happen before pipe_rd/pipe_wr are closed below: a still-armed
+	 * retry_timer holds no reference of its own to either, but firing
+	 * after they're gone would use a stale ssize_t against a link that no
+	 * longer has anything valid to splice. */
+	if (link->retry_timer.tpd)
+		triton_timer_del(&link->retry_timer);
+
 	/* Detach from the owning session first, under the pair lock: the
 	 * `l2tp switch show` walk reads src->switch_link (and the link's byte
 	 * counter) on the CLI thread while holding that same lock, so once

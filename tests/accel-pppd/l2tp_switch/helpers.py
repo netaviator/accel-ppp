@@ -153,6 +153,86 @@ def tunnels_active(accel_cmd, cli_port=2001):
     return int(m.group(1))
 
 
+def l2tp_finishing(accel_cmd, cli_port=2001):
+    """(tunnels, control-channel sessions) counted as "finishing" by `show
+    stat`. An object enters that state when it is torn down and leaves it only
+    when its last reference drops and it is destroyed, so a count that never
+    returns to zero is a reference that was never released -- unlike the
+    "active" counts, which drop as soon as teardown starts."""
+    out = show_stat(accel_cmd, cli_port)
+    found = []
+    for section in ("tunnels", r"sessions \(control channels\)"):
+        m = re.search(
+            section + r":\r?\n\s*starting: \d+\r?\n\s*active: \d+\r?\n\s*finishing: (\d+)",
+            out,
+        )
+        assert m, f"couldn't parse {section} from show stat:\n{out}"
+        found.append(int(m.group(1)))
+    return tuple(found)
+
+
+def _cli_connection_inodes(cli_port):
+    """Inodes of the TCP connections to the daemon's CLI port (its accepted
+    sockets, not the listener), from /proc/net/tcp."""
+    inodes = set()
+    with open("/proc/net/tcp") as f:
+        for line in list(f)[1:]:
+            fields = line.split()
+            local_port = int(fields[1].split(":")[1], 16)
+            if local_port == cli_port and fields[3] != "0A":  # 0A: LISTEN
+                inodes.add(fields[9])
+    return inodes
+
+
+def fd_count(pid, cli_port=None):
+    """Number of open file descriptors of process `pid` (Linux /proc), not
+    counting timerfds: triton closes a deleted timer's descriptor lazily, on
+    its timer thread's next wakeups, so a timerfd can outlive its timer by as
+    long as nothing else is due -- it says nothing about a leak.
+
+    With `cli_port`, the daemon's CLI connections are not counted either: the
+    test's own accel-cmd polls open one, and the daemon closes its end only
+    when a worker gets to the disconnect, which on a slow host can be after
+    the count is taken -- so a count that includes it is off by one at random.
+    """
+    cli_inodes = _cli_connection_inodes(cli_port) if cli_port else set()
+
+    def counted(target):
+        if "anon_inode:[timerfd]" in target:
+            return False
+        return not any(f"socket:[{ino}]" in target for ino in cli_inodes)
+
+    return len([t for t in fd_targets(pid) if counted(t)])
+
+
+def wait_udp_bound(port, timeout=10.0):
+    """Waits until some process has `port` bound as a UDP socket. A peer
+    harness started with l2tp_peer_process.start() needs a moment to open its
+    socket (it is a sanitizer build); a switch that sends to the port before
+    that gets an ICMP "unreachable" and abandons the tunnel, which a test
+    about what happens *to* a tunnel cannot tolerate. Returns True if bound."""
+    needle = f":{port:04X} "
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open("/proc/net/udp") as f:
+            if any(needle in line.split(None, 2)[1] + " " for line in list(f)[1:]):
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def fd_targets(pid):
+    """What each open descriptor of process `pid` points at, for a failure
+    message that says which one leaked."""
+    targets = []
+    for fd in sorted(os.listdir(f"/proc/{pid}/fd"), key=int):
+        try:
+            targets.append(f"{fd} -> {os.readlink(f'/proc/{pid}/fd/{fd}')}")
+        except OSError:
+            pass  # closed between listdir and readlink
+    return targets
+
+
 def wait_for_tunnels_active(accel_cmd, expected, timeout, cli_port=2001):
     """Poll `tunnels_active()` until it equals `expected`.
 

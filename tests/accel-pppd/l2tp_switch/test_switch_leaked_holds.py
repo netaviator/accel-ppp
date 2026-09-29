@@ -106,6 +106,17 @@ def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
     idle-linger={IDLE_LINGER}
     reconnect-interval=1
     """,
+        # Pinned, not left to the host's own CPU count (see
+        # start_instance()'s own comment): triton grows its worker pool
+        # lazily, one thread per online CPU, only as load actually needs
+        # more of them. On a multi-vCPU host that can add a thread (and
+        # with it a permanent epoll/eventfd pair) between this fixture's
+        # baseline_fds snapshot and a test's own settled-state one, without
+        # anything having leaked -- observed on a CI leg with more than one
+        # vCPU, where every test here failed by exactly one fd, on whichever
+        # test happened to run first and trigger the growth, not
+        # consistently on any one of them.
+        thread_count=1,
     )
     assert started
     try:

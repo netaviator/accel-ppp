@@ -107,15 +107,22 @@ def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
     reconnect-interval=1
     """,
         # Pinned, not left to the host's own CPU count (see
-        # start_instance()'s own comment): triton grows its worker pool
-        # lazily, one thread per online CPU, only as load actually needs
-        # more of them. On a multi-vCPU host that can add a thread (and
-        # with it a permanent epoll/eventfd pair) between this fixture's
-        # baseline_fds snapshot and a test's own settled-state one, without
-        # anything having leaked -- observed on a CI leg with more than one
-        # vCPU, where every test here failed by exactly one fd, on whichever
-        # test happened to run first and trigger the growth, not
-        # consistently on any one of them.
+        # start_instance()'s own comment), to remove real cross-thread
+        # scheduling non-determinism as a variable on a multi-vCPU host.
+        # Kept even though it turned out NOT to be what was causing this
+        # fixture's own one-fd-off CI failures (a build with this already
+        # pinned still hit them). A call-through-the-switch warm-up was
+        # tried here as the fix instead (see
+        # fix/l2tp-switch-fd-baseline-warmup's history) but reverted: it
+        # disturbed the on-demand target's own connect/retry state on
+        # several CI legs -- the warm-up's own downstream leg disappearing
+        # (--rounds exhausted) before the switch had fully finished its
+        # side of that same teardown made the switch treat the target as
+        # having failed, so a *real* test's own first call could then be
+        # delayed for minutes behind an unrelated reconnect backoff. This
+        # fixture is back to no warm-up; only
+        # test_switch_apses_hop_race.py's simpler one (a plain, switch-free
+        # daemon) is still in place.
         thread_count=1,
     )
     assert started

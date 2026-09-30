@@ -146,8 +146,34 @@ def test_apses_finished_lost_to_its_tunnel_teardown_leaks_nothing(
     )
     assert started
     try:
-        baseline_fds = fd_count(ctrl["process"].pid, s_cli)
         assert wait_udp_bound(s_port), "the daemon never bound its l2tp socket"
+
+        # Warm up with one ordinary connect+teardown before measuring the
+        # baseline: on one specific CI leg (never reproduced locally), some
+        # resource -- appearing as a generic fd in fd_targets(), unrelated to
+        # this test's own scenario -- gets opened lazily the first time a real
+        # call goes through the daemon's data path, and stays open for the
+        # rest of its life. Measuring baseline before that first call makes
+        # every later "nothing leaked" check here look like it leaked by
+        # exactly one fd, regardless of thread count or anything else this
+        # test is actually about.
+        warmup_thread, warmup_ctrl = l2tp_peer_process.start(
+            peer_bin,
+            [
+                "--peer-addr", "127.0.0.1",
+                "--peer-port", str(s_port),
+                "--secret", "upstreamsecret",
+                "--calling-number", CALLING_NUMBER,
+                "--send-stopccn",
+            ],
+        )
+        rc, out, err = finish_harness(warmup_thread, warmup_ctrl, 15.0)
+        assert rc == 0, f"warm-up harness failed (rc={rc}): {err}\n{out}"
+        assert wait_for(lambda: l2tp_finishing(accel_cmd, s_cli) == (0, 0), 10.0), (
+            "warm-up connection never settled before baseline capture"
+        )
+
+        baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         up_thread, up_ctrl = l2tp_peer_process.start(
             peer_bin,

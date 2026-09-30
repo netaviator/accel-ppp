@@ -27,6 +27,15 @@ def test_switch_matches_on_called_number(pytestconfig, accel_cmd, accel_pppd, pe
     # already being up before any call is placed, which on-demand mode's
     # default no longer does. See
     target=downstream,127.0.0.1,{down_l2tp},downstreamsecret,persistent
+    # A decoy Calling-Number rule ahead of the real Called-Number one --
+    # regression coverage for l2tp_switch_match()'s per-ICRQ locking
+    # (l2tp_switch_match_lock()/_unlock() now bracket the whole per-AVP
+    # loop in l2tp_recv_ICRQ() instead of l2tp_switch_match() itself taking
+    # the lock once per AVP): the ICRQ below carries both Calling-Number
+    # and Called-Number, and every AVP still has to be checked against the
+    # *whole* two-entry rule table, not just the first entry or the one for
+    # the attribute that happens to match.
+    match=Calling-Number,exact,000000,downstream
     match=Called-Number,exact,5551234,downstream
     """,
         )

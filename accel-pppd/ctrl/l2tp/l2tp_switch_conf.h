@@ -143,6 +143,16 @@ struct l2tp_switch_target_t *l2tp_switch_target_find(const char *name);
  * returns non-NULL. */
 struct l2tp_switch_target_t *l2tp_switch_match(const struct l2tp_dict_attr_t *attr,
 					       const uint8_t *val, int len);
+/* Lets a caller that offers several AVPs from one packet to the rule table
+ * in a row (l2tp_recv_ICRQ()/l2tp_recv_ICCN()) take the match lock once for
+ * the whole packet instead of once per AVP via l2tp_switch_match() -- bracket
+ * the per-AVP loop with l2tp_switch_match_lock()/_unlock() and call
+ * l2tp_switch_match_locked() (same lookup as l2tp_switch_match(), minus its
+ * own lock/unlock) from inside it. */
+void l2tp_switch_match_lock(void);
+void l2tp_switch_match_unlock(void);
+struct l2tp_switch_target_t *l2tp_switch_match_locked(const struct l2tp_dict_attr_t *attr,
+						      const uint8_t *val, int len);
 int l2tp_switch_rule_add(const char *attr_name, const char *mode_name,
 			 const uint8_t *val, int len, const char *target_name);
 int l2tp_switch_rule_del(const char *attr_name, const char *mode_name,

@@ -4372,11 +4372,19 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 	 * config-load time by resolve_match_attr() in l2tp_switch_conf.c) --
 	 * so the union member is never actually read as a pointer unless it
 	 * is genuinely a string. Same reasoning applies at every other call
-	 * site below and in l2tp_recv_ICCN. */
+	 * site below and in l2tp_recv_ICCN.
+	 *
+	 * One lock/scan pass for the whole ICRQ instead of one per AVP --
+	 * l2tp_switch_match_lock() covers every l2tp_switch_match_locked()
+	 * call below, and nothing can mutate the rule table while it's held,
+	 * so this is equivalent to the old per-AVP l2tp_switch_match() calls
+	 * (each with its own lock/unlock) without re-acquiring the lock for
+	 * every AVP in the packet. */
+	l2tp_switch_match_lock();
 	list_for_each_entry(attr, &pack->attrs, entry) {
-		sess->switch_target = l2tp_switch_match(attr->attr,
-							attr->val.octets,
-							attr->length);
+		sess->switch_target = l2tp_switch_match_locked(attr->attr,
+							       attr->val.octets,
+							       attr->length);
 		if (sess->switch_target) {
 			l2tp_stat_inc(&l2tp_stat.switch_matched);
 			log_tunnel(log_info1, conn,
@@ -4386,6 +4394,7 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 			break;
 		}
 	}
+	l2tp_switch_match_unlock();
 
 	/* Allocate memory for Calling-Number if exists, and put it to l2tp_sess_t structure */
 	if (n > 0) {
@@ -6258,6 +6267,14 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 
 	log_session(log_info2, sess, "handling ICCN\n");
 
+	/* One lock for the whole ICCN AVP loop instead of one per
+	 * l2tp_switch_match_locked() call -- see l2tp_recv_ICRQ()'s matching
+	 * loop for why this is safe: nothing can mutate the rule table while
+	 * a reader holds this lock, so bracketing the whole loop is
+	 * equivalent to the old per-AVP lock/unlock pairs. Released before
+	 * every exit out of the loop below, including its own early
+	 * "return -1". */
+	l2tp_switch_match_lock();
 	list_for_each_entry(attr, &pack->attrs, entry) {
 		/* Same generic match attempt as l2tp_recv_ICRQ, run here too:
 		 * some AVPs worth routing on (Proxy-Authen-Name, carrying
@@ -6270,9 +6287,9 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 		 * by the time that case is reached and the existing capture
 		 * logic there correctly captures it for forwarding. */
 		if (!sess->switch_target) {
-			sess->switch_target = l2tp_switch_match(attr->attr,
-								attr->val.octets,
-								attr->length);
+			sess->switch_target = l2tp_switch_match_locked(attr->attr,
+								       attr->val.octets,
+								       attr->length);
 			if (sess->switch_target) {
 				l2tp_stat_inc(&l2tp_stat.switch_matched);
 				log_session(log_info1, sess,
@@ -6329,6 +6346,7 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 				log_session(log_error, sess,
 					    "impossible to handle ICCN:"
 					    " capturing proxy AVP failed\n");
+				l2tp_switch_match_unlock();
 				l2tp_session_disconnect(sess, 2, 6);
 				return -1;
 			}
@@ -6350,6 +6368,7 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 			break;
 		}
 	}
+	l2tp_switch_match_unlock();
 
 	if (unknown_attr) {
 		log_session(log_error, sess, "impossible to handle ICCN:"

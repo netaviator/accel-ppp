@@ -1,5 +1,9 @@
+import os
+import tempfile
+
 import pytest
-from common import process
+from common import accel_pppd_process, config, process
+from helpers import alloc_ports
 
 pytestmark = pytest.mark.xdist_group("fixed-port")
 
@@ -350,3 +354,104 @@ class TestTimingOptionsInvalidRejected:
 
     def test_switch_timing_invalid_rejected(self, accel_pppd_instance):
         assert accel_pppd_instance is False
+
+@pytest.mark.l2tp_switch
+class TestTargetSecretNotLeakedOnParseError:
+    """parse_target() used to log the raw target= config value verbatim on
+    several validation failures (invalid peer-port, invalid peer-addr,
+    unknown mode) -- and that raw value still has the plaintext secret
+    field intact at that point (only the field-count/empty-field check
+    that runs before the fields are split logs `val` as-is; every check
+    after that must redact the secret). A secret must never end up in the
+    daemon's own log output, whatever else about the target= line was
+    wrong.
+
+    l2tp_switch_conf_load() failing makes l2tp_init() call log_emerg() +
+    _exit(EXIT_FAILURE) immediately (see l2tp.c) -- with no synchronization
+    between that and log_file's own writer thread, a log_error() call made
+    right before it is lost more often than not (confirmed by hand: even a
+    directly-run `accel-pppd -c <bad config>` leaves both log-file= and
+    [core] log-error= completely empty). [log] log-debug= is the one sink
+    that isn't subject to that race: do_log() writes to it inline, on the
+    same thread, with an fflush() right after -- so it's what this test
+    reads instead of helpers.read_log()'s log-file=/log-error= files.
+    """
+
+    SECRET = "SuperSecretDoNotLeak123"
+
+    @pytest.fixture(
+        params=[
+            ("acme,203.0.113.50,not-a-port,{secret}", "invalid peer-port"),
+            ("acme,not-an-address,1701,{secret}", "invalid peer-addr"),
+            ("acme,203.0.113.50,1701,{secret},bogus-mode", "unknown mode"),
+        ],
+        ids=["bad-port", "bad-addr", "bad-mode"],
+    )
+    def target_case(self, request):
+        template, expect = request.param
+        return template.format(secret=self.SECRET), expect
+
+    def _start(self, accel_pppd, accel_cmd, cli_port, l2tp_port, target_line):
+        fd, cfg = tempfile.mkstemp()
+        os.close(fd)
+        debug = cfg + ".debug"
+        with open(cfg, "w") as f:
+            f.write(f"""
+    [modules]
+    log_file
+    log_syslog
+    l2tp
+    [l2tp-switch]
+    target={target_line}
+    [core]
+    log-error={cfg}.err
+    [log]
+    log-file={cfg}.log
+    log-debug={debug}
+    level=5
+    copy=1
+    [cli]
+    tcp=127.0.0.1:{cli_port}
+    [client-ip-range]
+    127.0.0.0/8
+    [l2tp]
+    bind=127.0.0.1
+    port={l2tp_port}
+    secret=testsecret
+    [ppp]
+    verbose=1
+    """)
+        started, thread, ctrl = accel_pppd_process.start(
+            accel_pppd, ["-c" + cfg], accel_cmd, 5.0, cli_port=cli_port
+        )
+        return started, thread, ctrl, cfg, debug
+
+    def test_secret_not_leaked_on_target_parse_error(
+        self, accel_cmd, accel_pppd, target_case
+    ):
+        target_line, expect = target_case
+        cli_port, l2tp_port = alloc_ports(2)
+
+        started, thread, ctrl, cfg, debug = self._start(
+            accel_pppd, accel_cmd, cli_port, l2tp_port, target_line
+        )
+        try:
+            assert started is False, (
+                "malformed target= must be a fatal config-load error"
+            )
+
+            try:
+                with open(debug, "r", errors="replace") as f:
+                    log = f.read()
+            except OSError:
+                log = ""
+
+            assert self.SECRET not in log, (
+                f"target= secret leaked into the daemon log:\n{log}"
+            )
+            assert expect in log, (
+                f"expected error ({expect!r}) not found in log:\n{log}"
+            )
+        finally:
+            accel_pppd_process.end(thread, ctrl, accel_cmd, 10.0, cli_port=cli_port)
+            config.delete_tmp(cfg)

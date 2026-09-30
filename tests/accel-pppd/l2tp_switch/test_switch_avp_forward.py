@@ -154,4 +154,23 @@ def test_switch_logs_captured_proxy_authen_type_without_leaking_credentials(
             accel_pppd_process.end(s_thread, s_ctrl, accel_cmd, 10.0, cli_port=switch_cli)
             config.delete_tmp(s_cfg)
     finally:
-        finish_harness(down_thread, down_ctrl, 15.0)
+        down_rc, down_out, down_err = finish_harness(down_thread, down_ctrl, 15.0)
+
+    # The log above is the switch's OWN account of what it captured from
+    # the upstream leg, decoded before re-injection -- checking only that
+    # would miss a bug in re-injection itself (l2tp_packet_add_octets() vs
+    # _add_int16(): both add the AVP without error and without dropping it,
+    # they just serialize a different, wrong union member for an int16-typed
+    # id, corrupting the value in transit -- confirmed against a partner
+    # downstream LNS that decoded 64624 instead of 3/PAP). The downstream
+    # leg is this same --listen peer harness, so what it actually decoded
+    # off the wire is checked here too, independent of the switch's own
+    # account of what it thought it sent.
+    assert "event=recv_proxy_authen_type" in down_out, (
+        f"the downstream leg's own ICCN never carried Proxy-Authen-Type at"
+        f" all:\n{down_out}\n{down_err}"
+    )
+    assert "event=recv_proxy_authen_type" in down_out and " value=3" in down_out, (
+        f"the downstream leg decoded a Proxy-Authen-Type value other than"
+        f" 3 (PPP PAP) off the wire -- re-injection corrupted it:\n{down_out}"
+    )

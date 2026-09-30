@@ -223,6 +223,12 @@ struct l2tp_switch_avp_t {
 	int M;
 	uint8_t *val;
 	int len;
+	/* Set at capture time (l2tp_switch_capture_avp()) whenever this AVP's
+	 * dictionary type is int16 (Proxy-Authen-Type/-ID): `val`/`len` still
+	 * hold its network-order bytes either way, but re-injecting it needs
+	 * to go through l2tp_packet_add_int16(), not _add_octets() -- see the
+	 * re-injection loop below for why. */
+	int is_int16;
 };
 
 struct l2tp_switch_avps {
@@ -3473,9 +3479,27 @@ static int l2tp_send_ICCN(struct l2tp_sess_t *sess)
 
 		for (i = 0; i < sess->switch_avps->count; i++) {
 			struct l2tp_switch_avp_t *a = &sess->switch_avps->avp[i];
+			int res;
 
-			if (l2tp_packet_add_octets(pack, a->id, a->val, a->len,
-						   a->M) < 0) {
+			/* l2tp_packet_add_octets() always populates
+			 * attr->val.octets, regardless of a->id's own
+			 * dictionary type -- for an int16-typed id (is_int16,
+			 * set at capture) that leaves the wire encoder
+			 * serializing the wrong union member (see
+			 * l2tp_switch_capture_avp()'s own comment). Decode
+			 * a->val's stored network-order bytes back and go
+			 * through l2tp_packet_add_int16() instead, which sets
+			 * attr->val.int16 the way the encoder actually reads
+			 * it for this type. */
+			if (a->is_int16 && a->len == sizeof(uint16_t))
+				res = l2tp_packet_add_int16(pack, a->id,
+					(int16_t)ntohs(*(uint16_t *)a->val),
+					a->M);
+			else
+				res = l2tp_packet_add_octets(pack, a->id,
+							     a->val, a->len,
+							     a->M);
+			if (res < 0) {
 				log_session(log_error, sess,
 					    "impossible to send ICCN:"
 					    " re-injecting proxy AVP %d"
@@ -5516,12 +5540,17 @@ static int l2tp_switch_capture_avp(struct l2tp_sess_t *sess,
 	 * if it were a pointer and crashes dereferencing it -- confirmed by
 	 * reproducing this exact segfault against a real accel-pppd on a VM
 	 * (Proxy-Authen-Type, sent whenever --proxy-username is used).
-	 * Serialize to the same on-the-wire byte representation
-	 * l2tp_packet_add_int16() itself would produce, so re-injecting via
-	 * l2tp_packet_add_octets() later round-trips correctly --
-	 * the wire format for an int16 AVP is just its 2 network-order
-	 * bytes, indistinguishable from an octets AVP of length 2 to
-	 * whichever end decodes it. */
+	 * Stash the value's own on-the-wire bytes either way (val/len below),
+	 * but remember it was int16 (is_int16) -- attr_alloc() looks the AVP
+	 * id up in the SAME dictionary regardless of which l2tp_packet_add_*()
+	 * the re-injection loop below calls, so an int16-typed id re-injected
+	 * via l2tp_packet_add_octets() gets attr->attr->type == ATTR_TYPE_INT16
+	 * with attr->val.octets (a malloc'd pointer) populated instead of
+	 * attr->val.int16 -- the wire encoder then serializes *that* union
+	 * member for an int16-typed AVP, corrupting the value to whatever the
+	 * pointer's own low 16 bits happen to be. Confirmed against a partner
+	 * downstream LNS logging Proxy-Authen-Type 64624 instead of 3 (PPP
+	 * PAP). */
 	switch (attr->attr->type) {
 	case ATTR_TYPE_INT16: {
 		uint16_t val = htons(attr->val.uint16);
@@ -5531,6 +5560,7 @@ static int l2tp_switch_capture_avp(struct l2tp_sess_t *sess,
 		if (!slot->val)
 			return -1;
 		memcpy(slot->val, &val, slot->len);
+		slot->is_int16 = 1;
 		break;
 	}
 	case ATTR_TYPE_OCTETS:

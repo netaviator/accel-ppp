@@ -359,6 +359,21 @@ static int serve_established_tunnel(int fd, const struct sockaddr_in *their_addr
 			printf("event=recv_icrq round=%d t=%.6f\n",
 			       round, now_monotonic());
 		} else if (type == Message_Type_Incoming_Call_Connected) {
+			/* Decoded here, not just logged as present/absent: a
+			 * switch re-injecting a captured Proxy-Authen-Type AVP
+			 * through the wrong l2tp_packet_add_*() call corrupts
+			 * its *value* (union-aliasing an int16-typed AVP's
+			 * val.int16 with a heap pointer left over from
+			 * val.octets) without dropping the AVP or failing to
+			 * send it -- a test that only checked for the AVP's
+			 * presence would not catch that. */
+			list_for_each_entry(attr, &msg->attrs, entry)
+				if (attr->attr &&
+				    attr->attr->id == Proxy_Authen_Type)
+					printf("event=recv_proxy_authen_type"
+					       " round=%d t=%.6f value=%u\n",
+					       round, now_monotonic(),
+					       (unsigned int)attr->val.uint16);
 			printf("event=recv_iccn round=%d t=%.6f\n",
 			       round, now_monotonic());
 		} else if (type == Message_Type_Call_Disconnect_Notify) {

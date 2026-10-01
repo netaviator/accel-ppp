@@ -47,6 +47,7 @@ from helpers import (
     read_log,
     start_instance,
     wait_for,
+    wait_for_tunnels_active,
     wait_udp_bound,
 )
 
@@ -109,7 +110,7 @@ def _fin_flood(deadline_ms, fin_wait_ms=FIN_WAIT_MS):
 
 
 @contextlib.contextmanager
-def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
+def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port, peer_bin):
     """An on-demand switch instance; yields (ctrl, cfg)."""
     started, thread, ctrl, cfg = start_instance(
         accel_pppd,
@@ -131,18 +132,7 @@ def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
         # scheduling non-determinism as a variable on a multi-vCPU host.
         # Kept even though it turned out NOT to be what was causing this
         # fixture's own one-fd-off CI failures (a build with this already
-        # pinned still hit them). A call-through-the-switch warm-up was
-        # tried here as the fix instead (see
-        # fix/l2tp-switch-fd-baseline-warmup's history) but reverted: it
-        # disturbed the on-demand target's own connect/retry state on
-        # several CI legs -- the warm-up's own downstream leg disappearing
-        # (--rounds exhausted) before the switch had fully finished its
-        # side of that same teardown made the switch treat the target as
-        # having failed, so a *real* test's own first call could then be
-        # delayed for minutes behind an unrelated reconnect backoff. This
-        # fixture is back to no warm-up; only
-        # test_switch_apses_hop_race.py's simpler one (a plain, switch-free
-        # daemon) is still in place.
+        # pinned still hit them) -- see the warm-up call below instead.
         thread_count=1,
         l2tp_extra=f"""rtimeout={UPSTREAM_RTIMEOUT}
     retransmit={UPSTREAM_RETRANSMIT}
@@ -150,6 +140,76 @@ def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
     )
     assert started
     try:
+        # Warm up with one ordinary call placed all the way through to a
+        # real downstream, and torn down cleanly, before any test measures
+        # its own baseline_fds -- see test_switch_apses_hop_race.py's
+        # identical comment for the underlying mechanism (same CI-leg-only
+        # one-fd-off failure, never reproduced locally).
+        #
+        # A first attempt at this (fix/l2tp-switch-fd-baseline-warmup) was
+        # reverted: its downstream leg used --hold-seconds 1, so its own
+        # process (and bound socket) could disappear before the switch had
+        # gotten around to tearing down *its* side of that same call --
+        # the target's idle-linger (IDLE_LINGER below) only starts once the
+        # call ends, and only after that does the switch send the
+        # downstream a graceful tunnel-level StopCCN. A downstream that has
+        # already exited by then looks, from the switch's side, like the
+        # target failed rather than like a peer that hung up politely --
+        # l2tp_switch_target_should_retry()'s reconnect backoff is exactly
+        # the kind of delay that then stalled a *real* test's own first
+        # call for minutes afterward.
+        #
+        # Fixed by giving the downstream leg enough --hold-seconds to
+        # outlive the target's own idle-linger plus a margin for the
+        # StopCCN round trip it waits out at the end of that linger, so
+        # its socket is never the thing that disappears first -- and by
+        # waiting for the switch's own view of the target (tunnels_active)
+        # to reach 0 before tearing the downstream leg down at all, not
+        # just for its process to exit on its own schedule.
+        warmup_down_thread, warmup_down_ctrl = l2tp_peer_process.start(
+            peer_bin,
+            [
+                "--listen",
+                "--peer-port", str(down_port),
+                "--secret", "downstreamsecret",
+                "--rounds", "1",
+                "--hold-seconds", str(IDLE_LINGER + 8),
+            ],
+        )
+        try:
+            assert wait_udp_bound(down_port), (
+                "the warm-up downstream harness never bound"
+            )
+            warmup_up_thread, warmup_up_ctrl = l2tp_peer_process.start(
+                peer_bin,
+                [
+                    "--peer-addr", "127.0.0.1",
+                    "--peer-port", str(s_port),
+                    "--secret", "upstreamsecret",
+                    "--calling-number", "472913",
+                    "--send-stopccn",
+                ],
+            )
+            rc, out, err = finish_harness(warmup_up_thread, warmup_up_ctrl, 15.0)
+            assert rc == 0, (
+                f"warm-up upstream harness failed (rc={rc}): {err}\n{out}"
+            )
+
+            assert wait_for(
+                lambda: l2tp_finishing(accel_cmd, s_cli) == (0, 0), 10.0
+            ), "warm-up call's upstream-facing session/tunnel never settled"
+            # Only now -- with the switch's own view of the target
+            # confirmed back to idle, its graceful StopCCN to this leg
+            # already sent and (if the harness binary itself got that far)
+            # acked -- is it safe to let the downstream leg's own process
+            # go; see the comment above for why doing this earlier broke
+            # things.
+            assert wait_for_tunnels_active(
+                accel_cmd, 0, IDLE_LINGER + 5.0, s_cli
+            )[0], "warm-up call's on-demand target tunnel never went idle"
+        finally:
+            finish_harness(warmup_down_thread, warmup_down_ctrl, 15.0)
+
         yield ctrl, cfg
     finally:
         accel_pppd_process.end(thread, ctrl, accel_cmd, 10.0, cli_port=s_cli)
@@ -186,7 +246,7 @@ def test_abort_of_stalled_tunnel_lost_to_its_teardown_leaks_nothing(
     socket stay forever."""
     s_cli, s_port, down_port = alloc_ports(3)
 
-    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
+    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port, peer_bin) as (ctrl, cfg):
         baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # A downstream that never answers: the switch's tunnel stays in
@@ -243,7 +303,7 @@ def test_disconnect_of_queued_call_lost_to_its_tunnel_teardown_leaks_nothing(
     and through it the tunnel -- is never destroyed."""
     s_cli, s_port, down_port = alloc_ports(3)
 
-    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
+    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port, peer_bin) as (ctrl, cfg):
         baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # Never answers within the test: the call stays queued until the
@@ -312,7 +372,7 @@ def test_idle_close_lost_to_its_tunnel_teardown_leaks_nothing(
     ran out -- the hold is never dropped."""
     s_cli, s_port, down_port = alloc_ports(3)
 
-    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port) as (ctrl, cfg):
+    with _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port, peer_bin) as (ctrl, cfg):
         baseline_fds = fd_count(ctrl["process"].pid, s_cli)
 
         # A patient downstream (it does not hang up on its own once the call

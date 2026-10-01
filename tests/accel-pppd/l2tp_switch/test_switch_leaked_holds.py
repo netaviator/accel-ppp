@@ -56,9 +56,25 @@ from helpers import (
 CONNECT_TIMEOUT = 3
 IDLE_LINGER = 4
 
-# How long the switch's tunnel stays in FIN_WAIT: its own rtimeout, 1s unless
-# configured otherwise.
+# How long the switch's own *target* tunnel (switch_target set --
+# l2tp_switch_target_connect()) stays in FIN_WAIT after receiving a peer's
+# StopCCN: one rtimeout, 1s unless configured otherwise -- l2tp_tunnel_finwait()
+# scopes that short window to target tunnels specifically, restoring the full
+# backoff below for every other (ordinary) tunnel.
 FIN_WAIT_MS = 1000
+
+# test_disconnect_of_queued_call_lost_to_its_tunnel_teardown_leaks_nothing
+# floods the *other* side: the switch's own inbound-facing tunnel, accepting
+# a call from an upstream LAC. That tunnel has no switch_target, so it gets
+# the full backoff instead of FIN_WAIT_MS -- rtimeout doubling up to
+# `retransmit` times, capped at `rtimeout-cap`. _switch() below shrinks all
+# three to keep that sum small and deterministic (1 + 2 = 3s) rather than
+# inheriting the compiled-in defaults (1+2+4+8+16 = 31s), which would still
+# be correct but would force a much longer-running test.
+UPSTREAM_RTIMEOUT = 1
+UPSTREAM_RETRANSMIT = 2
+UPSTREAM_RTIMEOUT_CAP = 2
+UPSTREAM_FIN_WAIT_MS = 3000
 
 # Margins around the moment the switch's timer schedules its call, all far
 # outside the few ms of jitter either way: the flood is already running that
@@ -77,12 +93,16 @@ FLOOD_TAIL_MS = 400
 SETTLE_TIMEOUT = 75.0
 
 
-def _fin_flood(deadline_ms):
+def _fin_flood(deadline_ms, fin_wait_ms=FIN_WAIT_MS):
     """The harness's --fin-flood A:S:W for a switch timer due `deadline_ms`
     after the harness's anchor event: StopCCN early enough for the FIN_WAIT
     timer to expire FIN_WAIT_AFTER_MS past the deadline, flood from
-    FLOOD_LEAD_MS before it until FLOOD_TAIL_MS past that expiry."""
-    stopccn = deadline_ms + FIN_WAIT_AFTER_MS - FIN_WAIT_MS
+    FLOOD_LEAD_MS before it until FLOOD_TAIL_MS past that expiry.
+
+    `fin_wait_ms` is how long the flooded tunnel actually stays in FIN_WAIT --
+    FIN_WAIT_MS for a switch target tunnel, UPSTREAM_FIN_WAIT_MS for the
+    switch's own inbound-facing one (see the constants above)."""
+    stopccn = deadline_ms + FIN_WAIT_AFTER_MS - fin_wait_ms
     start = deadline_ms - FLOOD_LEAD_MS
     length = FLOOD_LEAD_MS + FIN_WAIT_AFTER_MS + FLOOD_TAIL_MS
     return f"{stopccn}:{start}:{length}"
@@ -124,6 +144,9 @@ def _switch(accel_pppd, accel_cmd, s_cli, s_port, down_port):
         # test_switch_apses_hop_race.py's simpler one (a plain, switch-free
         # daemon) is still in place.
         thread_count=1,
+        l2tp_extra=f"""rtimeout={UPSTREAM_RTIMEOUT}
+    retransmit={UPSTREAM_RETRANSMIT}
+    rtimeout-cap={UPSTREAM_RTIMEOUT_CAP}""",
     )
     assert started
     try:
@@ -238,7 +261,11 @@ def test_disconnect_of_queued_call_lost_to_its_tunnel_teardown_leaks_nothing(
         try:
             assert wait_udp_bound(down_port), "the downstream harness never bound"
             # The upstream LAC is what ends its own tunnel and floods it,
-            # anchored on the ICCN that queued the call.
+            # anchored on the ICCN that queued the call. This is the switch's
+            # inbound-facing tunnel (no switch_target), so it's the one
+            # subject to the full backoff -- UPSTREAM_FIN_WAIT_MS, not
+            # FIN_WAIT_MS -- and _switch() above shrinks that backoff's own
+            # config to keep it small.
             up_thread, up_ctrl = l2tp_peer_process.start(
                 peer_bin,
                 [
@@ -246,7 +273,9 @@ def test_disconnect_of_queued_call_lost_to_its_tunnel_teardown_leaks_nothing(
                     "--peer-port", str(s_port),
                     "--secret", "upstreamsecret",
                     "--calling-number", "472913",
-                    "--fin-flood", _fin_flood(CONNECT_TIMEOUT * 1000),
+                    "--fin-flood",
+                    _fin_flood(CONNECT_TIMEOUT * 1000,
+                              fin_wait_ms=UPSTREAM_FIN_WAIT_MS),
                     "--fin-flood-on", "iccn",
                     "--hold-seconds", "1",
                 ],

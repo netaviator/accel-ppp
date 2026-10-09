@@ -36,7 +36,7 @@ Note: tests will be run under sudo. If you prefer install python modules using p
 
 Install additional tools required for tests:
 ```bash
-sudo apt install iproute2 ppp pppoe isc-dhcp-client
+sudo apt install iproute2 ppp pppoe isc-dhcp-client tcpdump
 ```
 
 Then build accel-ppp in 'build' directory (as usual)
@@ -120,3 +120,19 @@ If you want to re-run tests 'from scratch', you may want to remove coverage data
 sudo gcovr -d # build report and delete
 sudo gcovr -d # check that data is deleted (any coverage = 0%)
 ```
+## Running the L2TP switch tests in parallel
+
+The `l2tp_switch` tests start their own daemons on free ports, so several
+copies can run on one machine. Tests that use the shared fixture daemon (CLI
+port 2001) carry `xdist_group("fixed-port")`, so
+`pytest -n auto --dist loadgroup` runs them on a single worker.
+
+To spread the tests over several containers, each with its own network
+namespace, build accel-ppp in a Linux container, `docker commit` it, and run:
+
+```bash
+tests/run_l2tp_switch_sharded.sh <image> [shards]
+```
+
+The shards use the binary stored in the image, so commit a new image after
+each rebuild.

@@ -4435,18 +4435,12 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 	 * (each with its own lock/unlock) without re-acquiring the lock for
 	 * every AVP in the packet. */
 	l2tp_switch_match_lock();
-	list_for_each_entry(attr, &pack->attrs, entry) {
-		sess->switch_target = l2tp_switch_match_locked(attr->attr,
-							       attr->val.octets,
-							       attr->length);
-		if (sess->switch_target) {
-			l2tp_stat_inc(&l2tp_stat.switch_matched);
-			log_tunnel(log_info1, conn,
-				   "call matches l2tp-switch"
-				   " target \"%s\"\n",
-				   sess->switch_target->name);
-			break;
-		}
+	sess->switch_target = l2tp_switch_match_attrs_locked(&pack->attrs);
+	if (sess->switch_target) {
+		l2tp_stat_inc(&l2tp_stat.switch_matched);
+		log_tunnel(log_info1, conn,
+			   "call matches l2tp-switch target \"%s\"\n",
+			   sess->switch_target->name);
 	}
 	l2tp_switch_match_unlock();
 
@@ -6445,38 +6439,21 @@ static int l2tp_recv_ICCN(struct l2tp_sess_t *sess,
 
 	log_session(log_info2, sess, "handling ICCN\n");
 
-	/* One lock for the whole ICCN AVP loop instead of one per
-	 * l2tp_switch_match_locked() call -- see l2tp_recv_ICRQ()'s matching
-	 * loop for why this is safe: nothing can mutate the rule table while
-	 * a reader holds this lock, so bracketing the whole loop is
-	 * equivalent to the old per-AVP lock/unlock pairs. Released before
-	 * every exit out of the loop below, including its own early
-	 * "return -1". */
+	/* Same generic match as l2tp_recv_ICRQ, run here too: some AVPs worth
+	 * routing on (Proxy-Authen-Name) only appear in ICCN. Done before the
+	 * loop so the capture below sees sess->switch_target already set.
+	 * One lock for the whole match, see l2tp_recv_ICRQ(). */
 	l2tp_switch_match_lock();
-	list_for_each_entry(attr, &pack->attrs, entry) {
-		/* Same generic match attempt as l2tp_recv_ICRQ, run here too:
-		 * some AVPs worth routing on (Proxy-Authen-Name, carrying
-		 * the upstream LAC's proxied username/realm) only ever appear in ICCN, not
-		 * ICRQ -- see l2tp_switch_match()'s own doc comment for why
-		 * offering every AVP's raw value is safe regardless of this
-		 * AVP's real type. Runs before the switch below so that, if
-		 * this same AVP is the one that matches (Proxy-Authen-Name
-		 * itself, most commonly), sess->switch_target is already set
-		 * by the time that case is reached and the existing capture
-		 * logic there correctly captures it for forwarding. */
-		if (!sess->switch_target) {
-			sess->switch_target = l2tp_switch_match_locked(attr->attr,
-								       attr->val.octets,
-								       attr->length);
-			if (sess->switch_target) {
-				l2tp_stat_inc(&l2tp_stat.switch_matched);
-				log_session(log_info1, sess,
-					    "call matches l2tp-switch"
-					    " target \"%s\"\n",
-					    sess->switch_target->name);
-			}
+	if (!sess->switch_target) {
+		sess->switch_target = l2tp_switch_match_attrs_locked(&pack->attrs);
+		if (sess->switch_target) {
+			l2tp_stat_inc(&l2tp_stat.switch_matched);
+			log_session(log_info1, sess,
+				    "call matches l2tp-switch target \"%s\"\n",
+				    sess->switch_target->name);
 		}
-
+	}
+	list_for_each_entry(attr, &pack->attrs, entry) {
 		switch (attr->attr->id) {
 		case Message_Type:
 		case Random_Vector:

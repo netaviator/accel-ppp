@@ -4855,6 +4855,7 @@ static int l2tp_switch_link_write_out(struct l2tp_switch_link_t *link, ssize_t n
 			goto peer_gone;
 
 		if (w >= 0) {
+			l2tp_switch_link_count_bytes(link, w);
 			link->enomem_retries = 0;
 			n -= w;
 			continue;
@@ -4987,7 +4988,6 @@ static int l2tp_switch_link_read(struct triton_md_handler_t *h)
 		if (n == 0)
 			return 0;
 
-		l2tp_switch_link_count_bytes(link, n);
 		l2tp_switch_link_peek(link, n);
 
 		/* Fresh chunk: reset both bounded-retry counts, matching the

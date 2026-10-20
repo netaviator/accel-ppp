@@ -1322,6 +1322,15 @@ static struct l2tp_switch_unpaired l2tp_switch_unpair(struct l2tp_sess_t *sess,
 	return u;
 }
 
+/* wipe that the compiler cannot elide; explicit_bzero() needs a recent libc */
+static void l2tp_secure_wipe(void *p, size_t len)
+{
+	volatile uint8_t *v = p;
+
+	while (len--)
+		*v++ = 0;
+}
+
 static void l2tp_switch_avps_free(struct l2tp_switch_avps *avps)
 {
 	int i;
@@ -1331,7 +1340,7 @@ static void l2tp_switch_avps_free(struct l2tp_switch_avps *avps)
 
 	for (i = 0; i < avps->count; i++) {
 		/* Proxy-Authen-Response is the cleartext PAP password */
-		explicit_bzero(avps->avp[i].val, avps->avp[i].len);
+		l2tp_secure_wipe(avps->avp[i].val, avps->avp[i].len);
 		_free(avps->avp[i].val);
 	}
 	_free(avps);

@@ -7402,6 +7402,20 @@ static void l2tp_create_session_help(char * const *fields, int fields_cnt,
 		 " - place new call in tunnel <tid>\r\n");
 }
 
+/* The proxied PAP password and the other Proxy-Authen AVPs of an ICCN are
+ * repeated to the downstream LNS; they are hidden only if hide-avps is on. At
+ * startup the targets are not loaded yet when load_config() runs, so this is
+ * also called after l2tp_switch_conf_load(). */
+static void l2tp_switch_warn_cleartext_avps(void)
+{
+	if (conf_hide_avps || list_empty(&l2tp_switch_targets))
+		return;
+
+	log_warn("l2tp-switch: hide-avps is not set, proxied authentication"
+		 " AVPs (including a PAP password) cross the downstream leg"
+		 " unhidden; set hide-avps=1 in [l2tp]\n");
+}
+
 static void load_config(void)
 {
 	const char *opt;
@@ -7537,6 +7551,8 @@ static void load_config(void)
 		/* Makes compiler happy */
 		break;
 	}
+
+	l2tp_switch_warn_cleartext_avps();
 }
 
 /* twalk_r() is a GNU extension, twalk() takes no closure */
@@ -7774,6 +7790,7 @@ static void l2tp_init(void)
 			  " terminating\n");
 		_exit(EXIT_FAILURE);
 	}
+	l2tp_switch_warn_cleartext_avps();
 	l2tp_switch_targets_connect();
 
 	start_udp_server();

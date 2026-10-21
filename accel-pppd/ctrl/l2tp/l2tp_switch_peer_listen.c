@@ -298,7 +298,7 @@ static int serve_minimal_lcp_and_cdn(int fd, const struct sockaddr_in *their_add
 		return 0;
 	}
 
-	if (run_minimal_lcp(data_fd, 5) != 0) {
+	if (run_minimal_lcp(data_fd, MINIMAL_LCP_TIMEOUT_SECONDS) != 0) {
 		close(data_fd);
 		return die("downstream minimal LCP failed");
 	}

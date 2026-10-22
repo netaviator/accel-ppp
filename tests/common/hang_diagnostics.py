@@ -94,6 +94,14 @@ def _log_tail(cfg):
     return "\n".join(parts) or "<no log output>"
 
 
+def dump_logs(popen, reason):
+    """Prints the log tails of an already exited daemon `popen`: its stderr
+    pipe is often empty for an abort() (the BUG: lines go to log-error=)."""
+    print(f"===== accel-pppd {popen.pid} logs: {reason} =====")
+    print(_log_tail(config_path(popen)))
+    print(f"===== end of accel-pppd {popen.pid} logs =====")
+
+
 def dump(popen, accel_cmd, cli_port, reason):
     """Prints the state of the still running daemon `popen`."""
     pid = popen.pid

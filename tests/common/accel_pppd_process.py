@@ -226,4 +226,6 @@ def _finish(accel_pppd_control, check_exit):
             "triton_context_call); separate fix pending: " + problem
         )
         return
+    if problem:
+        hang_diagnostics.dump_logs(accel_pppd_control["process"], problem)
     assert problem is None, problem + " (sanitizer report at exit? see output above)"

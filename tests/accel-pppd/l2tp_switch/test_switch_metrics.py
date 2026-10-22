@@ -54,7 +54,7 @@ def test_switch_metrics_exposed_via_native_endpoint(pytestconfig, accel_cmd, acc
     assert d_started
 
     try:
-        # start_instance() fixes [modules] to log_syslog/l2tp and a second [modules]
+        # start_instance() fixes [modules] to log_file/l2tp and a second [modules]
         # section in extra= is not merged, so build the config here with metrics
         # loaded from the start.
         s_cfg = config.make_tmp(

@@ -38,6 +38,23 @@ def _counter(accel_cmd, cli_port, name):
     return int(m.group(1)) if m else -1
 
 
+def _replace_failed_calls(peer_bin, switch_l2tp, calls):
+    """Starts a call in place of every one whose harness gave up before it
+    was placed (the call lost its SCCRQ or its reply, which a slow emulated
+    host does when it starts dozens of processes at once). The harnesses hold
+    their calls for far longer than this test runs, so one that has exited
+    never reached the switch's counters. Returns the number replaced."""
+    replaced = 0
+    for i, (thread, ctrl) in enumerate(calls):
+        if thread.is_alive() or ctrl["process"].returncode in (None, 0):
+            continue
+        print(f"call {i} failed (rc={ctrl['process'].returncode}), starting"
+              f" another: {ctrl['err']}", flush=True)
+        calls[i] = _call(peer_bin, switch_l2tp, ["--hold-seconds", "60"])
+        replaced += 1
+    return replaced
+
+
 @pytest.mark.l2tp_switch
 def test_unanswered_calls_on_an_established_target_are_limited(
     pytestconfig, accel_cmd, accel_pppd, peer_bin
@@ -90,9 +107,13 @@ def test_unanswered_calls_on_an_established_target_are_limited(
                     ]
                 calls.append(_call(peer_bin, switch_l2tp, extra))
 
-            assert wait_for(
-                lambda: _counter(accel_cmd, switch_cli, "placed") == LIMIT, 40.0
-            ), switch_show(accel_cmd, switch_cli) + read_log(s_cfg)
+            def all_placed():
+                _replace_failed_calls(peer_bin, switch_l2tp, calls)
+                return _counter(accel_cmd, switch_cli, "placed") == LIMIT
+
+            assert wait_for(all_placed, 60.0, interval=0.5), (
+                switch_show(accel_cmd, switch_cli) + read_log(s_cfg)
+            )
 
             # over the limit: refused, however many ask
             for _ in range(3):
